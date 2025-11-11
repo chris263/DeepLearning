@@ -666,7 +666,6 @@ def _extract_entry_price(p) -> Optional[float]:
                 pass
     return None
 
-
 def get_open_position(ex, symbol: str):
     """
     Return {"side": "long"|"short", "size": float, "entry_price": float|None}
@@ -674,38 +673,13 @@ def get_open_position(ex, symbol: str):
     """
     def _scan(positions):
         for p in positions or []:
-            sym = p.get("symbol") or p.get("info", {}).get("symbol")
-            if sym and sym != symbol:
+            if p.get("symbol") and p["symbol"] != symbol:
                 continue
-            # prefer explicit side string if present
-            side_str = (p.get("side") or p.get("positionSide") or p.get("info", {}).get("side") or "").lower()
-            size_val = p.get("contracts") or p.get("size") or p.get("positionAmt")
-            try:
-                size = float(size_val if size_val is not None else 0.0)
-            except Exception:
-                size = 0.0
-            if abs(size) <= 0:
-                continue
-            if side_str in ("buy","long"):
-                side = "long"
-            elif side_str in ("sell","short"):
-                side = "short"
-            else:
-                side = "long" if size > 0 else "short"
-            entry_price = _extract_entry_price(p) or _extract_entry_price(p.get("info", {}))
-            return {"side": side, "size": abs(size), "entry_price": entry_price}
-        return None
-
-    try:
-        # try narrow fetch
-        pos = _scan(ccxt.Exchange.fetch_positions.__get__(ex, ex)([symbol]))
-        if pos:
-            return pos
-    except Exception:
-        pass
-    try:
-        return _scan(ex.fetch_positions())
-    except Exception:
+            size = float(p.get("contracts") or p.get("size") or p.get("positionAmt") or 0)
+            if abs(size) > 0:
+                side = (p.get("side") or ("long" if size > 0 else "short")).lower()
+                entry_price = _extract_entry_price(p)
+                return {"side": side, "size": abs(size), "entry_price": entry_price}
         return None
 
     try:
@@ -718,7 +692,6 @@ def get_open_position(ex, symbol: str):
     except Exception:
         return None
 
-        
 # =========================
 # CLI
 # =========================
