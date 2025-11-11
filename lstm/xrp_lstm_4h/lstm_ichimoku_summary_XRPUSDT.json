@@ -1,0 +1,19 @@
+{
+  "ticker": "XRPUSDT",
+  "timeframe": "4h",
+  "lookback": 64,
+  "horizon": 4,
+  "model_path": "/home/christiano/Documents/DeepLearning/lstm/xrp_lstm_4h/lstm_ichimoku_XRPUSDT.pt",
+  "pos_thr": 0.55,
+  "neg_thr": 0.44999999999999996,
+  "out_dir": "/home/christiano/Documents/DeepLearning/lstm/xrp_lstm_4h",
+  "test": {
+    "net_profit_pct": 2110.8585334354257,
+    "max_drawdown_pct": 16.979252931536593,
+    "trades": 315,
+    "long_trades": 175,
+    "short_trades": 139,
+    "equity_path": "/home/christiano/Documents/DeepLearning/lstm/xrp_lstm_4h/lstm_ichimoku_equity_test_XRPUSDT.csv",
+    "trades_path": "/home/christiano/Documents/DeepLearning/lstm/xrp_lstm_4h/lstm_ichimoku_trades_XRPUSDT.json"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "ticker": "ETHUSDT",
+  "timeframe": "30m",
+  "lookback": 64,
+  "horizon": 4,
+  "model_path": "/home/christiano/Documents/DeepLearning/lstm/eth_lstm_30m/lstm_ichimoku_ETHUSDT.pt",
+  "pos_thr": 0.55,
+  "neg_thr": 0.44999999999999996,
+  "out_dir": "/home/christiano/Documents/DeepLearning/lstm/eth_lstm_30m",
+  "test": {
+    "net_profit_pct": 35866050.5425127,
+    "max_drawdown_pct": 7.716130973449953,
+    "trades": 1295,
+    "long_trades": 646,
+    "short_trades": 648,
+    "equity_path": "/home/christiano/Documents/DeepLearning/lstm/eth_lstm_30m/lstm_ichimoku_equity_test_ETHUSDT.csv",
+    "trades_path": "/home/christiano/Documents/DeepLearning/lstm/eth_lstm_30m/lstm_ichimoku_trades_ETHUSDT.json"
+  }
+}

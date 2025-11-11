@@ -1,0 +1,19 @@
+{
+  "ticker": "BTCUSDT",
+  "timeframe": "4h",
+  "lookback": 64,
+  "horizon": 4,
+  "model_path": "/home/christiano/Documents/DeepLearning/lstm/btc_lstm_4h/lstm_ichimoku_BTCUSDT.pt",
+  "pos_thr": 0.55,
+  "neg_thr": 0.44999999999999996,
+  "out_dir": "/home/christiano/Documents/DeepLearning/lstm/btc_lstm_4h",
+  "test": {
+    "net_profit_pct": 315.55578970433487,
+    "max_drawdown_pct": 9.16038534105108,
+    "trades": 215,
+    "long_trades": 97,
+    "short_trades": 118,
+    "equity_path": "/home/christiano/Documents/DeepLearning/lstm/btc_lstm_4h/lstm_ichimoku_equity_test_BTCUSDT.csv",
+    "trades_path": "/home/christiano/Documents/DeepLearning/lstm/btc_lstm_4h/lstm_ichimoku_trades_BTCUSDT.json"
+  }
+}

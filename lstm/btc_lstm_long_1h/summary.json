@@ -1,0 +1,17 @@
+{
+  "total_trades": 433,
+  "long_trades": 212,
+  "short_trades": 221,
+  "long_wins": 152,
+  "short_wins": 145,
+  "losses": 136,
+  "gross_profit": 59615.734092287414,
+  "gross_loss": -11584.119941608227,
+  "net_profit": 1072499.35350613,
+  "pct_net_profit": 107.24993535061299,
+  "profit_factor": 5.14633259952339,
+  "win_rate_pct": 68.59122401847574,
+  "max_drawdown_pct": -0.05371457220955966,
+  "buy_hold_pct": 0.19844096018841828,
+  "initial_capital": 10000.0
+}

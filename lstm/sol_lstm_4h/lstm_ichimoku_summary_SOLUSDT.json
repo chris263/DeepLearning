@@ -1,0 +1,19 @@
+{
+  "ticker": "SOLUSDT",
+  "timeframe": "4h",
+  "lookback": 64,
+  "horizon": 4,
+  "model_path": "/home/christiano/Documents/DeepLearning/lstm/sol_lstm_4h/lstm_ichimoku_SOLUSDT.pt",
+  "pos_thr": 0.55,
+  "neg_thr": 0.44999999999999996,
+  "out_dir": "/home/christiano/Documents/DeepLearning/lstm/sol_lstm_4h",
+  "test": {
+    "net_profit_pct": 8547.757511468448,
+    "max_drawdown_pct": 14.075849410489083,
+    "trades": 336,
+    "long_trades": 161,
+    "short_trades": 175,
+    "equity_path": "/home/christiano/Documents/DeepLearning/lstm/sol_lstm_4h/lstm_ichimoku_equity_test_SOLUSDT.csv",
+    "trades_path": "/home/christiano/Documents/DeepLearning/lstm/sol_lstm_4h/lstm_ichimoku_trades_SOLUSDT.json"
+  }
+}
