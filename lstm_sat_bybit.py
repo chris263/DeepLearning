@@ -406,20 +406,40 @@ def read_keys_from_env(pub_var: Optional[str], sec_var: Optional[str]) -> Tuple[
 
 def get_open_position(ex, symbol: str) -> Optional[Dict]:
     def _scan(pos_list):
-        if not pos_list: return None
+        if not pos_list:
+            return None
         for p in pos_list:
             sym = p.get("symbol") or p.get("info", {}).get("symbol")
-            if sym == symbol or (ex.markets.get(sym, {}).get("symbol") == symbol):
-                sz = float(p.get("contracts") or p.get("size") or p.get("positionAmt") or 0.0)
-                if abs(sz) <= 0: continue
-                side = "long" if sz > 0 else "short"
-                entry = _extract_entry_price(p) or _extract_entry_price(p.get("info", {}))
-                return {"side": side, "size": abs(sz), "entry_price": entry}
+            # accept market id too, but normalize to unified symbol
+            if sym != symbol and (ex.markets.get(sym, {}).get("symbol") != symbol):
+                continue
+
+            # prefer string side if available
+            side_str = (p.get("side") or p.get("positionSide") or p.get("info", {}).get("side") or "").lower()
+
+            qty_val = p.get("contracts") or p.get("size") or p.get("positionAmt")
+            try:
+                qty = float(qty_val if qty_val is not None else 0.0)
+            except Exception:
+                qty = 0.0
+            if abs(qty) <= 0:
+                continue
+
+            if side_str in ("buy", "long"):
+                side = "long"
+            elif side_str in ("sell", "short"):
+                side = "short"
+            else:
+                side = "long" if qty > 0 else "short"
+
+            entry = _extract_entry_price(p) or _extract_entry_price(p.get("info", {}))
+            return {"side": side, "size": abs(qty), "entry_price": entry}
         return None
 
     try:
         pos = _scan(ccxt.Exchange.fetch_positions.__get__(ex, ex)([symbol]))
-        if pos: return pos
+        if pos:
+            return pos
     except Exception:
         pass
     try:
@@ -551,13 +571,12 @@ def decide_and_maybe_trade(args):
                     sl_hit = last_high >= entry * (1.0 + sl_pct)
 
             if tp_hit or sl_hit:
+                # inside the SL/TP block
                 close_side = "buy" if pos["side"] == "short" else "sell"
-                close_qty = amount_to_precision(ex, symbol, pos["size"])
-                reason = "TP hit" if tp_hit else "SL hit"
+                close_qty  = amount_to_precision(ex, symbol, pos["size"])
                 print(f"{reason} — reduce-only MARKET {close_side.upper()} {symbol} qty={close_qty} (entry≈{entry:.6f}, H/L={last_high:.6f}/{last_low:.6f})")
                 try:
-                    ex.create_order(symbol=symbol, type="market", side=close_side, amount=close_qty,
-                                    params={"reduceOnly": True})
+                    ex.create_order(symbol=symbol, type="market", side=close_side, amount=close_qty, params={"reduceOnly": True})
                 except Exception as e:
                     print(f"[ERROR] close failed: {e}")
                 return  # do not flip on the same run after SL/TP exit
@@ -588,16 +607,16 @@ def decide_and_maybe_trade(args):
         if (take_long and pos["side"] == "long") or (take_short and pos["side"] == "short"):
             print("Avoiding opening another position - pyramiding.")
             return
-        # flip
+        # flip: close existing with reduce-only, then open new
         close_side = "buy" if pos["side"] == "short" else "sell"
-        close_qty = amount_to_precision(ex, symbol, pos["size"])
+        close_qty  = amount_to_precision(ex, symbol, pos["size"])
         print(f"Close position sent — reduce-only MARKET {close_side.upper()} {symbol} qty={close_qty}")
         try:
-            ex.create_order(symbol=symbol, type="market", side=close_side, amount=close_qty,
-                            params={"reduceOnly": True})
+            ex.create_order(symbol=symbol, type="market", side=close_side, amount=close_qty, params={"reduceOnly": True})
         except Exception as e:
             print(f"[ERROR] close failed: {e}")
-            return
+        return
+
 
     # 6) Place new order (MARKET, unified linear swap)
     side = "buy" if take_long else "sell"
