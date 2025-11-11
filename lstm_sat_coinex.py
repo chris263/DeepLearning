@@ -584,7 +584,7 @@ def decide_and_maybe_trade(args):
             close_side = "buy" if pos["side"] == "short" else "sell"
             close_qty = amount_to_precision(ex, symbol, sz)
             reason = "TP hit" if tp_hit else "SL hit"
-            print(f"{reason} — reduce-only MARKET {close_side.upper()} {ticker} qty={close_qty} (entry≈{entry:.6f}, H/L={last_high:.6f}/{last_low:.6f})")
+            print(f"{reason} — reduce-only MARKET {close_side.upper()} {symbol} qty={close_qty} (entry≈{entry:.6f}, H/L={last_high:.6f}/{last_low:.6f})")
             try:
                 ex.create_order(symbol=symbol, type="market", side=close_side, amount=close_qty,
                                 params={"reduceOnly": True})
@@ -592,20 +592,20 @@ def decide_and_maybe_trade(args):
                 print(f"[ERROR] close failed: {e}")
             return  # do not flip/open new after a stop/take exit
 
-    # 7) No overlapping: flip allowed (close then open) but no pyramiding
-if pos is not None:
-    if (take_long and pos["side"] == "long") or (take_short and pos["side"] == "short"):
-        print("Avoiding opening another position — pyramiding disabled.")
-        return
-    # flip: close existing, then proceed to open
-    close_side = "buy" if pos["side"] == "short" else "sell"
-    close_qty = amount_to_precision(ex, symbol, pos["size"])
-    print(f"Close position sent — reduce-only MARKET {close_side.upper()} {symbol} qty={close_qty}")
-    try:
-        ex.create_order(symbol=symbol, type="market", side=close_side, amount=close_qty, params={"reduceOnly": True})
-    except Exception as e:
-        print(f"[ERROR] close failed: {e}")
-        return
+        # 7) No overlapping: flip allowed (close then open) but no pyramiding
+    if pos is not None:
+        if (take_long and pos["side"] == "long") or (take_short and pos["side"] == "short"):
+            print("Avoiding opening another position — pyramiding disabled.")
+            return
+        # flip: close existing, then proceed to open
+        close_side = "buy" if pos["side"] == "short" else "sell"
+        close_qty = amount_to_precision(ex, symbol, pos["size"])
+        print(f"Close position sent — reduce-only MARKET {close_side.upper()} {symbol} qty={close_qty}")
+        try:
+            ex.create_order(symbol=symbol, type="market", side=close_side, amount=close_qty, params={"reduceOnly": True})
+        except Exception as e:
+            print(f"[ERROR] close failed: {e}")
+            return
 
 
     # 8) Decide side
@@ -689,15 +689,13 @@ def _extract_entry_price(p) -> Optional[float]:
 
 def get_open_position(ex, symbol: str):
     """
-    Return {"side": "long"|"short", "size": float, "entry_price": float|None}
-    or None if flat.
+    Return {"side": "long"|"short", "size": float, "entry_price": float|None} or None.
     """
     def _scan(positions):
         for p in positions or []:
             sym = p.get("symbol") or p.get("info", {}).get("symbol")
             if sym and sym != symbol:
                 continue
-            # prefer explicit side string if present
             side_str = (p.get("side") or p.get("positionSide") or p.get("info", {}).get("side") or "").lower()
             size_val = p.get("contracts") or p.get("size") or p.get("positionAmt")
             try:
@@ -717,20 +715,9 @@ def get_open_position(ex, symbol: str):
         return None
 
     try:
-        # try narrow fetch
         pos = _scan(ccxt.Exchange.fetch_positions.__get__(ex, ex)([symbol]))
         if pos:
             return pos
-    except Exception:
-        pass
-    try:
-        return _scan(ex.fetch_positions())
-    except Exception:
-        return None
-
-    try:
-        pos = _scan(ccxt.Exchange.fetch_positions.__get__(ex, ex)([symbol]))
-        if pos: return pos
     except Exception:
         pass
     try:
