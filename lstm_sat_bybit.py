@@ -251,10 +251,10 @@ def load_bundle(model_dir: str):
     model = torch.jit.load(mdl_path, map_location="cpu").eval()
 
     ichimoku_params = {
-        "tenkan":   int(meta.get("tenkan", 7)),
-        "kijun":    int(meta.get("kijun", 211)),
-        "senkou":   int(meta.get("senkou", 120)),
-        "displacement": int(meta.get("displacement", 41)),
+        "tenkan":   int(meta.get("ichimoku", {}).get("tenkan", 7)),
+        "kijun":    int(meta.get("ichimoku", {}).get("kijun", 211)),
+        "senkou":   int(meta.get("ichimoku", {}).get("senkou", 120)),
+        "displacement": int(meta.get("ichimoku", {}).get("displacement", 41)),
     }
 
     return {

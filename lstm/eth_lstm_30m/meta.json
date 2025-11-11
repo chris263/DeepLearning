@@ -8,6 +8,12 @@
   "timeframe": "30m",
   "lookback": 64,
   "horizon": 4,
+  "ichimoku": {
+    "tenkan": 9,
+    "kijun": 26,
+    "senkou": 52,
+    "displacement": 41
+  },
   "n_features": 14,
   "in_channels": 14,
   "features": [
@@ -27,7 +33,7 @@
     "vol20"
   ],
   "preprocess_file": "preprocess.json",
-  "created_at": "2025-11-11T16:15:03Z",
+  "created_at": "2025-11-11T18:00:07Z",
   "pos_thr": 0.55,
   "neg_thr": 0.44999999999999996,
   "prob_threshold": 0.55,
