@@ -1,31 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-LSTM Ichimoku runner for Bybit (USDT linear swap, i.e., futures only, unified account).
+LSTM Ichimoku runner for Bybit (USDT linear swap, unified account).
 
-Key points:
-- Always places futures (swap) orders for LONG/SHORT on Bybit unified account.
-- No args.category; removed entirely.
-- Bars loaded from a JSON file with closed bars.
-- TorchScript bundle: model.pt, preprocess.json, meta.json.
+- Always futures (swap). No args.category.
+- Shared last-bar ID at ~/.sat_state/lastbars.json (override via SAT_STATE_DIR).
+- Per-broker idempotency file in model dir.
 - SL/TP exits from meta.json (sl_pct / tp_pct).
-- Pyramiding protection & flip on reversal.
+- Pyramiding protection.
 - 6-minute window after last bar close.
-- Writes/reads SHARED last-bar ID at ~/.sat_state/lastbars.json (override via SAT_STATE_DIR).
-- Keeps a per-broker idempotency stamp file in the model dir to avoid double action for Bybit.
-
-API keys:
-- By default reads variables from ~/.ssh/coinex_keys.env
-  Use --keys-file to point elsewhere (e.g., same file you used for CoinEx).
-- Provide the variable names via --pub_key and --sec_key (e.g., API_KEY_BYBIT / API_SECRET_BYBIT).
-
-Example:
-  python3 lstm_sat_bybit.py \
-    --model-dir /path/to/bundle \
-    --bars-json /path/to/BTCUSDT_1h_closed.json \
-    --ticker BTCUSDT --timeframe 1h \
-    --pub_key API_KEY_BYBIT --sec_key API_SECRET_BYBIT \
-    --debug
+- Reversal policy: --reversal {close,flip,cooldown} (default: close),
+                   --cooldown-seconds N for cooldown mode.
 """
 
 from __future__ import annotations
@@ -48,26 +33,12 @@ except Exception:
     raise
 
 
-# =========================
-# Constants / timeframe helpers
-# =========================
 SIX_MIN_MS = 6 * 60 * 1000
-
 TF_TO_MS = {
-    "1m": 60_000,
-    "3m": 180_000,
-    "5m": 300_000,
-    "15m": 900_000,
-    "30m": 1_800_000,
-    "1h": 3_600_000,
-    "2h": 7_200_000,
-    "4h": 14_400_000,
-    "6h": 21_600_000,
-    "8h": 28_800_000,
-    "12h": 43_200_000,
-    "1d": 86_400_000,
+    "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
+    "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000,
+    "6h": 21_600_000, "8h": 28_800_000, "12h": 43_200_000, "1d": 86_400_000,
 }
-
 def tf_ms(tf: str) -> int:
     v = TF_TO_MS.get(str(tf).lower())
     if not v:
@@ -75,52 +46,36 @@ def tf_ms(tf: str) -> int:
     return v
 
 
-# =========================
-# JSON bars I/O
-# =========================
 def _normalize_bar(b: Dict) -> Optional[Dict]:
-    """
-    Normalize possible bar shapes to:
-      {ts(ms), open, high, low, close, volume}
-    """
     if not isinstance(b, dict):
         return None
     keys = {k.lower(): k for k in b.keys()}
-
     def g(*cands, default=None):
         for c in cands:
             k = keys.get(c)
             if k in b:
                 return b[k]
         return default
-
     ts = g("ts", "timestamp", "time", "t", default=None)
     if ts is None:
         return None
     ts = int(ts)
-    if ts < 10_000_000_000:  # seconds → ms
+    if ts < 10_000_000_000:
         ts *= 1000
-
     try:
-        o = float(g("open", "o"))
-        h = float(g("high", "h"))
-        l = float(g("low", "l"))
-        c = float(g("close", "c"))
+        o = float(g("open", "o")); h = float(g("high", "h"))
+        l = float(g("low", "l"));  c = float(g("close", "c"))
         v = float(g("volume", "v", "vol"))
     except Exception:
         return None
-
     return {"ts": ts, "open": o, "high": h, "low": l, "close": c, "volume": v}
 
 def load_bars_from_json(path: str) -> pd.DataFrame:
     p = pathlib.Path(path).expanduser()
     if not p.exists():
         raise SystemExit(f"Bars JSON not found: {p}")
-
     content = p.read_text().strip()
     bars: List[Dict] = []
-
-    # Try array or wrapped object
     try:
         obj = json.loads(content)
         if isinstance(obj, list):
@@ -131,7 +86,6 @@ def load_bars_from_json(path: str) -> pd.DataFrame:
                     bars = obj[key]
                     break
     except Exception:
-        # LDJSON fallback
         for line in content.splitlines():
             line = line.strip()
             if not line:
@@ -140,10 +94,8 @@ def load_bars_from_json(path: str) -> pd.DataFrame:
                 bars.append(json.loads(line))
             except Exception:
                 pass
-
     if not bars:
         raise SystemExit(f"No bars decoded from {p}")
-
     norm = []
     for b in bars:
         nb = _normalize_bar(b)
@@ -151,15 +103,11 @@ def load_bars_from_json(path: str) -> pd.DataFrame:
             norm.append(nb)
     if not norm:
         raise SystemExit(f"No valid bars decoded from {p}")
-
     df = pd.DataFrame(norm).dropna().sort_values("ts").reset_index(drop=True)
     df["timestamp"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert(None)
     return df[["timestamp","ts","open","high","low","close","volume"]]
 
 
-# =========================
-# Ichimoku + features
-# =========================
 def rolling_mid(high: pd.Series, low: pd.Series, n: int) -> pd.Series:
     n = int(n)
     hh = high.rolling(n, min_periods=n).max()
@@ -172,7 +120,7 @@ def ichimoku(df: pd.DataFrame, tenkan: int, kijun: int, senkou: int) -> pd.DataF
     d["kijun"]  = rolling_mid(d.high, d.low, kijun)
     d["span_a"] = (d["tenkan"] + d["kijun"]) / 2.0
     d["span_b"] = rolling_mid(d.high, d.low, senkou)
-    d["chikou"] = d["close"].shift(-kijun)  # trainer parity assumption
+    d["chikou"] = d["close"].shift(-kijun)
     return d
 
 def slope(series: pd.Series, w: int = 8) -> pd.Series:
@@ -198,9 +146,6 @@ def build_features(df: pd.DataFrame, tenkan: int, kijun: int, senkou: int,
     return d
 
 
-# =========================
-# Bundle I/O
-# =========================
 def load_bundle(model_dir: str):
     model_dir = os.path.abspath(os.path.expanduser(model_dir))
     meta_path = os.path.join(model_dir, "meta.json")
@@ -209,16 +154,13 @@ def load_bundle(model_dir: str):
     for p in (meta_path, pre_path, mdl_path):
         if not os.path.exists(p):
             raise SystemExit(f"Missing bundle file: {p}")
-
     with open(meta_path, "r") as f:
         meta = json.load(f)
     with open(pre_path, "r") as f:
         pre = json.load(f)
-
     feature_names = meta.get("features") or meta.get("feature_names")
     if not feature_names:
         raise SystemExit("meta.json missing 'features' list")
-
     lookback = int(meta.get("lookback") or meta.get("window") or 64)
     pos_thr  = float(meta.get("pos_thr", 0.55))
     neg_thr  = float(meta.get("neg_thr", 0.45))
@@ -226,51 +168,29 @@ def load_bundle(model_dir: str):
     tp_pct   = meta.get("tp_pct", None)
     sl_pct   = float(sl_pct) if sl_pct is not None else None
     tp_pct   = float(tp_pct) if tp_pct is not None else None
-
     ichimoku_params = {
         "tenkan": int(meta.get("tenkan", 7)),
         "kijun": int(meta.get("kijun", 211)),
         "senkou": int(meta.get("senkou", 120)),
         "displacement": int(meta.get("displacement", 41)),
     }
-
     mean = np.array(pre.get("mean"), dtype=np.float32)
     std  = np.array(pre.get("std"), dtype=np.float32)
     if mean.shape[0] != len(feature_names) or std.shape[0] != len(feature_names):
         raise SystemExit("preprocess.json shapes don't match features")
-
     model = torch.jit.load(mdl_path, map_location="cpu")
     model.eval()
-
     return {
-        "meta": meta,
-        "model": model,
-        "feature_names": feature_names,
-        "lookback": lookback,
-        "pos_thr": pos_thr,
-        "neg_thr": neg_thr,
-        "sl_pct": sl_pct,
-        "tp_pct": tp_pct,
-        "mean": mean,
-        "std": std,
-        "ichimoku": ichimoku_params,
-        "paths": {"dir": model_dir},
+        "meta": meta, "model": model, "feature_names": feature_names,
+        "lookback": lookback, "pos_thr": pos_thr, "neg_thr": neg_thr,
+        "sl_pct": sl_pct, "tp_pct": tp_pct, "mean": mean, "std": std,
+        "ichimoku": ichimoku_params, "paths": {"dir": model_dir},
     }
 
 
-# =========================
-# Time helpers
-# =========================
 def resolve_last_closed(now_ms: int, last_bar_open_ms: int, timeframe: str) -> Tuple[Optional[int], str, Optional[int]]:
-    """
-    Returns (last_close_ms, stamp_tag, age_ms).
-    Prefers close_stamp = last_bar_open + step; fallback open_stamp.
-    """
     step = tf_ms(timeframe)
-    candidates = [
-        (last_bar_open_ms + step, "close_stamp"),
-        (last_bar_open_ms, "open_stamp"),
-    ]
+    candidates = [(last_bar_open_ms + step, "close_stamp"), (last_bar_open_ms, "open_stamp")]
     valid = [(c, tag, now_ms - c) for (c, tag) in candidates if now_ms >= c]
     if not valid:
         return None, "future", None
@@ -278,9 +198,6 @@ def resolve_last_closed(now_ms: int, last_bar_open_ms: int, timeframe: str) -> T
     return c, tag, age
 
 
-# =========================
-# Shared last-bar ID (cross-broker)
-# =========================
 def state_dir() -> str:
     base = os.getenv("SAT_STATE_DIR", os.path.expanduser("~/.sat_state"))
     pathlib.Path(base).mkdir(parents=True, exist_ok=True)
@@ -304,7 +221,7 @@ def write_lastbars_store(data: Dict[str, Dict]) -> None:
     try:
         with os.fdopen(tmp_fd, "w") as f:
             json.dump(data, f, separators=(",", ":"), sort_keys=True)
-        os.replace(tmp_path, p)  # atomic
+        os.replace(tmp_path, p)
     finally:
         try:
             if os.path.exists(tmp_path):
@@ -320,20 +237,15 @@ def update_shared_lastbar(ticker: str, timeframe: str, last_open_ts_ms: int, las
     store = read_lastbars_store()
     store[key] = {
         "bar_id": bar_id(ticker, timeframe, last_open_ts_ms),
-        "ticker": ticker,
-        "timeframe": timeframe,
-        "last_open_ts": int(last_open_ts_ms),
-        "last_close_ts": int(last_close_ms),
+        "ticker": ticker, "timeframe": timeframe,
+        "last_open_ts": int(last_open_ts_ms), "last_close_ts": int(last_close_ms),
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     write_lastbars_store(store)
 
 
-# =========================
-# Per-bundle idempotency (per broker)
-# =========================
-def last_executed_guard(model_dir: str, suffix: Optional[str] = None) -> Tuple[Optional[int], str]:
-    fname = ".last_order_ts.txt" if not suffix else f".last_order_ts_{suffix}.txt"
+def last_executed_guard(model_dir: str, suffix: str) -> Tuple[Optional[int], str]:
+    fname = f".last_order_ts_{suffix}.txt"
     path = os.path.join(model_dir, fname)
     if os.path.exists(path):
         try:
@@ -348,10 +260,22 @@ def write_last_executed(path: str, ts_ms: int):
     with open(path, "w") as f:
         f.write(str(int(ts_ms)))
 
+def reversal_state_paths(model_dir: str, suffix: str) -> str:
+    return os.path.join(model_dir, f".reversal_state_{suffix}.json")
 
-# =========================
-# Exchange helpers (Bybit - swap only, unified)
-# =========================
+def read_reversal_state(path: str) -> Dict[str, int]:
+    if not os.path.exists(path):
+        return {}
+    try:
+        return json.loads(open(path, "r").read())
+    except Exception:
+        return {}
+
+def write_reversal_state(path: str, data: Dict[str, int]):
+    with open(path, "w") as f:
+        json.dump(data, f, separators=(",", ":"))
+
+
 def _read_kv_file(path: str) -> Dict[str, str]:
     kv = {}
     if os.path.exists(path):
@@ -364,37 +288,25 @@ def _read_kv_file(path: str) -> Dict[str, str]:
     return kv
 
 def make_exchange(pub_key_name: Optional[str], sec_key_name: Optional[str], keys_file: Optional[str] = None):
-    """
-    Always defaultType='swap' (futures). Targets unified account.
-    Keys are looked up in keys_file (default ~/.ssh/coinex_keys.env) by variable names.
-    """
     keyfile = os.path.expanduser(keys_file or os.getenv("BYBIT_KEYS_FILE", "~/.ssh/coinex_keys.env"))
     keyfile = os.path.expanduser(keyfile)
     kv = _read_kv_file(keyfile)
-
     api_key = kv.get(pub_key_name) if pub_key_name else None
     api_secret = kv.get(sec_key_name) if sec_key_name else None
-
     ex = ccxt.bybit({
-        "apiKey": api_key,
-        "secret": api_secret,
+        "apiKey": api_key, "secret": api_secret,
         "enableRateLimit": True,
-        "options": {
-            "defaultType": "swap",     # futures (linear)
-            "hedgeMode": False,        # one-way mode
-        }
+        "options": {"defaultType": "swap", "hedgeMode": False}
     })
     ex.load_markets()
     return ex
 
 def resolve_symbol(ex, ticker: str) -> str:
-    # Prefer linear USDT perpetual: e.g., BTC/USDT:USDT
     ticker = ticker.upper().replace("/", "")
     base = ticker[:-4] if ticker.endswith("USDT") else ticker
     candidates = [s for s in ex.symbols if s.startswith(f"{base}/USDT") and (":USDT" in s)]
     if candidates:
         return sorted(candidates)[0]
-    # fallback: any USDT linear
     for s in ex.symbols:
         if f"{base}/" in s and ":USDT" in s:
             return s
@@ -403,28 +315,23 @@ def resolve_symbol(ex, ticker: str) -> str:
 def fetch_usdt_balance_swap(ex) -> float:
     try:
         bal = ex.fetch_balance(params={"type": "swap", "accountType": "UNIFIED"})
-        total = bal.get("total", {}).get("USDT")
-        free  = bal.get("free", {}).get("USDT")
+        total = bal.get("total", {}).get("USDT"); free  = bal.get("free", {}).get("USDT")
         return float(free if free is not None else (total or 0.0))
     except Exception:
         try:
-            # fallback without params if ccxt version differs
             bal = ex.fetch_balance()
-            total = bal.get("total", {}).get("USDT")
-            free  = bal.get("free", {}).get("USDT")
+            total = bal.get("total", {}).get("USDT"); free  = bal.get("free", {}).get("USDT")
             return float(free if free is not None else (total or 0.0))
         except Exception:
             return 0.0
 
 def transfer_spot_to_swap_if_needed(ex, min_usdt: float, buffer_frac: float = 0.01, debug: bool = False) -> float:
-    """Best-effort top up (works for unified; ignored if not supported by account)."""
     try:
         swap_free = fetch_usdt_balance_swap(ex)
         if swap_free >= min_usdt:
             return swap_free
         if debug:
             print(f"[DEBUG] swap USDT={swap_free:.2f} < {min_usdt:.2f}; attempting top-up...")
-        # Try generic balance read for available USDT (Bybit unified often shares wallet)
         bal = ex.fetch_balance()
         spot_free = float(bal.get("free", {}).get("USDT") or 0.0)
         if spot_free <= 0:
@@ -432,7 +339,6 @@ def transfer_spot_to_swap_if_needed(ex, min_usdt: float, buffer_frac: float = 0.
         amt = min(spot_free, min_usdt * (1.0 + max(0.0, buffer_frac)))
         if debug:
             print(f"[DEBUG] attempting internal transfer of {amt:.6f} USDT to derivatives margin (if supported)")
-        # Some ccxt versions expose transfer() for bybit unified; if not, this is a no-op
         try:
             ex.transfer(code="USDT", amount=float(f"{amt:.6f}"), fromAccount="spot", toAccount="contract")
             time.sleep(0.5)
@@ -449,14 +355,12 @@ def get_swap_position(ex, symbol: str) -> Optional[Dict]:
             return None
         for p in ps:
             if (p or {}).get("symbol") == symbol:
-                side = (p.get("side") or "").lower()  # 'long' or 'short'
-                # bybit positions may have 'contracts' or 'size' depending on ccxt version
+                side = (p.get("side") or "").lower()
                 sz   = float(p.get("contracts") or p.get("size") or p.get("contractSize") or 0.0)
                 entry= float(p.get("entryPrice") or 0.0)
                 if sz and side:
                     return {"side": side, "size": abs(sz), "entry": entry}
         return None
-    # unified account often works with generic fetch_positions
     try:
         pos = _scan(ex.fetch_positions([symbol], params={"accountType": "UNIFIED"}))
         if pos: return pos
@@ -468,13 +372,7 @@ def get_swap_position(ex, symbol: str) -> Optional[Dict]:
         return None
 
 
-# =========================
-# Inference helpers
-# =========================
 def to_sequences_latest(feat_df: pd.DataFrame, features: List[str], lookback: int) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Returns X (2, lookback, n_features) for prev and last bars + ts seq.
-    """
     if len(feat_df) < (lookback + 1):
         raise SystemExit("Not enough rows to build lookback sequences")
     sub = feat_df.iloc[-(lookback+1):].copy().reset_index(drop=True)
@@ -485,17 +383,13 @@ def to_sequences_latest(feat_df: pd.DataFrame, features: List[str], lookback: in
     return X, ts_seq
 
 def run_model(model, X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> Tuple[float, float]:
-    """
-    Returns (p_prev, p_last).
-    """
     Xn = (X - mean) / (std + 1e-12)
     with torch.no_grad():
-        t = torch.from_numpy(Xn).float()  # (2, L, F)
+        t = torch.from_numpy(Xn).float()
         out = model(t)
         if isinstance(out, (list, tuple)):
             out = out[0]
         x = out.squeeze()
-        # if binary logit -> sigmoid; if 2-class -> softmax prob of class 1
         x = torch.sigmoid(x) if x.ndim == 0 or x.shape[-1] != 2 else torch.softmax(x, dim=-1)[..., 1]
         arr = x.detach().cpu().numpy().astype(np.float64)
     if np.ndim(arr) == 0:
@@ -505,33 +399,23 @@ def run_model(model, X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> Tuple[
     return float(arr[-2]), float(arr[-1])
 
 
-# =========================
-# Core flow (futures only)
-# =========================
 def decide_and_maybe_trade(args):
-    # 1) Load bundle
     bundle = load_bundle(args.model_dir)
-    meta = bundle["meta"]
-    model = bundle["model"]
-    feats = bundle["feature_names"]
-    lookback = bundle["lookback"]
+    meta = bundle["meta"]; model = bundle["model"]
+    feats = bundle["feature_names"]; lookback = bundle["lookback"]
     pos_thr, neg_thr = bundle["pos_thr"], bundle["neg_thr"]
     sl_pct, tp_pct   = bundle["sl_pct"], bundle["tp_pct"]
     mean, std = bundle["mean"], bundle["std"]
-    ik = bundle["ichimoku"]
-    model_dir = bundle["paths"]["dir"]
+    ik = bundle["ichimoku"]; model_dir = bundle["paths"]["dir"]
 
-    # 2) Resolve ticker/timeframe
     ticker = args.ticker or meta.get("ticker") or "BTCUSDT"
     timeframe = args.timeframe or meta.get("timeframe") or "1h"
 
-    # 3) Load bars (JSON)
     df = load_bars_from_json(args.bars_json)
     if df is None or len(df) < (lookback + 3):
         print("Not enough bars to build features.")
         return
 
-    # Build features & check feature names
     feat_df_full = build_features(
         df[["timestamp","ts","open","high","low","close","volume"]].copy(),
         ik["tenkan"], ik["kijun"], ik["senkou"], ik["displacement"]
@@ -541,80 +425,65 @@ def decide_and_maybe_trade(args):
             raise SystemExit(f"Feature '{c}' missing in computed frame.")
     feat_df = feat_df_full.copy()
 
-    # 4) Inference
     X, ts_seq = to_sequences_latest(feat_df[feats + ["ts"]], feats, lookback)
     p_prev, p_last = run_model(model, X, mean, std)
     print(f"LSTM inference | p_prev={p_prev:.3f} | p_last={p_last:.3f} | pos_thr={pos_thr:.3f} | neg_thr={neg_thr:.3f}")
 
-    # 5) Time gating (6-minute window after last bar close)
     now_ms = int(time.time() * 1000)
     ts_last_open = int(df["ts"].iloc[-1])
     last_close_ms, stamp_tag, age_ms = resolve_last_closed(now_ms, ts_last_open, timeframe)
     if args.debug:
         print(f"[DEBUG] last bar — ts_last={ts_last_open} tag={stamp_tag} age_min={(age_ms/60000.0) if age_ms is not None else None}")
-
     if last_close_ms is None or not (0 <= age_ms <= SIX_MIN_MS):
         print("Last closed bar is not within the 6-minute window — not acting.")
         return
 
-    # 6) Shared last-bar ID (cross-broker coordination)
     update_shared_lastbar(ticker, timeframe, ts_last_open, last_close_ms)
-    shared = read_lastbars_store().get(f"{ticker}:{timeframe}", {})
-    if args.debug:
-        print(f"[DEBUG] shared lastbar: {shared.get('bar_id')} last_close_ts={shared.get('last_close_ts')}")
+    # if args.debug: print shared if you want
 
-    # 7) Per-broker idempotency (Bybit-only guard)
-    guard_suffix = f"bybit_swap_{ticker}_{timeframe}"
-    last_seen_ts, guard_path = last_executed_guard(model_dir, guard_suffix)
+    suffix = f"bybit_swap_{ticker}_{timeframe}"
+    last_seen_ts, guard_path = last_executed_guard(model_dir, suffix)
+    rev_state_path = reversal_state_paths(model_dir, suffix)
+    rev_state = read_reversal_state(rev_state_path)
     if last_seen_ts is not None and last_seen_ts == last_close_ms:
         print("Already acted on this bar for Bybit — not acting again.")
         return
 
-    # 8) New signal detection
     take_long  = (p_last >= pos_thr) and not (p_prev >= pos_thr)
     take_short = (p_last <= neg_thr) and not (p_prev <= neg_thr)
     if not take_long and not take_short:
         print("No fresh signal on the last bar — not acting.")
         return
 
-    # 9) Connect exchange (swap only, unified)
     ex = make_exchange(args.pub_key, args.sec_key, keys_file=args.keys_file)
     symbol = resolve_symbol(ex, ticker)
 
-    # 10) Position and SL/TP on swap
     pos = get_swap_position(ex, symbol)
-
     last_close = float(df["close"].iloc[-1])
     last_high  = float(df["high"].iloc[-1])
     last_low   = float(df["low"].iloc[-1])
 
     if pos is not None and pos.get("side"):
         entry = float(pos.get("entry") or last_close)
-        side_open = pos["side"]  # 'long' or 'short'
-        sz = float(pos.get("size") or 0.0)
-
-        tp_hit = False
-        sl_hit = False
+        side_open = pos["side"]; sz = float(pos.get("size") or 0.0)
+        tp_hit = sl_hit = False
         if side_open == "long":
             if tp_pct is not None and last_high >= entry * (1.0 + tp_pct): tp_hit = True
             if sl_pct is not None and last_low  <= entry * (1.0 - sl_pct): sl_hit = True
-        else:  # short
+        else:
             if tp_pct is not None and last_low  <= entry * (1.0 - tp_pct): tp_hit = True
             if sl_pct is not None and last_high >= entry * (1.0 + sl_pct): sl_hit = True
-
         if tp_hit or sl_hit:
             reason = "TP" if tp_hit else "SL"
             try:
-                side = "buy" if side_open == "short" else "sell"  # reduce to close
-                params = {"reduceOnly": True, "accountType": "UNIFIED"}
+                side = "buy" if side_open == "short" else "sell"
                 print(f"{reason} hit — closing existing {side_open} position.")
-                ex.create_order(symbol, "market", side, sz or 1, None, params)
+                ex.create_order(symbol, "market", side, sz or 1, None, {"reduceOnly": True, "accountType": "UNIFIED"})
                 write_last_executed(guard_path, last_close_ms)
             except Exception as e:
                 print(f"[ERROR] close on {reason} failed: {e}")
             return
 
-    # 11) Avoid pyramiding (same direction)
     if pos is not None and pos.get("side") and (
         (take_long  and pos["side"] == "long") or
         (take_short and pos["side"] == "short")
@@ -622,71 +491,78 @@ def decide_and_maybe_trade(args):
         print("Avoiding opening another position - pyramiding.")
         return
 
-    # 12) Flip if necessary (close opposite before open)
-    if pos is not None and pos.get("side"):
-        try:
-            side_open = pos["side"]
-            sz = float(pos.get("size") or 0.0)
-            if (take_long and side_open == "short") or (take_short and side_open == "long"):
-                side = "buy" if side_open == "short" else "sell"
-                print("Signal reversal — closing existing position.")
-                ex.create_order(symbol, "market", side, sz or 1, None, {"reduceOnly": True, "accountType": "UNIFIED"})
-                time.sleep(0.2)
-        except Exception as e:
-            print(f"[WARN] failed to close before flip: {e}")
+    opposite = pos is not None and pos.get("side") and (
+        (pos["side"] == "long" and take_short) or
+        (pos["side"] == "short" and take_long)
+    )
 
-    # 13) Optional top-up for swap (unified)
+    if opposite:
+        try:
+            side_open = pos["side"]; sz = float(pos.get("size") or 0.0)
+            side = "buy" if side_open == "short" else "sell"
+            policy = args.reversal
+            if policy == "flip":
+                print("Signal reversal — flip mode: closing existing, then opening opposite.")
+            elif policy == "cooldown":
+                print("Signal reversal — cooldown mode: closing existing; no new open until cooldown expires.")
+            else:
+                print("Signal reversal — close-only mode: closing existing; not opening a new one this bar.")
+            ex.create_order(symbol, "market", side, sz or 1, None, {"reduceOnly": True, "accountType": "UNIFIED"})
+            if args.reversal in ("close", "cooldown"):
+                rev_state = {"last_close_time_ms": now_ms, "last_bar_ts": int(ts_last_open)}
+                write_reversal_state(rev_state_path, rev_state)
+        except Exception as e:
+            print(f"[WARN] failed to close before handling reversal: {e}")
+
+        if args.reversal == "flip":
+            time.sleep(0.2)
+        else:
+            write_last_executed(guard_path, last_close_ms)
+            return
+
+    if args.reversal == "cooldown":
+        cd_ms = int(max(0, args.cooldown_seconds)) * 1000
+        last_close_time_ms = int(rev_state.get("last_close_time_ms", 0))
+        if cd_ms > 0 and (now_ms - last_close_time_ms) < cd_ms:
+            remain = (cd_ms - (now_ms - last_close_time_ms)) / 1000.0
+            print(f"Cooldown active ({remain:.1f}s remaining) — not opening a new position.")
+            write_last_executed(guard_path, last_close_ms)
+            return
+
     if args.auto_transfer:
         transfer_spot_to_swap_if_needed(ex, min_usdt=50.0, buffer_frac=args.transfer_buffer, debug=args.debug)
 
-    # 14) Open order on swap
     try:
         if take_long:
-            side = "buy"   # open LONG
-            print("Opening LONG (futures/swap).")
+            side = "buy"; print("Opening LONG (futures/swap).")
         else:
-            side = "sell"  # open SHORT
-            print("Opening SHORT (futures/swap).")
-
-        qty = 1  # adjust sizing as needed for your environment
+            side = "sell"; print("Opening SHORT (futures/swap).")
+        qty = 1
         ex.create_order(symbol, "market", side, qty, None, {"reduceOnly": False, "accountType": "UNIFIED"})
         write_last_executed(guard_path, last_close_ms)
     except Exception as e:
         print(f"[ERROR] order failed: {e}")
 
 
-# =========================
-# CLI
-# =========================
 def parse_args():
     ap = argparse.ArgumentParser(
         description="Run LSTM bundle; Bybit FUTURES (swap, unified) orders on fresh signal within 6 minutes — bars read from a JSON file."
     )
-    ap.add_argument("--model-dir", required=True,
-                    help="Folder with model.pt, preprocess.json, meta.json")
-    ap.add_argument("--bars-json", required=True,
-                    help="Path to JSON file containing OHLCV bars (closed bars)")
-    ap.add_argument("--ticker", default=None,
-                    help="Override ticker (otherwise meta.json or BTCUSDT)")
-    ap.add_argument("--timeframe", default=None,
-                    help="Override timeframe (otherwise meta.json or 1h)")
-    ap.add_argument("--auto-transfer", action="store_true",
-                    help="Try to top up USDT margin for swap if balance is low")
-    ap.add_argument("--transfer-buffer", type=float, default=0.01,
-                    help="Extra fraction to transfer (e.g., 0.01=+1%)")
+    ap.add_argument("--model-dir", required=True, help="Folder with model.pt, preprocess.json, meta.json")
+    ap.add_argument("--bars-json", required=True, help="Path to JSON file containing OHLCV bars (closed bars)")
+    ap.add_argument("--ticker", default=None, help="Override ticker (otherwise meta.json or BTCUSDT)")
+    ap.add_argument("--timeframe", default=None, help="Override timeframe (otherwise meta.json or 1h)")
+    ap.add_argument("--auto-transfer", action="store_true", help="Try to top up USDT margin for swap if balance is low")
+    ap.add_argument("--transfer-buffer", type=float, default=0.01, help="Extra fraction to transfer (e.g., 0.01=+1%)")
+    ap.add_argument("--reversal", choices=["close","flip","cooldown"], default="close",
+                    help="How to react on opposite signal: close (default), flip, cooldown")
+    ap.add_argument("--cooldown-seconds", type=int, default=0, help="Cooldown duration when --reversal=cooldown")
     ap.add_argument("--debug", action="store_true", help="Verbose debug logs")
 
-    # Keys
-    ap.add_argument("--pub_key", default=None,
-                    help="Name of the API key variable (e.g., API_KEY_BYBIT)")
-    ap.add_argument("--sec_key", default=None,
-                    help="Name of the API secret variable (e.g., API_SECRET_BYBIT)")
-    ap.add_argument("--keys-file", default=None,
-                    help="Path to env file with KEY=VALUE pairs (default ~/.ssh/coinex_keys.env). "
-                         "If you use the same file as CoinEx, point it here.")
-
+    ap.add_argument("--pub_key", default=None, help="Name of API key var (e.g., API_KEY_BYBIT)")
+    ap.add_argument("--sec_key", default=None, help="Name of API secret var (e.g., API_SECRET_BYBIT)")
+    ap.add_argument("--keys-file", default=None, help="Env file path with KEY=VALUE pairs (default ~/.ssh/coinex_keys.env)")
     return ap.parse_args()
-
 
 def main():
     args = parse_args()

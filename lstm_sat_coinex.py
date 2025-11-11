@@ -4,20 +4,17 @@
 LSTM Ichimoku runner for CoinEx (USDT linear swap, i.e., futures only).
 
 Key points:
-- Always uses futures (swap) for both LONG and SHORT.
-- No args.category; removed entirely.
-- Bars loaded from a JSON file with closed bars.
-- TorchScript model bundle: model.pt, preprocess.json, meta.json.
+- Always futures (swap). No args.category anywhere.
+- Shared last-bar ID at ~/.sat_state/lastbars.json (override via SAT_STATE_DIR).
+- Per-broker idempotency file in model dir (prevents double actions in same bar).
 - SL/TP exits from meta.json (sl_pct / tp_pct).
-- Pyramiding protection & flip on reversal.
+- Pyramiding protection.
 - 6-minute window after last bar close.
-- Writes/reads SHARED last-bar ID at ~/.sat_state/lastbars.json (override via SAT_STATE_DIR)
-  so other broker scripts (Bybit/Binance/Coinbase) can use the same last-bar identity.
-- Keeps a per-broker idempotency stamp file in the model dir to avoid double action for CoinEx.
-
-CLI keys:
---pub_key/--sec_key are names of variables inside ~/.ssh/coinex_keys.env
-(e.g. API_KEY_COINEX=..., API_SECRET_COINEX=...).
+- Reversal policy:
+    --reversal close     (default): close-only on opposite signal.
+    --reversal flip                  close then open the opposite immediately.
+    --reversal cooldown              close-only and start a cooldown timer; won't open
+                                     until cooldown expires (see --cooldown-seconds).
 """
 
 from __future__ import annotations
@@ -41,25 +38,15 @@ except Exception:
 
 
 # =========================
-# Config / constants
+# Constants / timeframe helpers
 # =========================
 SIX_MIN_MS = 6 * 60 * 1000
 
 TF_TO_MS = {
-    "1m": 60_000,
-    "3m": 180_000,
-    "5m": 300_000,
-    "15m": 900_000,
-    "30m": 1_800_000,
-    "1h": 3_600_000,
-    "2h": 7_200_000,
-    "4h": 14_400_000,
-    "6h": 21_600_000,
-    "8h": 28_800_000,
-    "12h": 43_200_000,
-    "1d": 86_400_000,
+    "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
+    "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000,
+    "6h": 21_600_000, "8h": 28_800_000, "12h": 43_200_000, "1d": 86_400_000,
 }
-
 def tf_ms(tf: str) -> int:
     v = TF_TO_MS.get(str(tf).lower())
     if not v:
@@ -71,10 +58,6 @@ def tf_ms(tf: str) -> int:
 # JSON bars I/O
 # =========================
 def _normalize_bar(b: Dict) -> Optional[Dict]:
-    """
-    Normalize possible bar shapes to:
-      {ts(ms), open, high, low, close, volume}
-    """
     if not isinstance(b, dict):
         return None
     keys = {k.lower(): k for k in b.keys()}
@@ -254,10 +237,6 @@ def load_bundle(model_dir: str):
 # Time helpers
 # =========================
 def resolve_last_closed(now_ms: int, last_bar_open_ms: int, timeframe: str) -> Tuple[Optional[int], str, Optional[int]]:
-    """
-    Returns (last_close_ms, stamp_tag, age_ms).
-    Prefers close_stamp = last_bar_open + step; fallback open_stamp.
-    """
     step = tf_ms(timeframe)
     candidates = [
         (last_bar_open_ms + step, "close_stamp"),
@@ -271,7 +250,7 @@ def resolve_last_closed(now_ms: int, last_bar_open_ms: int, timeframe: str) -> T
 
 
 # =========================
-# Shared last-bar ID store (cross-broker)
+# Shared last-bar ID (cross-broker)
 # =========================
 def state_dir() -> str:
     base = os.getenv("SAT_STATE_DIR", os.path.expanduser("~/.sat_state"))
@@ -296,7 +275,7 @@ def write_lastbars_store(data: Dict[str, Dict]) -> None:
     try:
         with os.fdopen(tmp_fd, "w") as f:
             json.dump(data, f, separators=(",", ":"), sort_keys=True)
-        os.replace(tmp_path, p)  # atomic
+        os.replace(tmp_path, p)
     finally:
         try:
             if os.path.exists(tmp_path):
@@ -322,10 +301,10 @@ def update_shared_lastbar(ticker: str, timeframe: str, last_open_ts_ms: int, las
 
 
 # =========================
-# Per-bundle idempotency (per broker)
+# Per-broker idempotency & reversal state
 # =========================
-def last_executed_guard(model_dir: str, suffix: Optional[str] = None) -> Tuple[Optional[int], str]:
-    fname = ".last_order_ts.txt" if not suffix else f".last_order_ts_{suffix}.txt"
+def last_executed_guard(model_dir: str, suffix: str) -> Tuple[Optional[int], str]:
+    fname = f".last_order_ts_{suffix}.txt"
     path = os.path.join(model_dir, fname)
     if os.path.exists(path):
         try:
@@ -340,15 +319,26 @@ def write_last_executed(path: str, ts_ms: int):
     with open(path, "w") as f:
         f.write(str(int(ts_ms)))
 
+def reversal_state_paths(model_dir: str, suffix: str) -> str:
+    return os.path.join(model_dir, f".reversal_state_{suffix}.json")
+
+def read_reversal_state(path: str) -> Dict[str, int]:
+    if not os.path.exists(path):
+        return {}
+    try:
+        return json.loads(open(path, "r").read())
+    except Exception:
+        return {}
+
+def write_reversal_state(path: str, data: Dict[str, int]):
+    with open(path, "w") as f:
+        json.dump(data, f, separators=(",", ":"))
+
 
 # =========================
 # Exchange helpers (CoinEx - swap only)
 # =========================
 def make_exchange(pub_key_name: Optional[str], sec_key_name: Optional[str]):
-    """
-    Always defaultType='swap' (futures).
-    Keys are looked up in ~/.ssh/coinex_keys.env by variable names.
-    """
     api_key, api_secret = None, None
     if pub_key_name or sec_key_name:
         keyfile = os.path.expanduser("~/.ssh/coinex_keys.env")
@@ -367,13 +357,12 @@ def make_exchange(pub_key_name: Optional[str], sec_key_name: Optional[str]):
         "apiKey": api_key,
         "secret": api_secret,
         "enableRateLimit": True,
-        "options": {"defaultType": "swap"},  # FUTURES ONLY
+        "options": {"defaultType": "swap"},
     })
     ex.load_markets()
     return ex
 
 def resolve_symbol(ex, ticker: str) -> str:
-    # e.g., ETHUSDT -> ETH/USDT:USDT for linear USDT perp
     ticker = ticker.upper().replace("/", "")
     base = ticker[:-4] if ticker.endswith("USDT") else ticker
     candidates = [s for s in ex.symbols if s.startswith(f"{base}/USDT") and (":USDT" in s)]
@@ -394,7 +383,6 @@ def fetch_usdt_balance_swap(ex) -> float:
         return 0.0
 
 def transfer_spot_to_swap_if_needed(ex, min_usdt: float, buffer_frac: float = 0.01, debug: bool = False) -> float:
-    """Best-effort top up for swap account."""
     try:
         swap_free = fetch_usdt_balance_swap(ex)
         if swap_free >= min_usdt:
@@ -442,9 +430,6 @@ def get_swap_position(ex, symbol: str) -> Optional[Dict]:
 # Inference helpers
 # =========================
 def to_sequences_latest(feat_df: pd.DataFrame, features: List[str], lookback: int) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Returns X (2, lookback, n_features) for prev and last bars + ts seq.
-    """
     if len(feat_df) < (lookback + 1):
         raise SystemExit("Not enough rows to build lookback sequences")
     sub = feat_df.iloc[-(lookback+1):].copy().reset_index(drop=True)
@@ -455,17 +440,13 @@ def to_sequences_latest(feat_df: pd.DataFrame, features: List[str], lookback: in
     return X, ts_seq
 
 def run_model(model, X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> Tuple[float, float]:
-    """
-    Returns (p_prev, p_last).
-    """
     Xn = (X - mean) / (std + 1e-12)
     with torch.no_grad():
-        t = torch.from_numpy(Xn).float()  # (2, L, F)
+        t = torch.from_numpy(Xn).float()
         out = model(t)
         if isinstance(out, (list, tuple)):
             out = out[0]
         x = out.squeeze()
-        # if binary logit -> sigmoid; if 2-class -> softmax prob of class 1
         x = torch.sigmoid(x) if x.ndim == 0 or x.shape[-1] != 2 else torch.softmax(x, dim=-1)[..., 1]
         arr = x.detach().cpu().numpy().astype(np.float64)
     if np.ndim(arr) == 0:
@@ -476,7 +457,7 @@ def run_model(model, X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> Tuple[
 
 
 # =========================
-# Core flow (futures only)
+# Core flow (futures only, with reversal policy)
 # =========================
 def decide_and_maybe_trade(args):
     # 1) Load bundle
@@ -501,7 +482,7 @@ def decide_and_maybe_trade(args):
         print("Not enough bars to build features.")
         return
 
-    # Build features & check feature names
+    # Build features & check names
     feat_df_full = build_features(
         df[["timestamp","ts","open","high","low","close","volume"]].copy(),
         ik["tenkan"], ik["kijun"], ik["senkou"], ik["displacement"]
@@ -516,44 +497,44 @@ def decide_and_maybe_trade(args):
     p_prev, p_last = run_model(model, X, mean, std)
     print(f"LSTM inference | p_prev={p_prev:.3f} | p_last={p_last:.3f} | pos_thr={pos_thr:.3f} | neg_thr={neg_thr:.3f}")
 
-    # 5) Time gating (6-minute window after last bar close)
+    # 5) Time gating
     now_ms = int(time.time() * 1000)
     ts_last_open = int(df["ts"].iloc[-1])
     last_close_ms, stamp_tag, age_ms = resolve_last_closed(now_ms, ts_last_open, timeframe)
     if args.debug:
         print(f"[DEBUG] last bar — ts_last={ts_last_open} tag={stamp_tag} age_min={(age_ms/60000.0) if age_ms is not None else None}")
-
     if last_close_ms is None or not (0 <= age_ms <= SIX_MIN_MS):
         print("Last closed bar is not within the 6-minute window — not acting.")
         return
 
-    # 6) Shared last-bar ID (cross-broker coordination)
+    # 6) Shared last-bar ID
     update_shared_lastbar(ticker, timeframe, ts_last_open, last_close_ms)
-    shared = read_lastbars_store().get(f"{ticker}:{timeframe}", {})
     if args.debug:
+        shared = read_lastbars_store().get(f"{ticker}:{timeframe}", {})
         print(f"[DEBUG] shared lastbar: {shared.get('bar_id')} last_close_ts={shared.get('last_close_ts')}")
 
-    # 7) Per-broker idempotency (CoinEx-only guard)
-    guard_suffix = f"coinex_swap_{ticker}_{timeframe}"
-    last_seen_ts, guard_path = last_executed_guard(model_dir, guard_suffix)
+    # 7) Guard & reversal state
+    suffix = f"coinex_swap_{ticker}_{timeframe}"
+    last_seen_ts, guard_path = last_executed_guard(model_dir, suffix)
+    rev_state_path = reversal_state_paths(model_dir, suffix)
+    rev_state = read_reversal_state(rev_state_path)
     if last_seen_ts is not None and last_seen_ts == last_close_ms:
         print("Already acted on this bar for CoinEx — not acting again.")
         return
 
-    # 8) New signal detection
+    # 8) Signal detection
     take_long  = (p_last >= pos_thr) and not (p_prev >= pos_thr)
     take_short = (p_last <= neg_thr) and not (p_prev <= neg_thr)
     if not take_long and not take_short:
         print("No fresh signal on the last bar — not acting.")
         return
 
-    # 9) Connect exchange (swap only)
+    # 9) Exchange (swap only)
     ex = make_exchange(args.pub_key, args.sec_key)
     symbol = resolve_symbol(ex, ticker)
 
-    # 10) Position and SL/TP on swap
+    # 10) Position & SL/TP
     pos = get_swap_position(ex, symbol)
-
     last_close = float(df["close"].iloc[-1])
     last_high  = float(df["high"].iloc[-1])
     last_low   = float(df["low"].iloc[-1])
@@ -562,29 +543,25 @@ def decide_and_maybe_trade(args):
         entry = float(pos.get("entry") or last_close)
         side_open = pos["side"]  # 'long' or 'short'
         sz = float(pos.get("size") or 0.0)
-
-        tp_hit = False
-        sl_hit = False
+        tp_hit = sl_hit = False
         if side_open == "long":
             if tp_pct is not None and last_high >= entry * (1.0 + tp_pct): tp_hit = True
             if sl_pct is not None and last_low  <= entry * (1.0 - sl_pct): sl_hit = True
-        else:  # short
+        else:
             if tp_pct is not None and last_low  <= entry * (1.0 - tp_pct): tp_hit = True
             if sl_pct is not None and last_high >= entry * (1.0 + sl_pct): sl_hit = True
-
         if tp_hit or sl_hit:
             reason = "TP" if tp_hit else "SL"
             try:
-                side = "buy" if side_open == "short" else "sell"  # reduce to close
-                params = {"reduceOnly": True}
+                side = "buy" if side_open == "short" else "sell"
                 print(f"{reason} hit — closing existing {side_open} position.")
-                ex.create_order(symbol, "market", side, sz or 1, None, params)
+                ex.create_order(symbol, "market", side, sz or 1, None, {"reduceOnly": True})
                 write_last_executed(guard_path, last_close_ms)
             except Exception as e:
                 print(f"[ERROR] close on {reason} failed: {e}")
             return
 
-    # 11) Avoid pyramiding (same direction)
+    # 11) Avoid pyramiding
     if pos is not None and pos.get("side") and (
         (take_long  and pos["side"] == "long") or
         (take_short and pos["side"] == "short")
@@ -592,37 +569,71 @@ def decide_and_maybe_trade(args):
         print("Avoiding opening another position - pyramiding.")
         return
 
-    # 12) Flip if necessary (close opposite before open)
-    if pos is not None and pos.get("side"):
+    # 12) Reversal handling (close-only / cooldown / flip)
+    opposite = pos is not None and pos.get("side") and (
+        (pos["side"] == "long" and take_short) or
+        (pos["side"] == "short" and take_long)
+    )
+
+    opened_new = False  # track if we open after flip
+
+    if opposite:
+        # First: close current
         try:
             side_open = pos["side"]
             sz = float(pos.get("size") or 0.0)
-            if (take_long and side_open == "short") or (take_short and side_open == "long"):
-                side = "buy" if side_open == "short" else "sell"
-                print("Signal reversal — closing existing position.")
-                ex.create_order(symbol, "market", side, sz or 1, None, {"reduceOnly": True})
-                time.sleep(0.2)
+            side = "buy" if side_open == "short" else "sell"
+            policy = args.reversal
+            if policy == "flip":
+                print("Signal reversal — flip mode: closing existing, then opening opposite.")
+            elif policy == "cooldown":
+                print("Signal reversal — cooldown mode: closing existing; no new open until cooldown expires.")
+            else:
+                print("Signal reversal — close-only mode: closing existing; not opening a new one this bar.")
+            ex.create_order(symbol, "market", side, sz or 1, None, {"reduceOnly": True})
+            # record reversal time for cooldown
+            if args.reversal in ("close", "cooldown"):
+                rev_state = {"last_close_time_ms": now_ms, "last_bar_ts": int(ts_last_open)}
+                write_reversal_state(rev_state_path, rev_state)
         except Exception as e:
-            print(f"[WARN] failed to close before flip: {e}")
+            print(f"[WARN] failed to close before handling reversal: {e}")
 
-    # 13) Optional top-up for swap
+        if args.reversal == "flip":
+            time.sleep(0.2)  # tiny pause before opening
+        else:
+            # mark executed this bar and exit
+            write_last_executed(guard_path, last_close_ms)
+            return
+
+    # 13) If cooldown active, block opening
+    if args.reversal == "cooldown":
+        cd_ms = int(max(0, args.cooldown_seconds)) * 1000
+        last_close_time_ms = int(rev_state.get("last_close_time_ms", 0))
+        if cd_ms > 0 and (now_ms - last_close_time_ms) < cd_ms:
+            remain = (cd_ms - (now_ms - last_close_time_ms)) / 1000.0
+            print(f"Cooldown active ({remain:.1f}s remaining) — not opening a new position.")
+            write_last_executed(guard_path, last_close_ms)
+            return
+
+    # 14) Optional top-up for swap
     if args.auto_transfer:
         transfer_spot_to_swap_if_needed(ex, min_usdt=50.0, buffer_frac=args.transfer_buffer, debug=args.debug)
 
-    # 14) Open order on swap
+    # 15) Open order (either fresh signal or post-flip)
     try:
         if take_long:
-            side = "buy"   # open LONG
+            side = "buy"
             print("Opening LONG (futures/swap).")
         else:
-            side = "sell"  # open SHORT
+            side = "sell"
             print("Opening SHORT (futures/swap).")
-
-        qty = 1  # adjust sizing as needed in your environment
+        qty = 1
         ex.create_order(symbol, "market", side, qty, None, {"reduceOnly": False})
+        opened_new = True
         write_last_executed(guard_path, last_close_ms)
     except Exception as e:
         print(f"[ERROR] order failed: {e}")
+        # even on failure, leave guard unset so the bar can retry later if you prefer
 
 
 # =========================
@@ -632,27 +643,19 @@ def parse_args():
     ap = argparse.ArgumentParser(
         description="Run LSTM bundle; CoinEx FUTURES (swap) orders on fresh signal within 6 minutes — bars read from a JSON file."
     )
-    ap.add_argument("--model-dir", required=True,
-                    help="Folder with model.pt, preprocess.json, meta.json")
-    ap.add_argument("--bars-json", required=True,
-                    help="Path to JSON file containing OHLCV bars (closed bars)")
-    ap.add_argument("--ticker", default=None,
-                    help="Override ticker (otherwise meta.json or BTCUSDT)")
-    ap.add_argument("--timeframe", default=None,
-                    help="Override timeframe (otherwise meta.json or 1h)")
-    ap.add_argument("--auto-transfer", action="store_true",
-                    help="Auto-transfer USDT from spot→swap before opening futures")
-    ap.add_argument("--transfer-buffer", type=float, default=0.01,
-                    help="Extra fraction to transfer (e.g., 0.01=+1%)")
+    ap.add_argument("--model-dir", required=True, help="Folder with model.pt, preprocess.json, meta.json")
+    ap.add_argument("--bars-json", required=True, help="Path to JSON file containing OHLCV bars (closed bars)")
+    ap.add_argument("--ticker", default=None, help="Override ticker (otherwise meta.json or BTCUSDT)")
+    ap.add_argument("--timeframe", default=None, help="Override timeframe (otherwise meta.json or 1h)")
+    ap.add_argument("--auto-transfer", action="store_true", help="Auto-transfer USDT from spot→swap before opening futures")
+    ap.add_argument("--transfer-buffer", type=float, default=0.01, help="Extra fraction to transfer (e.g., 0.01=+1%)")
+    ap.add_argument("--reversal", choices=["close","flip","cooldown"], default="close",
+                    help="How to react on opposite signal: close (default), flip, cooldown")
+    ap.add_argument("--cooldown-seconds", type=int, default=0, help="Cooldown duration when --reversal=cooldown")
     ap.add_argument("--debug", action="store_true", help="Verbose debug logs")
-
-    # Variable names inside ~/.ssh/coinex_keys.env
-    ap.add_argument("--pub_key", default=None,
-                    help="Name of the API key variable (e.g., API_KEY_COINEX)")
-    ap.add_argument("--sec_key", default=None,
-                    help="Name of the API secret variable (e.g., API_SECRET_COINEX)")
+    ap.add_argument("--pub_key", default=None, help="Name of the API key variable in ~/.ssh/coinex_keys.env")
+    ap.add_argument("--sec_key", default=None, help="Name of the API secret variable in ~/.ssh/coinex_keys.env")
     return ap.parse_args()
-
 
 def main():
     args = parse_args()
