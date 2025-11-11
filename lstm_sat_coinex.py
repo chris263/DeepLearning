@@ -536,16 +536,6 @@ def decide_and_maybe_trade(args):
     # 5) Connect to exchange
     ex = make_exchange(args, category=category)
 
-    # --- Idempotency guard per broker/symbol/timeframe/category ---
-    symbol = resolve_symbol(ex, ticker)
-    sym_safe = symbol.replace("/", "-").replace(":", "-")
-    broker = "coinex"
-    suffix = f"{broker}_{sym_safe}_{timeframe.lower()}_{category}"
-    last_ts_seen, guard_path = last_executed_guard(model_dir, suffix=suffix)
-    if last_ts_seen and last_ts_seen == last_close_ms:
-        print(f"Signal already executed for this bar. Skipping. [guard={guard_path}]")
-        return
-
     # Precision helpers
     def amount_to_precision(ex, symbol, amt):
         prec = ex.markets[symbol]["precision"].get("amount", 8) if symbol in ex.markets else 8
@@ -582,31 +572,20 @@ def decide_and_maybe_trade(args):
 
         if tp_hit or sl_hit:
             close_side = "buy" if pos["side"] == "short" else "sell"
-            close_qty = amount_to_precision(ex, symbol, sz)
+            close_qty = amount_to_precision(ex, ticker, sz)
             reason = "TP hit" if tp_hit else "SL hit"
-            print(f"{reason} — reduce-only MARKET {close_side.upper()} {symbol} qty={close_qty} (entry≈{entry:.6f}, H/L={last_high:.6f}/{last_low:.6f})")
+            print(f"{reason} — reduce-only MARKET {close_side.upper()} {ticker} qty={close_qty} (entry≈{entry:.6f}, H/L={last_high:.6f}/{last_low:.6f})")
             try:
-                ex.create_order(symbol=symbol, type="market", side=close_side, amount=close_qty,
+                ex.create_order(symbol=ticker, type="market", side=close_side, amount=close_qty,
                                 params={"reduceOnly": True})
             except Exception as e:
                 print(f"[ERROR] close failed: {e}")
             return  # do not flip/open new after a stop/take exit
 
-        # 7) No overlapping: flip allowed (close then open) but no pyramiding
+    # 7) No overlapping: open only if there is no active position
     if pos is not None:
-        if (take_long and pos["side"] == "long") or (take_short and pos["side"] == "short"):
-            print("Avoiding opening another position — pyramiding disabled.")
-            return
-        # flip: close existing, then proceed to open
-        close_side = "buy" if pos["side"] == "short" else "sell"
-        close_qty = amount_to_precision(ex, symbol, pos["size"])
-        print(f"Close position sent — reduce-only MARKET {close_side.upper()} {symbol} qty={close_qty}")
-        try:
-            ex.create_order(symbol=symbol, type="market", side=close_side, amount=close_qty, params={"reduceOnly": True})
-        except Exception as e:
-            print(f"[ERROR] close failed: {e}")
-            return
-
+        print("Avoiding opening another position — pyramiding disabled.")
+        return
 
     # 8) Decide side
     if not take_long and not take_short:
@@ -623,13 +602,13 @@ def decide_and_maybe_trade(args):
 
     # Use a conservative sizing (example: 95% of quote for spot longs, or x USD for futures)
     qty = compute_order_size(ex, ticker, category, bal, last_close, side)
-    qty = amount_to_precision(ex, symbol, qty)
+    qty = amount_to_precision(ex, ticker, qty)
     if qty <= 0:
         print("[WARN] Computed qty <= 0 — aborting.")
         return
 
     # 10) Place MARKET order — keep exactly the same server call, no attached brackets
-    px = price_to_precision(ex, symbol, last_close)
+    px = price_to_precision(ex, ticker, last_close)
 
     # Compute reference SL/TP prices from last close and configured percentages.
     sl_price = None
@@ -637,14 +616,14 @@ def decide_and_maybe_trade(args):
     try:
         if side == "buy":
             if sl_pct is not None:
-                sl_price = price_to_precision(ex, symbol, last_close * (1.0 - sl_pct))
+                sl_price = price_to_precision(ex, ticker, last_close * (1.0 - sl_pct))
             if tp_pct is not None:
-                tp_price = price_to_precision(ex, symbol, last_close * (1.0 + tp_pct))
+                tp_price = price_to_precision(ex, ticker, last_close * (1.0 + tp_pct))
         else:  # opening a SHORT
             if sl_pct is not None:
-                sl_price = price_to_precision(ex, symbol, last_close * (1.0 + sl_pct))
+                sl_price = price_to_precision(ex, ticker, last_close * (1.0 + sl_pct))
             if tp_pct is not None:
-                tp_price = price_to_precision(ex, symbol, last_close * (1.0 - tp_pct))
+                tp_price = price_to_precision(ex, ticker, last_close * (1.0 - tp_pct))
     except Exception:
         # keep going even if precision helpers fail
         pass
@@ -653,14 +632,14 @@ def decide_and_maybe_trade(args):
     _tp_str = f"{tp_price:.6f}" if isinstance(tp_price, (int, float)) and tp_price is not None else "-"
     print(f"Placing MARKET {side.upper()} {ticker} qty={qty} (px≈{px}) — prob={p_last:.3f} | SL≈{_sl_str} TP≈{_tp_str}")
     try:
-        order = ex.create_order(symbol=symbol, type="market", side=side, amount=qty)
+        order = ex.create_order(symbol=ticker, type="market", side=side, amount=qty)
         # attach reference SL/TP to the local order dict for logging/tracking (no server-side brackets)
         if isinstance(order, dict):
             order["sat_sl_price"] = sl_price
             order["sat_tp_price"] = tp_price
         oid = order.get("id") or order.get("orderId") or order
         print(f"Order placed: {oid} | SL≈{_sl_str} TP≈{_tp_str}")
-        write_last_executed(guard_path, last_close_ms)
+        write_last_executed(args.guard_path, last_close_ms)
     except Exception as e:
         print(f"[ERROR] order failed: {e}")
 
@@ -687,15 +666,18 @@ def _extract_entry_price(p) -> Optional[float]:
                 pass
     return None
 
+
 def get_open_position(ex, symbol: str):
     """
-    Return {"side": "long"|"short", "size": float, "entry_price": float|None} or None.
+    Return {"side": "long"|"short", "size": float, "entry_price": float|None}
+    or None if flat.
     """
     def _scan(positions):
         for p in positions or []:
             sym = p.get("symbol") or p.get("info", {}).get("symbol")
             if sym and sym != symbol:
                 continue
+            # prefer explicit side string if present
             side_str = (p.get("side") or p.get("positionSide") or p.get("info", {}).get("side") or "").lower()
             size_val = p.get("contracts") or p.get("size") or p.get("positionAmt")
             try:
@@ -715,6 +697,7 @@ def get_open_position(ex, symbol: str):
         return None
 
     try:
+        # try narrow fetch
         pos = _scan(ccxt.Exchange.fetch_positions.__get__(ex, ex)([symbol]))
         if pos:
             return pos
@@ -725,6 +708,17 @@ def get_open_position(ex, symbol: str):
     except Exception:
         return None
 
+    try:
+        pos = _scan(ccxt.Exchange.fetch_positions.__get__(ex, ex)([symbol]))
+        if pos: return pos
+    except Exception:
+        pass
+    try:
+        return _scan(ex.fetch_positions())
+    except Exception:
+        return None
+
+        
 # =========================
 # CLI
 # =========================
