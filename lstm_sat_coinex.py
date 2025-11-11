@@ -536,15 +536,15 @@ def decide_and_maybe_trade(args):
     # 5) Connect to exchange
     ex = make_exchange(args, category=category)
 
-# --- Idempotency: one order per bar per broker/symbol/timeframe/category ---
-symbol = resolve_symbol(ex, ticker)
-sym_safe = symbol.replace("/", "-").replace(":", "-")
-broker = "coinex"
-suffix = f"{broker}_{sym_safe}_{timeframe.lower()}_{category}"
-last_ts_seen, guard_path = last_executed_guard(model_dir, suffix=suffix)
-if last_ts_seen and last_ts_seen == last_close_ms:
-    print(f"Signal already executed for this bar. Skipping. [guard={guard_path}]")
-    return
+    # --- Idempotency guard per broker/symbol/timeframe/category ---
+    symbol = resolve_symbol(ex, ticker)
+    sym_safe = symbol.replace("/", "-").replace(":", "-")
+    broker = "coinex"
+    suffix = f"{broker}_{sym_safe}_{timeframe.lower()}_{category}"
+    last_ts_seen, guard_path = last_executed_guard(model_dir, suffix=suffix)
+    if last_ts_seen and last_ts_seen == last_close_ms:
+        print(f"Signal already executed for this bar. Skipping. [guard={guard_path}]")
+        return
 
     # Precision helpers
     def amount_to_precision(ex, symbol, amt):
@@ -556,7 +556,7 @@ if last_ts_seen and last_ts_seen == last_close_ms:
         return float(ex.price_to_precision(symbol, px)) if hasattr(ex, "price_to_precision") else round(float(px), prec)
 
     # 6) Position checks and exits (SL/TP closures if already in position)
-    pos = get_open_position(ex, symbol, timeframe, category)
+    pos = get_open_position(ex, ticker, timeframe, category)
     last_close = float(df["close"].iloc[-1])
     last_high  = float(df["high"].iloc[-1])
     last_low   = float(df["low"].iloc[-1])
@@ -592,10 +592,21 @@ if last_ts_seen and last_ts_seen == last_close_ms:
                 print(f"[ERROR] close failed: {e}")
             return  # do not flip/open new after a stop/take exit
 
-    # 7) No overlapping: open only if there is no active position
-    if pos is not None:
+    # 7) No overlapping: flip allowed (close then open) but no pyramiding
+if pos is not None:
+    if (take_long and pos["side"] == "long") or (take_short and pos["side"] == "short"):
         print("Avoiding opening another position — pyramiding disabled.")
         return
+    # flip: close existing, then proceed to open
+    close_side = "buy" if pos["side"] == "short" else "sell"
+    close_qty = amount_to_precision(ex, symbol, pos["size"])
+    print(f"Close position sent — reduce-only MARKET {close_side.upper()} {symbol} qty={close_qty}")
+    try:
+        ex.create_order(symbol=symbol, type="market", side=close_side, amount=close_qty, params={"reduceOnly": True})
+    except Exception as e:
+        print(f"[ERROR] close failed: {e}")
+        return
+
 
     # 8) Decide side
     if not take_long and not take_short:
@@ -683,13 +694,38 @@ def get_open_position(ex, symbol: str):
     """
     def _scan(positions):
         for p in positions or []:
-            if p.get("symbol") and p["symbol"] != symbol:
+            sym = p.get("symbol") or p.get("info", {}).get("symbol")
+            if sym and sym != symbol:
                 continue
-            size = float(p.get("contracts") or p.get("size") or p.get("positionAmt") or 0)
-            if abs(size) > 0:
-                side = (p.get("side") or ("long" if size > 0 else "short")).lower()
-                entry_price = _extract_entry_price(p)
-                return {"side": side, "size": abs(size), "entry_price": entry_price}
+            # prefer explicit side string if present
+            side_str = (p.get("side") or p.get("positionSide") or p.get("info", {}).get("side") or "").lower()
+            size_val = p.get("contracts") or p.get("size") or p.get("positionAmt")
+            try:
+                size = float(size_val if size_val is not None else 0.0)
+            except Exception:
+                size = 0.0
+            if abs(size) <= 0:
+                continue
+            if side_str in ("buy","long"):
+                side = "long"
+            elif side_str in ("sell","short"):
+                side = "short"
+            else:
+                side = "long" if size > 0 else "short"
+            entry_price = _extract_entry_price(p) or _extract_entry_price(p.get("info", {}))
+            return {"side": side, "size": abs(size), "entry_price": entry_price}
+        return None
+
+    try:
+        # try narrow fetch
+        pos = _scan(ccxt.Exchange.fetch_positions.__get__(ex, ex)([symbol]))
+        if pos:
+            return pos
+    except Exception:
+        pass
+    try:
+        return _scan(ex.fetch_positions())
+    except Exception:
         return None
 
     try:
