@@ -536,6 +536,16 @@ def decide_and_maybe_trade(args):
     # 5) Connect to exchange
     ex = make_exchange(args, category=category)
 
+# --- Idempotency: one order per bar per broker/symbol/timeframe/category ---
+symbol = resolve_symbol(ex, ticker)
+sym_safe = symbol.replace("/", "-").replace(":", "-")
+broker = "coinex"
+suffix = f"{broker}_{sym_safe}_{timeframe.lower()}_{category}"
+last_ts_seen, guard_path = last_executed_guard(model_dir, suffix=suffix)
+if last_ts_seen and last_ts_seen == last_close_ms:
+    print(f"Signal already executed for this bar. Skipping. [guard={guard_path}]")
+    return
+
     # Precision helpers
     def amount_to_precision(ex, symbol, amt):
         prec = ex.markets[symbol]["precision"].get("amount", 8) if symbol in ex.markets else 8
@@ -546,7 +556,7 @@ def decide_and_maybe_trade(args):
         return float(ex.price_to_precision(symbol, px)) if hasattr(ex, "price_to_precision") else round(float(px), prec)
 
     # 6) Position checks and exits (SL/TP closures if already in position)
-    pos = get_open_position(ex, ticker, timeframe, category)
+    pos = get_open_position(ex, symbol, timeframe, category)
     last_close = float(df["close"].iloc[-1])
     last_high  = float(df["high"].iloc[-1])
     last_low   = float(df["low"].iloc[-1])
@@ -572,11 +582,11 @@ def decide_and_maybe_trade(args):
 
         if tp_hit or sl_hit:
             close_side = "buy" if pos["side"] == "short" else "sell"
-            close_qty = amount_to_precision(ex, ticker, sz)
+            close_qty = amount_to_precision(ex, symbol, sz)
             reason = "TP hit" if tp_hit else "SL hit"
             print(f"{reason} — reduce-only MARKET {close_side.upper()} {ticker} qty={close_qty} (entry≈{entry:.6f}, H/L={last_high:.6f}/{last_low:.6f})")
             try:
-                ex.create_order(symbol=ticker, type="market", side=close_side, amount=close_qty,
+                ex.create_order(symbol=symbol, type="market", side=close_side, amount=close_qty,
                                 params={"reduceOnly": True})
             except Exception as e:
                 print(f"[ERROR] close failed: {e}")
@@ -602,13 +612,13 @@ def decide_and_maybe_trade(args):
 
     # Use a conservative sizing (example: 95% of quote for spot longs, or x USD for futures)
     qty = compute_order_size(ex, ticker, category, bal, last_close, side)
-    qty = amount_to_precision(ex, ticker, qty)
+    qty = amount_to_precision(ex, symbol, qty)
     if qty <= 0:
         print("[WARN] Computed qty <= 0 — aborting.")
         return
 
     # 10) Place MARKET order — keep exactly the same server call, no attached brackets
-    px = price_to_precision(ex, ticker, last_close)
+    px = price_to_precision(ex, symbol, last_close)
 
     # Compute reference SL/TP prices from last close and configured percentages.
     sl_price = None
@@ -616,14 +626,14 @@ def decide_and_maybe_trade(args):
     try:
         if side == "buy":
             if sl_pct is not None:
-                sl_price = price_to_precision(ex, ticker, last_close * (1.0 - sl_pct))
+                sl_price = price_to_precision(ex, symbol, last_close * (1.0 - sl_pct))
             if tp_pct is not None:
-                tp_price = price_to_precision(ex, ticker, last_close * (1.0 + tp_pct))
+                tp_price = price_to_precision(ex, symbol, last_close * (1.0 + tp_pct))
         else:  # opening a SHORT
             if sl_pct is not None:
-                sl_price = price_to_precision(ex, ticker, last_close * (1.0 + sl_pct))
+                sl_price = price_to_precision(ex, symbol, last_close * (1.0 + sl_pct))
             if tp_pct is not None:
-                tp_price = price_to_precision(ex, ticker, last_close * (1.0 - tp_pct))
+                tp_price = price_to_precision(ex, symbol, last_close * (1.0 - tp_pct))
     except Exception:
         # keep going even if precision helpers fail
         pass
@@ -632,14 +642,14 @@ def decide_and_maybe_trade(args):
     _tp_str = f"{tp_price:.6f}" if isinstance(tp_price, (int, float)) and tp_price is not None else "-"
     print(f"Placing MARKET {side.upper()} {ticker} qty={qty} (px≈{px}) — prob={p_last:.3f} | SL≈{_sl_str} TP≈{_tp_str}")
     try:
-        order = ex.create_order(symbol=ticker, type="market", side=side, amount=qty)
+        order = ex.create_order(symbol=symbol, type="market", side=side, amount=qty)
         # attach reference SL/TP to the local order dict for logging/tracking (no server-side brackets)
         if isinstance(order, dict):
             order["sat_sl_price"] = sl_price
             order["sat_tp_price"] = tp_price
         oid = order.get("id") or order.get("orderId") or order
         print(f"Order placed: {oid} | SL≈{_sl_str} TP≈{_tp_str}")
-        write_last_executed(args.guard_path, last_close_ms)
+        write_last_executed(guard_path, last_close_ms)
     except Exception as e:
         print(f"[ERROR] order failed: {e}")
 
