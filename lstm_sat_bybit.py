@@ -614,10 +614,38 @@ def decide_and_maybe_trade(args):
     # place order
     try:
         px = price_to_precision(ex, symbol, last_close)
-        print(f"Placing MARKET {side.upper()} {symbol} qty={qty} (px≈{px}) — prob={p_last:.3f}")
+
+        # --- Compute reference SL/TP from last_close and configured percentages (no bracket orders) ---
+        sl_price = None
+        tp_price = None
+        try:
+            if side == "buy":
+                if sl_pct is not None:
+                    sl_price = price_to_precision(ex, symbol, last_close * (1.0 - sl_pct))
+                if tp_pct is not None:
+                    tp_price = price_to_precision(ex, symbol, last_close * (1.0 + tp_pct))
+            else:  # opening a SHORT
+                if sl_pct is not None:
+                    sl_price = price_to_precision(ex, symbol, last_close * (1.0 + sl_pct))
+                if tp_pct is not None:
+                    tp_price = price_to_precision(ex, symbol, last_close * (1.0 - tp_pct))
+        except Exception:
+            # keep going even if precision helpers fail
+            pass
+
+        _sl_str = f"{sl_price:.6f}" if (sl_price is not None and isinstance(sl_price, (int, float))) else "-"
+        _tp_str = f"{tp_price:.6f}" if (tp_price is not None and isinstance(tp_price, (int, float))) else "-"
+
+        print(f"Placing MARKET {side.upper()} {symbol} qty={qty} (px≈{px}) — prob={p_last:.3f} | SL≈{_sl_str} TP≈{_tp_str}")
         order = ex.create_order(symbol=symbol, type="market", side=side, amount=qty)
+
+        # Attach reference SL/TP to the returned order object (local-only metadata)
+        if isinstance(order, dict):
+            order["sat_sl_price"] = sl_price
+            order["sat_tp_price"] = tp_price
+
         oid = order.get("id") or order.get("orderId") or order.get("info", {}).get("orderId")
-        print(f"Order placed: {oid}")
+        print(f"Order placed: {oid} | SL≈{_sl_str} TP≈{_tp_str}")
         write_last_executed(guard_path, last_close_ms)
     except Exception as e:
         print(f"[ERROR] order failed: {e}")

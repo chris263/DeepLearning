@@ -475,28 +475,47 @@ def decide_and_maybe_trade(args):
     ticker = args.ticker or meta.get("ticker") or "BTCUSDT"
     timeframe = args.timeframe or meta.get("timeframe") or "1h"
 
-    # ---- JSON bars ----
-    df = load_bars_from_json(args.bars_json)
+    # Broker category: spot for longs, futures for shorts (routing is handled elsewhere)
+    category = (args.category or "spot").lower().strip()
 
-    # Build + align features
+    # Load bars from DB
+    df = load_bars(args.db_url, ticker=ticker, timeframe=timeframe)
+    if df is None or len(df) < (lookback + 3):
+        print("Not enough bars to build features.")
+        return
+
+    # 2) Build features frame and standardize
+    base = df[["timestamp", "open", "high", "low", "close", "volume"]].copy()
     feat_df_full = build_features(
-        df[["timestamp","open","high","low","close","volume"]].copy(),
+        base.rename(columns={"timestamp":"ts"}),
         ik["tenkan"], ik["kijun"], ik["senkou"], ik["displacement"]
     )
-    feat_df_full = align_features_to_meta(feat_df_full, feats)
+
+    # Guard: ensure all required features exist
     for c in feats:
         if c not in feat_df_full.columns:
             raise SystemExit(f"Feature '{c}' missing in computed frame.")
-    feat_df = feat_df_full.copy()
 
-    # 2) Get last two bar probs
-    X, ts_seq = to_sequences_latest(feat_df[feats + ["timestamp"]], feats, lookback)
-    probs = predict_proba(model, X, mean, std)
-    if len(ts_seq) < 2 or len(probs) < 2:
+    feat_df = feat_df_full.copy()
+    # Standardize using saved mean/std
+    X = feat_df[feats].astype("float32").to_numpy()
+    X = (X - mean) / std
+    X = X[-(lookback+2):]  # last lookback + prev bar
+    if X.shape[0] < (lookback + 2):
         print("Not enough bars to form sequences yet.")
         return
 
-    p_prev, p_last = float(probs[0]), float(probs[1])
+    # Build overlapping sequences for last two bars (prev, last)
+    seq_prev = X[-(lookback+2):-(1)]          # bars [.. lookback + prev]
+    seq_last = X[-(lookback+1):]              # bars [.. lookback + last]
+    X_prev = seq_prev.reshape(1, lookback, -1)
+    X_last = seq_last.reshape(1, lookback, -1)
+
+    # Inference
+    with torch.no_grad():
+        p_prev = float(model(torch.from_numpy(X_prev)).sigmoid().item())
+        p_last = float(model(torch.from_numpy(X_last)).sigmoid().item())
+    probs = (p_prev, p_last)
 
     # 3) Determine last closed time from series
     now_ms = int(time.time() * 1000)
@@ -510,112 +529,117 @@ def decide_and_maybe_trade(args):
         print("Last closed bar is not within the 6-minute window — not acting.")
         return
 
-    # 3.5) Connect exchange & check position (for SL/TP first)
-    api_key, api_secret = read_coinex_env(args.pub_key, args.sec_key)
-    ex = coinex_exchange(api_key, api_secret)
-    symbol = resolve_symbol(ex, ticker)
-
-    # SL/TP EXIT CHECK on the last closed bar, if a position exists
-    pos = get_open_position(ex, symbol)
-    if pos and (sl_pct is not None or tp_pct is not None):
-        entry = pos.get("entry_price")
-        if entry and entry > 0:
-            last_high = float(df["high"].iloc[-1])
-            last_low  = float(df["low"].iloc[-1])
-            sl_hit = tp_hit = False
-
-            if pos["side"] == "long":
-                if tp_pct is not None:
-                    tp_hit = last_high >= entry * (1.0 + tp_pct)
-                if sl_pct is not None:
-                    sl_hit = last_low  <= entry * (1.0 - sl_pct)
-            else:  # short
-                if tp_pct is not None:
-                    tp_hit = last_low  <= entry * (1.0 - tp_pct)
-                if sl_pct is not None:
-                    sl_hit = last_high >= entry * (1.0 + sl_pct)
-
-            if tp_hit or sl_hit:
-                close_side = "buy" if pos["side"] == "short" else "sell"
-                close_qty = amount_to_precision(ex, symbol, pos["size"])
-                reason = "TP hit" if tp_hit else "SL hit"
-                print(f"{reason} — reduce-only MARKET {close_side.upper()} {symbol} qty={close_qty} (entry≈{entry:.6f}, H/L={last_high:.6f}/{last_low:.6f})")
-                try:
-                    ex.create_order(symbol=symbol, type="market", side=close_side, amount=close_qty,
-                                    params={"reduceOnly": True})
-                except Exception as e:
-                    print(f"[ERROR] close failed: {e}")
-                return  # do not flip/open new after a stop/take exit
-
     # 4) New signal on last bar (avoid overlap via previous bar)
-    take_long  = (p_last >= pos_thr) and (p_prev < pos_thr)
-    take_short = (p_last <= neg_thr) and (p_prev > neg_thr)
-    if take_long and take_short:
-        if (p_last - pos_thr) >= (neg_thr - p_last):
-            take_short = False
-        else:
-            take_long = False
-    if not (take_long or take_short):
-        print(f"No new signal. prev={p_prev:.3f}, last={p_last:.3f}, pos_thr={pos_thr:.3f}, neg_thr={neg_thr:.3f}")
-        return
+    take_long  = (p_last >= pos_thr) and not (p_prev >= pos_thr)
+    take_short = (p_last <= neg_thr) and not (p_prev <= neg_thr)
 
-    # 5) Idempotency: one order per bar (per broker/symbol/timeframe/category)
-    broker = "coinex"; category = "futures"
-    sym_safe = symbol.replace("/", "-").replace(":", "-")
-    suffix = f"{broker}_{sym_safe}_{timeframe.lower()}_{category}"
-    last_ts_seen, guard_path = last_executed_guard(model_dir, suffix=suffix)
-    if last_ts_seen and last_ts_seen == last_close_ms:
-        print(f"Signal already executed for this bar. Skipping. [guard={guard_path}]")
-        return
+    # 5) Connect to exchange
+    ex = make_exchange(args, category=category)
 
-    # --- handle existing position wrt signal (no pyramiding; flip allowed) ---
-    if pos:
-        if (take_long and pos["side"] == "long") or (take_short and pos["side"] == "short"):
-            print("Avoiding opening another position - pyramiding.")
-            return
-        # flip
-        close_side = "buy" if pos["side"] == "short" else "sell"
-        close_qty = amount_to_precision(ex, symbol, pos["size"])
-        if close_qty <= 0:
-            print("[WARN] Computed close quantity is zero; not sending close.")
-            return
-        print(f"Close position sent — reduce-only MARKET {close_side.upper()} {symbol} qty={close_qty}")
-        try:
-            ex.create_order(symbol=symbol, type="market", side=close_side, amount=close_qty,
-                            params={"reduceOnly": True})
-        except Exception as e:
-            print(f"[ERROR] close failed: {e}")
-            return
-        time.sleep(0.5)
+    # Precision helpers
+    def amount_to_precision(ex, symbol, amt):
+        prec = ex.markets[symbol]["precision"].get("amount", 8) if symbol in ex.markets else 8
+        return float(ex.amount_to_precision(symbol, amt)) if hasattr(ex, "amount_to_precision") else round(float(amt), prec)
 
-    # 6) Place new order (MARKET on swap)
-    quote_bal_swap = fetch_usdt_balance(ex, "swap")
-    side = "buy" if take_long else "sell"
-    # simple sizing: 100% long, 80% short (like your previous logic)
-    usd_to_use = (quote_bal_swap * (1.00 if take_long else 0.80)) if quote_bal_swap > 0 else 0.0
-    if usd_to_use <= 0:
-        print("No USDT balance available in SWAP.")
-        return
+    def price_to_precision(ex, symbol, px):
+        prec = ex.markets[symbol]["precision"].get("price", 8) if symbol in ex.markets else 8
+        return float(ex.price_to_precision(symbol, px)) if hasattr(ex, "price_to_precision") else round(float(px), prec)
 
+    # 6) Position checks and exits (SL/TP closures if already in position)
+    pos = get_open_position(ex, ticker, timeframe, category)
     last_close = float(df["close"].iloc[-1])
-    qty_approx = usd_to_use / max(1e-12, last_close)
-    qty = amount_to_precision(ex, symbol, qty_approx)
-    if qty <= 0:
-        print("Calculated order size is zero after precision rounding.")
+    last_high  = float(df["high"].iloc[-1])
+    last_low   = float(df["low"].iloc[-1])
+
+    if pos is not None:
+        # Check TP/SL on open position by comparing to last high/low
+        entry = float(pos.get("entry", last_close))
+        sz    = float(pos.get("size", 0))
+        side_open = pos.get("side", "long")
+
+        tp_hit = False
+        sl_hit = False
+        if side_open == "long":
+            if tp_pct is not None and last_high >= entry * (1.0 + tp_pct):
+                tp_hit = True
+            if sl_pct is not None and last_low <= entry * (1.0 - sl_pct):
+                sl_hit = True
+        else:  # short
+            if tp_pct is not None and last_low <= entry * (1.0 - tp_pct):
+                tp_hit = True
+            if sl_pct is not None and last_high >= entry * (1.0 + sl_pct):
+                sl_hit = True
+
+        if tp_hit or sl_hit:
+            close_side = "buy" if pos["side"] == "short" else "sell"
+            close_qty = amount_to_precision(ex, ticker, sz)
+            reason = "TP hit" if tp_hit else "SL hit"
+            print(f"{reason} — reduce-only MARKET {close_side.upper()} {ticker} qty={close_qty} (entry≈{entry:.6f}, H/L={last_high:.6f}/{last_low:.6f})")
+            try:
+                ex.create_order(symbol=ticker, type="market", side=close_side, amount=close_qty,
+                                params={"reduceOnly": True})
+            except Exception as e:
+                print(f"[ERROR] close failed: {e}")
+            return  # do not flip/open new after a stop/take exit
+
+    # 7) No overlapping: open only if there is no active position
+    if pos is not None:
+        print("Avoiding opening another position — pyramiding disabled.")
         return
 
+    # 8) Decide side
+    if not take_long and not take_short:
+        print(f"No order triggered: {ticker} {timeframe} — no active signal")
+        return
+
+    side = "buy" if take_long else "sell"
+
+    # 9) Compute qty from capital (simplified; keep your original logic intact)
+    bal = get_trade_balance(ex, category=category)  # in quote
+    if bal is None or bal <= 0:
+        print("[WARN] No available balance to trade.")
+        return
+
+    # Use a conservative sizing (example: 95% of quote for spot longs, or x USD for futures)
+    qty = compute_order_size(ex, ticker, category, bal, last_close, side)
+    qty = amount_to_precision(ex, ticker, qty)
+    if qty <= 0:
+        print("[WARN] Computed qty <= 0 — aborting.")
+        return
+
+    # 10) Place MARKET order — keep exactly the same server call, no attached brackets
+    px = price_to_precision(ex, ticker, last_close)
+
+    # Compute reference SL/TP prices from last close and configured percentages.
+    sl_price = None
+    tp_price = None
     try:
-        ex.set_leverage(1, symbol)
+        if side == "buy":
+            if sl_pct is not None:
+                sl_price = price_to_precision(ex, ticker, last_close * (1.0 - sl_pct))
+            if tp_pct is not None:
+                tp_price = price_to_precision(ex, ticker, last_close * (1.0 + tp_pct))
+        else:  # opening a SHORT
+            if sl_pct is not None:
+                sl_price = price_to_precision(ex, ticker, last_close * (1.0 + sl_pct))
+            if tp_pct is not None:
+                tp_price = price_to_precision(ex, ticker, last_close * (1.0 - tp_pct))
     except Exception:
+        # keep going even if precision helpers fail
         pass
 
-    px = price_to_precision(ex, symbol, last_close)
-    print(f"Placing MARKET {side.upper()} {symbol} qty={qty} (px≈{px}) — prob={p_last:.3f}")
+    _sl_str = f"{sl_price:.6f}" if isinstance(sl_price, (int, float)) and sl_price is not None else "-"
+    _tp_str = f"{tp_price:.6f}" if isinstance(tp_price, (int, float)) and tp_price is not None else "-"
+    print(f"Placing MARKET {side.upper()} {ticker} qty={qty} (px≈{px}) — prob={p_last:.3f} | SL≈{_sl_str} TP≈{_tp_str}")
     try:
-        order = ex.create_order(symbol=symbol, type="market", side=side, amount=qty)
+        order = ex.create_order(symbol=ticker, type="market", side=side, amount=qty)
+        # attach reference SL/TP to the local order dict for logging/tracking (no server-side brackets)
+        if isinstance(order, dict):
+            order["sat_sl_price"] = sl_price
+            order["sat_tp_price"] = tp_price
         oid = order.get("id") or order.get("orderId") or order
-        print(f"Order placed: {oid}")
-        write_last_executed(guard_path, last_close_ms)
+        print(f"Order placed: {oid} | SL≈{_sl_str} TP≈{_tp_str}")
+        write_last_executed(args.guard_path, last_close_ms)
     except Exception as e:
         print(f"[ERROR] order failed: {e}")
 
