@@ -704,31 +704,108 @@ def decide_and_maybe_trade(args):
     if args.auto_transfer:
         transfer_spot_to_swap_if_needed(ex, min_usdt=50.0, buffer_frac=args.transfer_buffer, debug=args.debug)
 
-    # 15) OPEN order — balance-based sizing (old behavior)
+    # 15) OPEN order — balance-based sizing (with verification + retry)
     try:
         quote_bal_swap = fetch_usdt_balance_swap(ex)
         side = "buy" if take_long else "sell"
         usd_to_use = (quote_bal_swap * (1.00 if take_long else 0.80)) if quote_bal_swap > 0 else 0.0
+        if args.debug:
+            print(f"[DEBUG] swap free USDT={quote_bal_swap:.4f} using={usd_to_use:.4f}")
         if usd_to_use <= 0:
             print("No USDT balance available in UNIFIED/swap.")
             return
+
+        # Market limits sanity (qty + notional)
+        mkt = ex.market(symbol)
+        last_close = float(df["close"].iloc[-1])
         qty_approx = usd_to_use / max(1e-12, last_close)
+
+        # Round to precision
         qty = amount_to_precision(ex, symbol, qty_approx)
-        if qty <= 0:
-            print("Calculated order size is zero after precision rounding.")
+        px  = price_to_precision(ex, symbol, last_close)
+
+        # Enforce min amount / min cost if present
+        min_qty  = float((((mkt.get("limits") or {}).get("amount") or {}).get("min") or 0) or 0)
+        min_cost = float((((mkt.get("limits") or {}).get("cost")   or {}).get("min") or 0) or 0)
+        notional = qty * px
+        if qty <= 0 or (min_qty and qty < min_qty) or (min_cost and notional < min_cost):
+            print(f"[WARN] Order below market limits "
+                  f"(qty={qty} min_qty={min_qty} notional≈{notional:.4f} min_cost={min_cost}). Not acting.")
             return
+
+        # One-way position mode (best effort)
+        try:
+            ex.set_position_mode(False, symbol)
+        except Exception:
+            pass
         try:
             ex.set_leverage(1, symbol)
         except Exception:
             pass
-        px = price_to_precision(ex, symbol, last_close)
-        print(f"Opening {('LONG' if side=='buy' else 'SHORT')} (futures/swap) — MARKET {side.upper()} {symbol} qty={qty} (px≈{px})")
-        order = ex.create_order(symbol, "market", side, qty, None, {"reduceOnly": False, "accountType": "UNIFIED"})
-        oid = order.get("id") or order.get("orderId") or order
+
+        # Position before
+        pos_before = get_swap_position(ex, symbol) or {}
+
+        params = {
+            "reduceOnly": False,
+            "accountType": "UNIFIED",
+            "category": "linear",     # Bybit v5
+            "timeInForce": "IOC",     # market IOC
+        }
+
+        print(f"Opening {('LONG' if side=='buy' else 'SHORT')} (futures/swap) — "
+              f"MARKET {side.upper()} {symbol} qty={qty} (px≈{px})")
+
+        order = ex.create_order(symbol, "market", side, qty, None, params)
+        oid = order.get("id") or order.get("orderId") or (order.get("info", {}) or {}).get("orderId") or order
         print(f"Order placed: {oid}")
-        write_last_executed(guard_path, last_close_ms)
+
+        # Verify via position delta (most reliable for market orders)
+        time.sleep(0.8)
+        pos_after = get_swap_position(ex, symbol) or {}
+        sz_before = float(pos_before.get("size") or 0.0)
+        sz_after  = float(pos_after.get("size")  or 0.0)
+        opened = (sz_after > sz_before + 1e-12) and (
+            (side == "buy"  and (pos_after.get("side") == "long")) or
+            (side == "sell" and (pos_after.get("side") == "short"))
+        )
+
+        if not opened:
+            # Try to fetch normalized order status (may be missing for fully-filled market orders)
+            try:
+                ord2 = ex.fetch_order(oid, symbol)
+                status = ord2.get("status")
+                filled = ord2.get("filled")
+                remaining = ord2.get("remaining")
+                info = ord2.get("info")
+                print(f"[WARN] Order not reflected in position — status={status} filled={filled} "
+                      f"remaining={remaining} info={info}")
+            except Exception as e:
+                print(f"[WARN] Could not verify via fetch_order: {e}")
+
+            # Retry once with convenience helpers
+            try:
+                if side == "buy":
+                    ord_retry = ex.create_market_buy_order(symbol, qty, params)
+                else:
+                    ord_retry = ex.create_market_sell_order(symbol, qty, params)
+                oid2 = ord_retry.get("id") or ord_retry
+                print(f"[RETRY] Order placed: {oid2}")
+                time.sleep(0.6)
+                pos_after2 = get_swap_position(ex, symbol) or {}
+                sz_after2  = float(pos_after2.get("size") or 0.0)
+                opened = (sz_after2 > sz_before + 1e-12)
+            except Exception as e2:
+                print(f"[ERROR] Retry failed: {e2}")
+
+        if opened:
+            write_last_executed(guard_path, last_close_ms)
+        else:
+            print("[ERROR] Order did not result in an open position; check API keys, permissions, balance, and account type.")
+
     except Exception as e:
         print(f"[ERROR] order failed: {e}")
+
 
 
 # =========================
