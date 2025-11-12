@@ -4,13 +4,16 @@
 LSTM Ichimoku runner for Bybit (USDT linear swap, unified account).
 
 - Always futures (swap). No args.category.
+- Fresh-cross trigger (old logic).
+- Close-only on reversal by default (new logic). Optional: --reversal flip|cooldown
+- SL/TP exits from meta.json (sl_pct / tp_pct).
+- Balance-based sizing: 100% long, 80% short (USDT in unified).
+- Feature-name alignment to meta["features"].
+- 6-minute window after last bar close (open+step).
 - Shared last-bar ID at ~/.sat_state/lastbars.json (override via SAT_STATE_DIR).
 - Per-broker idempotency file in model dir.
-- SL/TP exits from meta.json (sl_pct / tp_pct).
-- Pyramiding protection.
-- 6-minute window after last bar close.
-- Reversal policy: --reversal {close,flip,cooldown} (default: close),
-                   --cooldown-seconds N for cooldown mode.
+
+Requires: torch, ccxt, numpy, pandas
 """
 
 from __future__ import annotations
@@ -33,6 +36,9 @@ except Exception:
     raise
 
 
+# =========================
+# Constants / timeframe helpers
+# =========================
 SIX_MIN_MS = 6 * 60 * 1000
 TF_TO_MS = {
     "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
@@ -46,6 +52,9 @@ def tf_ms(tf: str) -> int:
     return v
 
 
+# =========================
+# JSON bars I/O
+# =========================
 def _normalize_bar(b: Dict) -> Optional[Dict]:
     if not isinstance(b, dict):
         return None
@@ -56,16 +65,22 @@ def _normalize_bar(b: Dict) -> Optional[Dict]:
             if k in b:
                 return b[k]
         return default
-    ts = g("ts", "timestamp", "time", "t", default=None)
+    ts = g("ts", "timestamp", "time", "t", "open_time", "opentime", default=None)
     if ts is None:
         return None
+    if isinstance(ts, str):
+        try:
+            ts_dt = pd.to_datetime(ts, utc=True)
+            ts = int(ts_dt.value // 1_000_000)
+        except Exception:
+            return None
     ts = int(ts)
     if ts < 10_000_000_000:
         ts *= 1000
     try:
         o = float(g("open", "o")); h = float(g("high", "h"))
         l = float(g("low", "l"));  c = float(g("close", "c"))
-        v = float(g("volume", "v", "vol"))
+        v = float(g("volume", "v", "vol", default=0.0))
     except Exception:
         return None
     return {"ts": ts, "open": o, "high": h, "low": l, "close": c, "volume": v}
@@ -76,16 +91,18 @@ def load_bars_from_json(path: str) -> pd.DataFrame:
         raise SystemExit(f"Bars JSON not found: {p}")
     content = p.read_text().strip()
     bars: List[Dict] = []
+    # JSON array or wrapped object
     try:
         obj = json.loads(content)
         if isinstance(obj, list):
             bars = obj
         elif isinstance(obj, dict):
-            for key in ("data", "bars", "result", "items"):
+            for key in ("data", "bars", "result", "items", "price"):
                 if key in obj and isinstance(obj[key], list):
                     bars = obj[key]
                     break
     except Exception:
+        # NDJSON fallback
         for line in content.splitlines():
             line = line.strip()
             if not line:
@@ -108,6 +125,9 @@ def load_bars_from_json(path: str) -> pd.DataFrame:
     return df[["timestamp","ts","open","high","low","close","volume"]]
 
 
+# =========================
+# Ichimoku + features
+# =========================
 def rolling_mid(high: pd.Series, low: pd.Series, n: int) -> pd.Series:
     n = int(n)
     hh = high.rolling(n, min_periods=n).max()
@@ -120,11 +140,40 @@ def ichimoku(df: pd.DataFrame, tenkan: int, kijun: int, senkou: int) -> pd.DataF
     d["kijun"]  = rolling_mid(d.high, d.low, kijun)
     d["span_a"] = (d["tenkan"] + d["kijun"]) / 2.0
     d["span_b"] = rolling_mid(d.high, d.low, senkou)
-    d["chikou"] = d["close"].shift(-kijun)
+    d["chikou"] = d["close"].shift(-kijun)  # trainer-parity assumption
     return d
 
 def slope(series: pd.Series, w: int = 8) -> pd.Series:
     return series.diff(w)
+
+# --- Feature synonyms to align to meta["features"] ---
+_SYNONYMS = {
+    "ret1": ["ret_1", "r1", "return1"],
+    "oc_diff": ["ocdiff", "oc_change"],
+    "hl_range": ["hlrange", "high_low_range"],
+    "logv_chg": ["logv_change", "dlogv", "logv_diff"],
+    "dist_px_cloud_top": ["dist_px_cloudtop", "dist_px_cloudTop"],
+    "dist_px_cloud_bot": ["dist_px_cloudbot", "dist_px_cloudBottom"],
+    "dist_tk_kj": ["dist_tk_kijun", "tk_kj_dist"],
+    "span_order": ["spanOrder", "span_order_flag"],
+    "tk_slope": ["tenkan_slope", "tkSlope"],
+    "kj_slope": ["kijun_slope", "kjSlope"],
+    "span_a_slope": ["spana_slope", "spanA_slope"],
+    "span_b_slope": ["spanb_slope", "spanB_slope"],
+    "chikou_above": ["chikouAbove", "chikou_flag"],
+    "vol20": ["vol_20", "volatility20"],
+}
+def align_features_to_meta(feat_df: pd.DataFrame, meta_features: List[str]) -> pd.DataFrame:
+    cols = set(feat_df.columns)
+    for name in meta_features:
+        if name in cols:
+            continue
+        for cand in _SYNONYMS.get(name, []):
+            if cand in cols:
+                feat_df[name] = feat_df[cand]
+                cols.add(name)
+                break
+    return feat_df
 
 def build_features(df: pd.DataFrame, tenkan: int, kijun: int, senkou: int,
                    displacement: int, slope_window: int = 8) -> pd.DataFrame:
@@ -141,11 +190,18 @@ def build_features(df: pd.DataFrame, tenkan: int, kijun: int, senkou: int,
     d["kj_slope"]     = slope(d["kijun"], slope_window)
     d["span_a_slope"] = slope(d["span_a"], slope_window)
     d["span_b_slope"] = slope(d["span_b"], slope_window)
-    d["chikou_above"] = np.where(d["chikou"] > d["close"], 1.0, -1.0)
+    # keep "chikou_above" aligned with displacement-style meta (boolean-to-float)
+    D = int(displacement)
+    d["chikou_above"] = (d["close"] > d["close"].shift(D)).astype(float)
     d["vol20"] = d["volume"].rolling(20, min_periods=1).mean()
+    d["ts"] = df["ts"].values
+    d["timestamp"] = df["timestamp"].values
     return d
 
 
+# =========================
+# Bundle I/O
+# =========================
 def load_bundle(model_dir: str):
     model_dir = os.path.abspath(os.path.expanduser(model_dir))
     meta_path = os.path.join(model_dir, "meta.json")
@@ -188,6 +244,9 @@ def load_bundle(model_dir: str):
     }
 
 
+# =========================
+# Time helpers
+# =========================
 def resolve_last_closed(now_ms: int, last_bar_open_ms: int, timeframe: str) -> Tuple[Optional[int], str, Optional[int]]:
     step = tf_ms(timeframe)
     candidates = [(last_bar_open_ms + step, "close_stamp"), (last_bar_open_ms, "open_stamp")]
@@ -198,6 +257,9 @@ def resolve_last_closed(now_ms: int, last_bar_open_ms: int, timeframe: str) -> T
     return c, tag, age
 
 
+# =========================
+# Shared last-bar ID (cross-broker)
+# =========================
 def state_dir() -> str:
     base = os.getenv("SAT_STATE_DIR", os.path.expanduser("~/.sat_state"))
     pathlib.Path(base).mkdir(parents=True, exist_ok=True)
@@ -244,6 +306,9 @@ def update_shared_lastbar(ticker: str, timeframe: str, last_open_ts_ms: int, las
     write_lastbars_store(store)
 
 
+# =========================
+# Per-broker idempotency & reversal state
+# =========================
 def last_executed_guard(model_dir: str, suffix: str) -> Tuple[Optional[int], str]:
     fname = f".last_order_ts_{suffix}.txt"
     path = os.path.join(model_dir, fname)
@@ -276,6 +341,9 @@ def write_reversal_state(path: str, data: Dict[str, int]):
         json.dump(data, f, separators=(",", ":"))
 
 
+# =========================
+# Exchange helpers (Bybit unified swap)
+# =========================
 def _read_kv_file(path: str) -> Dict[str, str]:
     kv = {}
     if os.path.exists(path):
@@ -296,7 +364,7 @@ def make_exchange(pub_key_name: Optional[str], sec_key_name: Optional[str], keys
     ex = ccxt.bybit({
         "apiKey": api_key, "secret": api_secret,
         "enableRateLimit": True,
-        "options": {"defaultType": "swap", "hedgeMode": False}
+        "options": {"defaultType": "swap", "hedgeMode": False, "accountType": "UNIFIED"}
     })
     ex.load_markets()
     return ex
@@ -349,6 +417,18 @@ def transfer_spot_to_swap_if_needed(ex, min_usdt: float, buffer_frac: float = 0.
         print(f"[WARN] auto-transfer failed: {e}")
         return fetch_usdt_balance_swap(ex)
 
+def amount_to_precision(ex, symbol: str, amount: float) -> float:
+    try:
+        return float(ex.amount_to_precision(symbol, amount))
+    except Exception:
+        return float(f"{amount:.6f}")
+
+def price_to_precision(ex, symbol: str, price: float) -> float:
+    try:
+        return float(ex.price_to_precision(symbol, price))
+    except Exception:
+        return float(f"{price:.6f}")
+
 def get_swap_position(ex, symbol: str) -> Optional[Dict]:
     def _scan(ps):
         if not ps:
@@ -372,6 +452,9 @@ def get_swap_position(ex, symbol: str) -> Optional[Dict]:
         return None
 
 
+# =========================
+# Inference helpers
+# =========================
 def to_sequences_latest(feat_df: pd.DataFrame, features: List[str], lookback: int) -> Tuple[np.ndarray, np.ndarray]:
     if len(feat_df) < (lookback + 1):
         raise SystemExit("Not enough rows to build lookback sequences")
@@ -399,7 +482,11 @@ def run_model(model, X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> Tuple[
     return float(arr[-2]), float(arr[-1])
 
 
+# =========================
+# Core flow (futures only, close-only reversal by default)
+# =========================
 def decide_and_maybe_trade(args):
+    # 1) Load bundle
     bundle = load_bundle(args.model_dir)
     meta = bundle["meta"]; model = bundle["model"]
     feats = bundle["feature_names"]; lookback = bundle["lookback"]
@@ -408,39 +495,46 @@ def decide_and_maybe_trade(args):
     mean, std = bundle["mean"], bundle["std"]
     ik = bundle["ichimoku"]; model_dir = bundle["paths"]["dir"]
 
+    # 2) Resolve ticker/timeframe
     ticker = args.ticker or meta.get("ticker") or "BTCUSDT"
     timeframe = args.timeframe or meta.get("timeframe") or "1h"
 
+    # 3) Load bars (JSON)
     df = load_bars_from_json(args.bars_json)
     if df is None or len(df) < (lookback + 3):
         print("Not enough bars to build features.")
         return
 
+    # Build + align features & check names
     feat_df_full = build_features(
         df[["timestamp","ts","open","high","low","close","volume"]].copy(),
         ik["tenkan"], ik["kijun"], ik["senkou"], ik["displacement"]
     )
+    feat_df_full = align_features_to_meta(feat_df_full, feats)
     for c in feats:
         if c not in feat_df_full.columns:
             raise SystemExit(f"Feature '{c}' missing in computed frame.")
     feat_df = feat_df_full.copy()
 
+    # 4) Inference (prev vs last bar)
     X, ts_seq = to_sequences_latest(feat_df[feats + ["ts"]], feats, lookback)
     p_prev, p_last = run_model(model, X, mean, std)
     print(f"LSTM inference | p_prev={p_prev:.3f} | p_last={p_last:.3f} | pos_thr={pos_thr:.3f} | neg_thr={neg_thr:.3f}")
 
+    # 5) Time gating (6-minute window after close)
     now_ms = int(time.time() * 1000)
     ts_last_open = int(df["ts"].iloc[-1])
     last_close_ms, stamp_tag, age_ms = resolve_last_closed(now_ms, ts_last_open, timeframe)
     if args.debug:
-        print(f"[DEBUG] last bar — ts_last={ts_last_open} tag={stamp_tag} age_min={(age_ms/60000.0) if age_ms is not None else None}")
+        print(f"[DEBUG] last bar — ts_last_open={ts_last_open} tag={stamp_tag} age_min={(age_ms/60000.0) if age_ms is not None else None}")
     if last_close_ms is None or not (0 <= age_ms <= SIX_MIN_MS):
         print("Last closed bar is not within the 6-minute window — not acting.")
         return
 
+    # 6) Shared last-bar ID
     update_shared_lastbar(ticker, timeframe, ts_last_open, last_close_ms)
-    # if args.debug: print shared if you want
 
+    # 7) Guard & reversal state
     suffix = f"bybit_swap_{ticker}_{timeframe}"
     last_seen_ts, guard_path = last_executed_guard(model_dir, suffix)
     rev_state_path = reversal_state_paths(model_dir, suffix)
@@ -449,15 +543,18 @@ def decide_and_maybe_trade(args):
         print("Already acted on this bar for Bybit — not acting again.")
         return
 
-    take_long  = (p_last >= pos_thr) and not (p_prev >= pos_thr)
-    take_short = (p_last <= neg_thr) and not (p_prev <= neg_thr)
+    # 8) Fresh-cross trigger logic (old)
+    take_long  = (p_last >= pos_thr) and (p_prev <  pos_thr)
+    take_short = (p_last <= neg_thr) and (p_prev >  neg_thr)
     if not take_long and not take_short:
         print("No fresh signal on the last bar — not acting.")
         return
 
+    # 9) Exchange (unified swap)
     ex = make_exchange(args.pub_key, args.sec_key, keys_file=args.keys_file)
     symbol = resolve_symbol(ex, ticker)
 
+    # 10) Position & SL/TP
     pos = get_swap_position(ex, symbol)
     last_close = float(df["close"].iloc[-1])
     last_high  = float(df["high"].iloc[-1])
@@ -484,6 +581,7 @@ def decide_and_maybe_trade(args):
                 print(f"[ERROR] close on {reason} failed: {e}")
             return
 
+    # 11) Avoid pyramiding
     if pos is not None and pos.get("side") and (
         (take_long  and pos["side"] == "long") or
         (take_short and pos["side"] == "short")
@@ -491,11 +589,11 @@ def decide_and_maybe_trade(args):
         print("Avoiding opening another position - pyramiding.")
         return
 
+    # 12) Reversal handling (CLOSE ONLY default)
     opposite = pos is not None and pos.get("side") and (
         (pos["side"] == "long" and take_short) or
         (pos["side"] == "short" and take_long)
     )
-
     if opposite:
         try:
             side_open = pos["side"]; sz = float(pos.get("size") or 0.0)
@@ -511,15 +609,14 @@ def decide_and_maybe_trade(args):
             if args.reversal in ("close", "cooldown"):
                 rev_state = {"last_close_time_ms": now_ms, "last_bar_ts": int(ts_last_open)}
                 write_reversal_state(rev_state_path, rev_state)
+                write_last_executed(guard_path, last_close_ms)
+                return
         except Exception as e:
             print(f"[WARN] failed to close before handling reversal: {e}")
-
         if args.reversal == "flip":
-            time.sleep(0.2)
-        else:
-            write_last_executed(guard_path, last_close_ms)
-            return
+            time.sleep(0.2)  # tiny pause before opening
 
+    # 13) Cooldown block (if enabled)
     if args.reversal == "cooldown":
         cd_ms = int(max(0, args.cooldown_seconds)) * 1000
         last_close_time_ms = int(rev_state.get("last_close_time_ms", 0))
@@ -529,21 +626,40 @@ def decide_and_maybe_trade(args):
             write_last_executed(guard_path, last_close_ms)
             return
 
+    # 14) Optional top-up for swap margin
     if args.auto_transfer:
         transfer_spot_to_swap_if_needed(ex, min_usdt=50.0, buffer_frac=args.transfer_buffer, debug=args.debug)
 
+    # 15) OPEN order — balance-based sizing (old behavior)
     try:
-        if take_long:
-            side = "buy"; print("Opening LONG (futures/swap).")
-        else:
-            side = "sell"; print("Opening SHORT (futures/swap).")
-        qty = 1
-        ex.create_order(symbol, "market", side, qty, None, {"reduceOnly": False, "accountType": "UNIFIED"})
+        quote_bal_swap = fetch_usdt_balance_swap(ex)
+        side = "buy" if take_long else "sell"
+        usd_to_use = (quote_bal_swap * (1.00 if take_long else 0.80)) if quote_bal_swap > 0 else 0.0
+        if usd_to_use <= 0:
+            print("No USDT balance available in UNIFIED/swap.")
+            return
+        qty_approx = usd_to_use / max(1e-12, last_close)
+        qty = amount_to_precision(ex, symbol, qty_approx)
+        if qty <= 0:
+            print("Calculated order size is zero after precision rounding.")
+            return
+        try:
+            ex.set_leverage(1, symbol)
+        except Exception:
+            pass
+        px = price_to_precision(ex, symbol, last_close)
+        print(f"Opening {('LONG' if side=='buy' else 'SHORT')} (futures/swap) — MARKET {side.upper()} {symbol} qty={qty} (px≈{px})")
+        order = ex.create_order(symbol, "market", side, qty, None, {"reduceOnly": False, "accountType": "UNIFIED"})
+        oid = order.get("id") or order.get("orderId") or order
+        print(f"Order placed: {oid}")
         write_last_executed(guard_path, last_close_ms)
     except Exception as e:
         print(f"[ERROR] order failed: {e}")
 
 
+# =========================
+# CLI
+# =========================
 def parse_args():
     ap = argparse.ArgumentParser(
         description="Run LSTM bundle; Bybit FUTURES (swap, unified) orders on fresh signal within 6 minutes — bars read from a JSON file."
