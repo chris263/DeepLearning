@@ -503,6 +503,40 @@ def run_model(model, X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> Tuple[
         return float(arr[0]), float(arr[1])
     return float(arr[-2]), float(arr[-1])
 
+def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: float) -> str:
+    fp = lambda x: f"{x:.3f}"
+    # Sanity: neutral band
+    if neg_thr < p_last < pos_thr:
+        return (f"No fresh signal: p_last={fp(p_last)} is inside the neutral band "
+                f"({fp(neg_thr)} < p_last < {fp(pos_thr)}). "
+                f"Fresh-cross requires p_prev<{fp(pos_thr)}≤p_last for LONG or "
+                f"p_prev>{fp(neg_thr)}≥p_last for SHORT.")
+
+    # Already in zones (no re-open without a fresh cross)
+    if p_last >= pos_thr and p_prev >= pos_thr:
+        return (f"No LONG open: previous bar already in LONG zone "
+                f"(p_prev={fp(p_prev)} ≥ pos_thr={fp(pos_thr)}), so no fresh cross. "
+                f"Current p_last={fp(p_last)}.")
+    if p_last <= neg_thr and p_prev <= neg_thr:
+        return (f"No SHORT open: previous bar already in SHORT zone "
+                f"(p_prev={fp(p_prev)} ≤ neg_thr={fp(neg_thr)}), so no fresh cross. "
+                f"Current p_last={fp(p_last)}.")
+
+    # Approaching but didn’t cross
+    if p_prev < pos_thr and p_last < pos_thr:
+        gap = pos_thr - p_last
+        return (f"No LONG: probability stayed below pos_thr "
+                f"(p_prev={fp(p_prev)} → p_last={fp(p_last)}; needs +{fp(gap)} to reach {fp(pos_thr)}).")
+    if p_prev > neg_thr and p_last > neg_thr:
+        gap = p_last - neg_thr
+        return (f"No SHORT: probability stayed above neg_thr "
+                f"(p_prev={fp(p_prev)} → p_last={fp(p_last)}; needs -{fp(gap)} to reach {fp(neg_thr)}).")
+
+    # Edge/equality cases (e.g., sitting exactly on a threshold without fresh-cross)
+    return (f"No fresh signal: p_prev={fp(p_prev)} → p_last={fp(p_last)}; "
+            f"thresholds pos_thr={fp(pos_thr)}, neg_thr={fp(neg_thr)}. "
+            f"Fresh-cross requires p_prev<{fp(pos_thr)}≤p_last (LONG) or p_prev>{fp(neg_thr)}≥p_last (SHORT).")
+
 # =========================
 # Core flow (futures only, close-only reversal by default)
 # =========================
@@ -574,8 +608,9 @@ def decide_and_maybe_trade(args):
     take_long  = (p_last >= pos_thr) and (p_prev <  pos_thr)
     take_short = (p_last <= neg_thr) and (p_prev >  neg_thr)
     if not take_long and not take_short:
-        print("No fresh signal on the last bar — not acting.")
+        print(_explain_no_open(p_prev, p_last, pos_thr, neg_thr))
         return
+
 
     # 9) Exchange (swap only)
     ex = make_exchange(args.pub_key, args.sec_key)
