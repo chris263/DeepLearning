@@ -557,6 +557,9 @@ def decide_and_maybe_trade(args):
 
     # 6) Shared last-bar ID
     update_shared_lastbar(ticker, timeframe, ts_last_open, last_close_ms)
+    if args.debug:
+        shared = read_lastbars_store().get(f"{ticker}:{timeframe}", {})
+        print(f"[DEBUG] shared lastbar: {shared.get('bar_id')} last_close_ts={shared.get('last_close_ts')}")
 
     # 7) Guard & reversal state
     suffix = f"bybit_swap_{ticker}_{timeframe}"
