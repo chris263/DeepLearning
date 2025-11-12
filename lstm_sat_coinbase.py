@@ -280,15 +280,68 @@ def to_sequences_latest(feat_df,features,lookback):
     sub=feat_df.iloc[-(lookback+1):].copy().reset_index(drop=True)
     prev=sub.iloc[:-1][features].to_numpy(np.float32); last=sub.iloc[1:][features].to_numpy(np.float32)
     X=np.stack([prev,last],axis=0); ts=sub["ts"].to_numpy(); return X, ts
-def run_model(model,X,mean,std):
-    Xn=(X-mean)/(std+1e-12)
+    
+def run_model(model, X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> Tuple[float, float]:
+    # X shape: (2, lookback, n_features) -> run model separately for prev and last
+    Xn = (X - mean) / (std + 1e-12)
     with torch.no_grad():
-        out=model(torch.from_numpy(Xn).float()); out=out[0] if isinstance(out,(list,tuple)) else out
-        x=out.squeeze(); x=torch.sigmoid(x) if x.ndim==0 or x.shape[-1]!=2 else torch.softmax(x,dim=-1)[...,1]
-        arr=x.detach().cpu().numpy().astype(np.float64)
-    if np.ndim(arr)==0: return float(arr),float(arr)
-    if arr.shape[0]==2: return float(arr[0]),float(arr[1])
-    return float(arr[-2]),float(arr[-1])
+        t_prev = torch.from_numpy(Xn[0:1]).float()  # shape (1, L, C)
+        t_last = torch.from_numpy(Xn[1:2]).float()  # shape (1, L, C)
+
+        out_prev = model(t_prev)
+        out_last = model(t_last)
+
+        if isinstance(out_prev, (list, tuple)): out_prev = out_prev[0]
+        if isinstance(out_last, (list, tuple)): out_last = out_last[0]
+
+        x_prev = out_prev.squeeze()
+        x_last = out_last.squeeze()
+
+        # If the model outputs 2 logits, treat as class probs; otherwise treat as a single logit
+        def _to_prob(x):
+            if x.ndim >= 1 and x.shape[-1] == 2:
+                return float(torch.softmax(x, dim=-1)[..., 1].reshape(-1)[-1].item())
+            return float(torch.sigmoid(x.reshape(-1)[-1]).item())
+
+        p_prev = _to_prob(x_prev)
+        p_last = _to_prob(x_last)
+
+    return p_prev, p_last
+
+    
+def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: float) -> str:
+    fp = lambda x: f"{x:.3f}"
+    # Sanity: neutral band
+    if neg_thr < p_last < pos_thr:
+        return (f"No fresh signal: p_last={fp(p_last)} is inside the neutral band "
+                f"({fp(neg_thr)} < p_last < {fp(pos_thr)}). "
+                f"Fresh-cross requires p_prev<{fp(pos_thr)}≤p_last for LONG or "
+                f"p_prev>{fp(neg_thr)}≥p_last for SHORT.")
+
+    # Already in zones (no re-open without a fresh cross)
+    if p_last >= pos_thr and p_prev >= pos_thr:
+        return (f"No LONG open: previous bar already in LONG zone "
+                f"(p_prev={fp(p_prev)} ≥ pos_thr={fp(pos_thr)}), so no fresh cross. "
+                f"Current p_last={fp(p_last)}.")
+    if p_last <= neg_thr and p_prev <= neg_thr:
+        return (f"No SHORT open: previous bar already in SHORT zone "
+                f"(p_prev={fp(p_prev)} ≤ neg_thr={fp(neg_thr)}), so no fresh cross. "
+                f"Current p_last={fp(p_last)}.")
+
+    # Approaching but didn’t cross
+    if p_prev < pos_thr and p_last < pos_thr:
+        gap = pos_thr - p_last
+        return (f"No LONG: probability stayed below pos_thr "
+                f"(p_prev={fp(p_prev)} → p_last={fp(p_last)}; needs +{fp(gap)} to reach {fp(pos_thr)}).")
+    if p_prev > neg_thr and p_last > neg_thr:
+        gap = p_last - neg_thr
+        return (f"No SHORT: probability stayed above neg_thr "
+                f"(p_prev={fp(p_prev)} → p_last={fp(p_last)}; needs -{fp(gap)} to reach {fp(neg_thr)}).")
+
+    # Edge/equality cases (e.g., sitting exactly on a threshold without fresh-cross)
+    return (f"No fresh signal: p_prev={fp(p_prev)} → p_last={fp(p_last)}; "
+            f"thresholds pos_thr={fp(pos_thr)}, neg_thr={fp(neg_thr)}. "
+            f"Fresh-cross requires p_prev<{fp(pos_thr)}≤p_last (LONG) or p_prev>{fp(neg_thr)}≥p_last (SHORT).")
 
 # ---------- Core ----------
 def decide_and_maybe_trade(args):
@@ -311,8 +364,12 @@ def decide_and_maybe_trade(args):
     suffix=f"coinbaseintl_swap_{ticker}_{timeframe}"; last_seen, guard_path=last_executed_guard(model_dir,suffix)
     rev_path=reversal_state_path(model_dir,suffix); rev_state=read_reversal_state(rev_path)
     if last_seen is not None and last_seen==last_close_ms: print("Already acted on this bar for Coinbase — not acting again."); return
-    take_long=(p_last>=pos_thr) and (p_prev<pos_thr); take_short=(p_last<=neg_thr) and (p_prev>neg_thr)
-    if not (take_long or take_short): print("No fresh signal on the last bar — not acting."); return
+    take_long  = (p_last >= pos_thr) and (p_prev <  pos_thr)
+    take_short = (p_last <= neg_thr) and (p_prev >  neg_thr)
+    if not take_long and not take_short:
+        print(_explain_no_open(p_prev, p_last, pos_thr, neg_thr))
+        return
+
     ex=make_exchange(args.pub_key,args.sec_key,keys_file=args.keys_file); symbol=resolve_symbol(ex,ticker)
     pos=get_swap_position(ex,symbol)
     last_close=float(df["close"].iloc[-1]); last_high=float(df["high"].iloc[-1]); last_low=float(df["low"].iloc[-1])
