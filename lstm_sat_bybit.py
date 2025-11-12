@@ -210,38 +210,62 @@ def load_bundle(model_dir: str):
     for p in (meta_path, pre_path, mdl_path):
         if not os.path.exists(p):
             raise SystemExit(f"Missing bundle file: {p}")
+
     with open(meta_path, "r") as f:
         meta = json.load(f)
     with open(pre_path, "r") as f:
         pre = json.load(f)
+
     feature_names = meta.get("features") or meta.get("feature_names")
     if not feature_names:
         raise SystemExit("meta.json missing 'features' list")
+
     lookback = int(meta.get("lookback") or meta.get("window") or 64)
     pos_thr  = float(meta.get("pos_thr", 0.55))
     neg_thr  = float(meta.get("neg_thr", 0.45))
-    sl_pct   = meta.get("sl_pct", None)
-    tp_pct   = meta.get("tp_pct", None)
-    sl_pct   = float(sl_pct) if sl_pct is not None else None
-    tp_pct   = float(tp_pct) if tp_pct is not None else None
+
+    # --- risk (nested first, then legacy top-level) ---
+    risk = meta.get("risk") or {}
+    sl_pct = risk.get("sl_pct", meta.get("sl_pct"))
+    tp_pct = risk.get("tp_pct", meta.get("tp_pct"))
+    fee_bps = risk.get("fee_bps", meta.get("fee_bps"))  # not required by runners, but available
+
+    sl_pct = float(sl_pct) if sl_pct is not None else None
+    tp_pct = float(tp_pct) if tp_pct is not None else None
+
+    # --- ichimoku (nested first, then legacy top-level, then defaults) ---
+    ik = meta.get("ichimoku") or {}
     ichimoku_params = {
-        "tenkan": int(meta.get("tenkan", 7)),
-        "kijun": int(meta.get("kijun", 211)),
-        "senkou": int(meta.get("senkou", 120)),
-        "displacement": int(meta.get("displacement", 41)),
+        "tenkan":       int(ik.get("tenkan",       meta.get("tenkan", 7))),
+        "kijun":        int(ik.get("kijun",        meta.get("kijun", 211))),
+        "senkou":       int(ik.get("senkou",       meta.get("senkou", 120))),
+        "displacement": int(ik.get("displacement", meta.get("displacement", 41))),
     }
+
     mean = np.array(pre.get("mean"), dtype=np.float32)
     std  = np.array(pre.get("std"), dtype=np.float32)
     if mean.shape[0] != len(feature_names) or std.shape[0] != len(feature_names):
         raise SystemExit("preprocess.json shapes don't match features")
+
     model = torch.jit.load(mdl_path, map_location="cpu")
     model.eval()
+
     return {
-        "meta": meta, "model": model, "feature_names": feature_names,
-        "lookback": lookback, "pos_thr": pos_thr, "neg_thr": neg_thr,
-        "sl_pct": sl_pct, "tp_pct": tp_pct, "mean": mean, "std": std,
-        "ichimoku": ichimoku_params, "paths": {"dir": model_dir},
+        "meta": meta,
+        "model": model,
+        "feature_names": feature_names,
+        "lookback": lookback,
+        "pos_thr": pos_thr,
+        "neg_thr": neg_thr,
+        "sl_pct": sl_pct,
+        "tp_pct": tp_pct,
+        "mean": mean,
+        "std": std,
+        "ichimoku": ichimoku_params,
+        "paths": {"dir": model_dir},
+        # "fee_bps": float(fee_bps) if fee_bps is not None else None,  # expose if you plan to use it
     }
+
 
 
 # =========================
