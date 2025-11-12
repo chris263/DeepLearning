@@ -282,31 +282,24 @@ def to_sequences_latest(feat_df,features,lookback):
     X=np.stack([prev,last],axis=0); ts=sub["ts"].to_numpy(); return X, ts
     
 def run_model(model, X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> Tuple[float, float]:
-    # X shape: (2, lookback, n_features) -> run model separately for prev and last
+    # X shape: (2, lookback, n_features)  -> separate forward passes
     Xn = (X - mean) / (std + 1e-12)
+
     with torch.no_grad():
-        t_prev = torch.from_numpy(Xn[0:1]).float()  # shape (1, L, C)
-        t_last = torch.from_numpy(Xn[1:2]).float()  # shape (1, L, C)
-
+        # prev window
+        t_prev = torch.from_numpy(Xn[0:1]).float()   # (1, L, C)
         out_prev = model(t_prev)
-        out_last = model(t_last)
-
         if isinstance(out_prev, (list, tuple)): out_prev = out_prev[0]
+        p_prev = float(torch.sigmoid(out_prev).view(-1)[0].item())
+
+        # last window
+        t_last = torch.from_numpy(Xn[1:2]).float()   # (1, L, C)
+        out_last = model(t_last)
         if isinstance(out_last, (list, tuple)): out_last = out_last[0]
-
-        x_prev = out_prev.squeeze()
-        x_last = out_last.squeeze()
-
-        # If the model outputs 2 logits, treat as class probs; otherwise treat as a single logit
-        def _to_prob(x):
-            if x.ndim >= 1 and x.shape[-1] == 2:
-                return float(torch.softmax(x, dim=-1)[..., 1].reshape(-1)[-1].item())
-            return float(torch.sigmoid(x.reshape(-1)[-1]).item())
-
-        p_prev = _to_prob(x_prev)
-        p_last = _to_prob(x_last)
+        p_last = float(torch.sigmoid(out_last).view(-1)[0].item())
 
     return p_prev, p_last
+
 
     
 def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: float) -> str:
