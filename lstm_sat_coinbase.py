@@ -372,26 +372,71 @@ def decide_and_maybe_trade(args):
         return
 
     ex=make_exchange(args.pub_key,args.sec_key,keys_file=args.keys_file); symbol=resolve_symbol(ex,ticker)
-    pos=get_swap_position(ex,symbol)
-    last_close=float(df["close"].iloc[-1]); last_high=float(df["high"].iloc[-1]); last_low=float(df["low"].iloc[-1])
-    if pos and pos.get("side"):
-        entry=float(pos.get("entry") or last_close); side_open=pos["side"]; sz=float(pos.get("size") or 0.0)
-        tp_hit=sl_hit=False
-        if side_open=="long":
-            if tp is not None and last_high>=entry*(1.0+tp): tp_hit=True
-            if sl is not None and last_low <=entry*(1.0-sl): sl_hit=True
-        else:
-            if tp is not None and last_low <=entry*(1.0-tp): tp_hit=True
-            if sl is not None and last_high>=entry*(1.0+sl): sl_hit=True
-        if tp_hit or sl_hit:
-            reason="TP" if tp_hit else "SL"
-            try:
-                side="buy" if side_open=="short" else "sell"
-                print(f"{reason} hit — closing existing {side_open} position.")
-                ex.create_order(symbol,"market",side,sz or 1,None,{"reduceOnly":True})
-                write_last_executed(guard_path,last_close_ms)
-            except Exception as e: print(f"[ERROR] close on {reason} failed: {e}")
-            return
+    # 10) Position & SL/TP (+ signal exit)
+    pos = get_swap_position(ex, symbol)
+    last_close = float(df["close"].iloc[-1])
+    last_high  = float(df["high"].iloc[-1])
+    last_low   = float(df["low"].iloc[-1])
+
+    if pos is not None and pos.get("side"):
+        entry = float(pos.get("entry") or last_close)
+        side_open = pos["side"]  # 'long' or 'short'
+        sz = float(pos.get("size") or 0.0)
+
+        if side_open == "long":
+            sl_px = entry * (1.0 - (sl_pct or 0.0)) if sl_pct is not None else None
+            tp_px = entry * (1.0 + (tp_pct or 0.0)) if tp_pct is not None else None
+            hit_sl = (sl_px is not None) and (last_low  <= sl_px)
+            hit_tp = (tp_px is not None) and (last_high >= tp_px)
+
+            # SL-first (backtest parity)
+            if hit_sl or hit_tp:
+                reason = "SL" if hit_sl else "TP"
+                try:
+                    ex.create_order(symbol, "market", "sell", sz or 1, None, {"reduceOnly": True})
+                    print(f"{reason} hit — closing existing LONG at ~{(sl_px if hit_sl else tp_px):.8g}")
+                    write_last_executed(guard_path, last_close_ms)
+                except Exception as e:
+                    print(f"[ERROR] close LONG on {reason} failed: {e}")
+                return
+
+            # SIGNAL EXIT: close LONG when p_last drops below pos_thr (no cross required)
+            if p_last < pos_thr:
+                try:
+                    ex.create_order(symbol, "market", "sell", sz or 1, None, {"reduceOnly": True})
+                    print(f"Signal exit — p_last={p_last:.3f} < pos_thr={pos_thr:.3f}: closing LONG at ~{last_close}")
+                    write_last_executed(guard_path, last_close_ms)
+                except Exception as e:
+                    print(f"[ERROR] close LONG (SIG) failed: {e}")
+                return
+
+        else:  # side_open == "short"
+            sl_px = entry * (1.0 + (sl_pct or 0.0)) if sl_pct is not None else None
+            tp_px = entry * (1.0 - (tp_pct or 0.0)) if tp_pct is not None else None
+            hit_sl = (sl_px is not None) and (last_high >= sl_px)
+            hit_tp = (tp_px is not None) and (last_low  <= tp_px)
+
+            # SL-first (backtest parity)
+            if hit_sl or hit_tp:
+                reason = "SL" if hit_sl else "TP"
+                try:
+                    ex.create_order(symbol, "market", "buy", sz or 1, None, {"reduceOnly": True})
+                    print(f"{reason} hit — closing existing SHORT at ~{(sl_px if hit_sl else tp_px):.8g}")
+                    write_last_executed(guard_path, last_close_ms)
+                except Exception as e:
+                    print(f"[ERROR] close SHORT on {reason} failed: {e}")
+                return
+
+            # SIGNAL EXIT: close SHORT when p_last rises above neg_thr (no cross required)
+            if p_last > neg_thr:
+                try:
+                    ex.create_order(symbol, "market", "buy", sz or 1, None, {"reduceOnly": True})
+                    print(f"Signal exit — p_last={p_last:.3f} > neg_thr={neg_thr:.3f}: closing SHORT at ~{last_close}")
+                    write_last_executed(guard_path, last_close_ms)
+                except Exception as e:
+                    print(f"[ERROR] close SHORT (SIG) failed: {e}")
+                return
+
     if pos and pos.get("side") and ((take_long and pos["side"]=="long") or (take_short and pos["side"]=="short")):
         print("Avoiding opening another position - pyramiding."); return
     opposite=pos and pos.get("side") and ((pos["side"]=="long" and take_short) or (pos["side"]=="short" and take_long))
