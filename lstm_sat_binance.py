@@ -418,8 +418,8 @@ def decide_and_maybe_trade(args):
     suffix=f"binance_fut_{ticker}_{timeframe}"; last_seen, guard_path=last_executed_guard(model_dir,suffix)
     rev_path=reversal_state_path(model_dir,suffix); rev_state=read_reversal_state(rev_path)
     if last_seen is not None and last_seen==last_close_ms: print("Already acted on this bar for Binance — not acting again."); return
-    take_long  = (p_last >= pos_thr) and (p_prev <  pos_thr)
-    take_short = (p_last <= neg_thr) and (p_prev >  neg_thr)
+    take_long  = (p_last >= pos_thr) and (p_prev <  pos_thr) and (p_last > p_prev)
+    take_short = (p_last <= neg_thr) and (p_prev >  neg_thr) and (p_last < p_prev)
     if not take_long and not take_short:
         print(_explain_no_open(p_prev, p_last, pos_thr, neg_thr))
         return
