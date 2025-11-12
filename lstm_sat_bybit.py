@@ -236,10 +236,10 @@ def load_bundle(model_dir: str):
     # --- ichimoku (nested first, then legacy top-level, then defaults) ---
     ik = meta.get("ichimoku") or {}
     ichimoku_params = {
-        "tenkan":       int(ik.get("tenkan",       meta.get("tenkan", 7))),
-        "kijun":        int(ik.get("kijun",        meta.get("kijun", 211))),
-        "senkou":       int(ik.get("senkou",       meta.get("senkou", 120))),
-        "displacement": int(ik.get("displacement", meta.get("displacement", 41))),
+        "tenkan":       int(ik.get("tenkan",       meta.get("tenkan", 9))),
+        "kijun":        int(ik.get("kijun",        meta.get("kijun", 26))),
+        "senkou":       int(ik.get("senkou",       meta.get("senkou", 52))),
+        "displacement": int(ik.get("displacement", meta.get("displacement", 26))),
     }
 
     mean = np.array(pre.get("mean"), dtype=np.float32)
