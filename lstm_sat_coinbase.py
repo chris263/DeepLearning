@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+LSTM Ichimoku runner for Coinbase International (perpetual futures).
+
+Notes:
+- CCXT exposes Coinbase futures via the `coinbaseinternational` exchange class.
+- Same behavior as your other runners (fresh-cross, close-only reversal, SL/TP, balance sizing).
+
+Requires: torch, ccxt, numpy, pandas
+"""
+
+from __future__ import annotations
+import os, sys, json, time, argparse, pathlib, tempfile
+from typing import List, Dict, Tuple, Optional
+import numpy as np
+import pandas as pd
+
+try:
+    import torch
+    import ccxt
+except Exception as e:
+    print("Please install dependencies: pip install torch ccxt pandas numpy", file=sys.stderr); raise
+
+SIX_MIN_MS = 6 * 60 * 1000
+TF_TO_MS = {"1m":60000,"3m":180000,"5m":300000,"15m":900000,"30m":1800000,"1h":3600000,"2h":7200000,"4h":14400000,"6h":21600000,"8h":28800000,"12h":43200000,"1d":86400000}
+def tf_ms(tf): v=TF_TO_MS.get(str(tf).lower()); 
+if not v: raise SystemExit(f"Unsupported timeframe '{tf}'"); 
+return v
+# (compact single-line defs are fine for size)
+
+# ---------- JSON bars (same as others) ----------
+def _normalize_bar(b):
+    if not isinstance(b,dict): return None
+    kl={k.lower():k for k in b}
+    def g(*n,default=None):
+        for x in n:
+            k=kl.get(x); 
+            if k in b: return b[k]
+        return default
+    ts=g("ts","timestamp","time","t","open_time","opentime")
+    if ts is None: return None
+    if isinstance(ts,str):
+        try: ts=int(pd.to_datetime(ts,utc=True).value//1_000_000)
+        except: return None
+    ts=int(ts); 
+    if ts<10_000_000_000: ts*=1000
+    try: o=float(g("open","o")); h=float(g("high","h")); l=float(g("low","l")); c=float(g("close","c")); v=float(g("volume","v","vol",default=0.0))
+    except: return None
+    return {"ts":ts,"open":o,"high":h,"low":l,"close":c,"volume":v}
+
+def load_bars_from_json(path):
+    p=pathlib.Path(path).expanduser()
+    if not p.exists(): raise SystemExit(f"Bars JSON not found: {p}")
+    content=p.read_text().strip(); bars=[]
+    try:
+        obj=json.loads(content)
+        if isinstance(obj,list): bars=obj
+        elif isinstance(obj,dict):
+            for k in ("data","bars","result","items","price"):
+                if k in obj and isinstance(obj[k],list): bars=obj[k]; break
+    except:
+        for line in content.splitlines():
+            line=line.strip()
+            if line:
+                try: bars.append(json.loads(line))
+                except: pass
+    if not bars: raise SystemExit(f"No bars decoded from {p}")
+    norm=[_normalize_bar(b) for b in bars if _normalize_bar(b)]
+    if not norm: raise SystemExit(f"No valid bars decoded from {p}")
+    df=pd.DataFrame(norm).sort_values("ts").reset_index(drop=True)
+    df["timestamp"]=pd.to_datetime(df["ts"],unit="ms",utc=True).dt.tz_convert(None)
+    return df[["timestamp","ts","open","high","low","close","volume"]]
+
+# ---------- Features (same as others) ----------
+def rolling_mid(h,l,n): n=int(n); return (h.rolling(n,min_periods=n).max()+l.rolling(n,min_periods=n).min())/2.0
+def ichimoku(df,tenkan,kijun,senkou):
+    d=df.copy()
+    d["tenkan"]=rolling_mid(d.high,d.low,int(tenkan)); d["kijun"]=rolling_mid(d.high,d.low,int(kijun))
+    d["span_a"]=(d["tenkan"]+d["kijun"])/2.0; d["span_b"]=rolling_mid(d.high,d.low,int(senkou))
+    d["chikou"]=d["close"].shift(-int(kijun)); return d
+def slope(s,w=8): return s.diff(int(w))
+_SYNONYMS={"ret1":["ret_1","r1","return1"],"oc_diff":["ocdiff","oc_change"],"hl_range":["hlrange","high_low_range"],"logv_chg":["logv_change","dlogv","logv_diff"],"dist_px_cloud_top":["dist_px_cloudtop"],"dist_px_cloud_bot":["dist_px_cloudbot"],"dist_tk_kj":["dist_tk_kijun","tk_kj_dist"],"span_order":["spanOrder","span_order_flag"],"tk_slope":["tenkan_slope","tkSlope"],"kj_slope":["kijun_slope","kjSlope"],"span_a_slope":["spana_slope","spanA_slope"],"span_b_slope":["spanb_slope","spanB_slope"],"chikou_above":["chikou_flag"],"vol20":["vol_20","volatility20"]}
+def align_features_to_meta(feat_df,meta_features):
+    cols=set(feat_df.columns)
+    for n in meta_features:
+        if n in cols: continue
+        for cand in _SYNONYMS.get(n,[]):
+            if cand in cols: feat_df[n]=feat_df[cand]; cols.add(n); break
+    return feat_df
+def build_features(df,tenkan,kijun,senkou,displacement, slope_window=8):
+    d=ichimoku(df,tenkan,kijun,senkou)
+    d["ret1"]=d["close"].pct_change(); d["oc_diff"]=d["close"]-d["open"]; d["hl_range"]=d["high"]-d["low"]; d["logv_chg"]=np.log1p(d["volume"]).diff()
+    d["dist_px_cloud_top"]=d["close"]-d[["span_a","span_b"]].max(axis=1); d["dist_px_cloud_bot"]=d["close"]-d[["span_a","span_b"]].min(axis=1)
+    d["dist_tk_kj"]=d["tenkan"]-d["kijun"]; d["span_order"]=np.where(d["span_a"]>=d["span_b"],1.0,-1.0)
+    d["tk_slope"]=slope(d["tenkan"],slope_window); d["kj_slope"]=slope(d["kijun"],slope_window)
+    d["span_a_slope"]=slope(d["span_a"],slope_window); d["span_b_slope"]=slope(d["span_b"],slope_window)
+    D=int(displacement); d["chikou_above"]=(d["close"]>d["close"].shift(D)).astype(float)
+    d["vol20"]=d["volume"].rolling(20,min_periods=1).mean(); d["ts"]=df["ts"].values; d["timestamp"]=df["timestamp"].values; return d
+
+# ---------- Bundle ----------
+def load_bundle(model_dir):
+    model_dir=os.path.abspath(os.path.expanduser(model_dir))
+    meta=json.load(open(os.path.join(model_dir,"meta.json"))); pre=json.load(open(os.path.join(model_dir,"preprocess.json")))
+    feats=meta.get("features") or meta.get("feature_names")
+    if not feats: raise SystemExit("meta.json missing 'features'")
+    lookback=int(meta.get("lookback") or meta.get("window") or 64)
+    pos_thr=float(meta.get("pos_thr",0.55)); neg_thr=float(meta.get("neg_thr",0.45))
+    sl=meta.get("sl_pct"); tp=meta.get("tp_pct"); sl=float(sl) if sl is not None else None; tp=float(tp) if tp is not None else None
+    ik={"tenkan":int(meta.get("tenkan",7)),"kijun":int(meta.get("kijun",211)),"senkou":int(meta.get("senkou",120)),"displacement":int(meta.get("displacement",41))}
+    mean=np.array(pre.get("mean"),dtype=np.float32); std=np.array(pre.get("std"),dtype=np.float32)
+    if mean.shape[0]!=len(feats) or std.shape[0]!=len(feats): raise SystemExit("preprocess.json shapes don't match features")
+    model=torch.jit.load(os.path.join(model_dir,"model.pt"),map_location="cpu"); model.eval()
+    return {"meta":meta,"model":model,"feature_names":feats,"lookback":lookback,"pos_thr":pos_thr,"neg_thr":neg_thr,"sl_pct":sl,"tp_pct":tp,"mean":mean,"std":std,"ichimoku":ik,"paths":{"dir":model_dir}}
+
+# ---------- Time & state ----------
+def resolve_last_closed(now_ms,last_open_ms,tf):
+    step=tf_ms(tf); arr=[(last_open_ms+step,"close_stamp"),(last_open_ms,"open_stamp")]
+    ok=[(c,t,now_ms-c) for (c,t) in arr if now_ms>=c]; 
+    if not ok: return None,"future",None
+    c,t,age=min(ok,key=lambda x:x[2]); return c,t,age
+def state_dir(): base=os.getenv("SAT_STATE_DIR",os.path.expanduser("~/.sat_state")); pathlib.Path(base).mkdir(parents=True,exist_ok=True); return base
+def lastbars_json_path(): return os.path.join(state_dir(),"lastbars.json")
+def read_lastbars_store():
+    p=pathlib.Path(lastbars_json_path())
+    if not p.exists(): return {}
+    try: return json.loads(p.read_text())
+    except: return {}
+def write_lastbars_store(d):
+    p=pathlib.Path(lastbars_json_path()); fd,tmp=tempfile.mkstemp(prefix="lastbars_",suffix=".json",dir=str(p.parent))
+    with os.fdopen(fd,"w") as f: json.dump(d,f,separators=(",",":"),sort_keys=True); os.replace(tmp,p)
+def bar_id(t,tf,last): return f"{t}|{tf}|{int(last)}"
+def update_shared_lastbar(t,tf,last_open,last_close):
+    key=f"{t}:{tf}"; s=read_lastbars_store()
+    s[key]={"bar_id":bar_id(t,tf,last_open),"ticker":t,"timeframe":tf,"last_open_ts":int(last_open),"last_close_ts":int(last_close),"updated_at":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())}
+    write_lastbars_store(s)
+def last_executed_guard(model_dir,suffix):
+    path=os.path.join(model_dir,f".last_order_ts_{suffix}.txt"); val=None
+    if os.path.exists(path):
+        try: val=int(open(path).read().strip() or "0")
+        except: val=None
+    return val,path
+def write_last_executed(path,ts): open(path,"w").write(str(int(ts)))
+def reversal_state_path(model_dir,suffix): return os.path.join(model_dir,f".reversal_state_{suffix}.json")
+def read_reversal_state(path): 
+    if not os.path.exists(path): return {}
+    try: return json.loads(open(path).read())
+    except: return {}
+def write_reversal_state(path,data): open(path,"w").write(json.dumps(data,separators=(",",":")))
+
+# ---------- Coinbase International helpers ----------
+def _read_kv_file(path):
+    kv={}; p=pathlib.Path(path)
+    if p.exists():
+        for line in p.read_text().splitlines():
+            line=line.strip()
+            if not line or line.startswith("#") or "=" not in line: continue
+            k,v=line.split("=",1); kv[k.strip()]=v.strip()
+    return kv
+
+def make_exchange(pub_key_name, sec_key_name, keys_file=None):
+    keyfile=os.path.expanduser(keys_file or os.getenv("COINBASE_KEYS_FILE","~/.ssh/coinbase_keys.env"))
+    kv=_read_kv_file(keyfile)
+    ex=ccxt.coinbaseinternational({
+        "apiKey": kv.get(pub_key_name) if pub_key_name else None,
+        "secret": kv.get(sec_key_name) if sec_key_name else None,
+        "enableRateLimit": True,
+        "options": {"defaultType":"swap"}  # perps
+    })
+    ex.load_markets(); return ex
+
+def resolve_symbol(ex, ticker:str)->str:
+    t=ticker.upper().replace("/","")
+    base=t[:-4] if t.endswith("USDT") else (t[:-4] if t.endswith("USDC") else t)
+    # prefer USDC perps, then USDT, then USD
+    pref=["USDC","USDT","USD"]
+    cands=[s for s in ex.symbols if s.startswith(f"{base}/") and (":" in s)]
+    if cands:
+        # rank by settlement code after colon
+        def rank(sym):
+            settle=sym.split(":")[-1]
+            return pref.index(settle) if settle in pref else 99
+        return sorted(cands, key=rank)[0]
+    # fallback (rare): any listing with base and a fiat/USDC quote
+    for s in ex.symbols:
+        if s.startswith(f"{base}/"): return s
+    raise SystemExit(f"No perp symbol for {ticker} on Coinbase International")
+
+def quote_code_from_symbol(symbol:str)->str:
+    return symbol.split(":")[-1] if ":" in symbol else symbol.split("/")[1]
+
+def fetch_quote_balance_swap(ex, code:str)->float:
+    try:
+        bal=ex.fetch_balance(params={"type":"swap"})
+        return float((bal.get("free",{}) or {}).get(code,0.0) or 0.0)
+    except Exception:
+        try:
+            bal=ex.fetch_balance()
+            return float((bal.get("free",{}) or {}).get(code,0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+def amount_to_precision(ex,symbol,amount):
+    try: return float(ex.amount_to_precision(symbol,amount))
+    except: return float(f"{amount:.6f}")
+def price_to_precision(ex,symbol,price):
+    try: return float(ex.price_to_precision(symbol,price))
+    except: return float(f"{price:.6f}")
+
+def get_swap_position(ex,symbol)->Optional[Dict]:
+    def _scan(ps):
+        if not ps: return None
+        for p in ps:
+            if (p or {}).get("symbol")==symbol:
+                side=(p.get("side") or "").lower()
+                sz=float(p.get("contracts") or p.get("size") or 0.0)
+                entry=float(p.get("entryPrice") or 0.0)
+                if sz and side: return {"side":side,"size":abs(sz),"entry":entry}
+        return None
+    try:
+        pos=_scan(ex.fetch_positions([symbol]))
+        if pos: return pos
+    except Exception: pass
+    try: return _scan(ex.fetch_positions())
+    except Exception: return None
+
+# ---------- Inference ----------
+def to_sequences_latest(feat_df,features,lookback):
+    if len(feat_df)<(lookback+1): raise SystemExit("Not enough rows to build lookback sequences")
+    sub=feat_df.iloc[-(lookback+1):].copy().reset_index(drop=True)
+    prev=sub.iloc[:-1][features].to_numpy(np.float32); last=sub.iloc[1:][features].to_numpy(np.float32)
+    X=np.stack([prev,last],axis=0); ts=sub["ts"].to_numpy(); return X, ts
+def run_model(model,X,mean,std):
+    Xn=(X-mean)/(std+1e-12)
+    with torch.no_grad():
+        out=model(torch.from_numpy(Xn).float()); out=out[0] if isinstance(out,(list,tuple)) else out
+        x=out.squeeze(); x=torch.sigmoid(x) if x.ndim==0 or x.shape[-1]!=2 else torch.softmax(x,dim=-1)[...,1]
+        arr=x.detach().cpu().numpy().astype(np.float64)
+    if np.ndim(arr)==0: return float(arr),float(arr)
+    if arr.shape[0]==2: return float(arr[0]),float(arr[1])
+    return float(arr[-2]),float(arr[-1])
+
+# ---------- Core ----------
+def decide_and_maybe_trade(args):
+    B=load_bundle(args.model_dir); meta=B["meta"]; model=B["model"]; feats=B["feature_names"]; lookback=B["lookback"]
+    pos_thr,neg_thr=B["pos_thr"],B["neg_thr"]; sl,tp=B["sl_pct"],B["tp_pct"]; mean,std=B["mean"],B["std"]; ik=B["ichimoku"]; model_dir=B["paths"]["dir"]
+    ticker=args.ticker or meta.get("ticker") or "BTCUSDT"; timeframe=args.timeframe or meta.get("timeframe") or "1h"
+    df=load_bars_from_json(args.bars_json)
+    if len(df)<(lookback+3): print("Not enough bars to build features."); return
+    feat_full=build_features(df[["timestamp","ts","open","high","low","close","volume"]].copy(), ik["tenkan"],ik["kijun"],ik["senkou"],ik["displacement"])
+    feat_full=align_features_to_meta(feat_full,feats)
+    for c in feats:
+        if c not in feat_full.columns: raise SystemExit(f"Feature '{c}' missing.")
+    feat_df=feat_full.copy()
+    X,ts_seq=to_sequences_latest(feat_df[feats+["ts"]],feats,lookback); p_prev,p_last=run_model(model,X,mean,std)
+    print(f"LSTM inference | p_prev={p_prev:.3f} | p_last={p_last:.3f} | pos_thr={pos_thr:.3f} | neg_thr={neg_thr:.3f}")
+    now_ms=int(time.time()*1000); ts_last_open=int(df["ts"].iloc[-1]); last_close_ms, tag, age=resolve_last_closed(now_ms, ts_last_open, timeframe)
+    if args.debug: print(f"[DEBUG] last bar — ts_last_open={ts_last_open} tag={tag} age_min={(age/60000.0) if age is not None else None}")
+    if last_close_ms is None or not (0<=age<=SIX_MIN_MS): print("Last closed bar is not within the 6-minute window — not acting."); return
+    update_shared_lastbar(ticker,timeframe,ts_last_open,last_close_ms)
+    suffix=f"coinbaseintl_swap_{ticker}_{timeframe}"; last_seen, guard_path=last_executed_guard(model_dir,suffix)
+    rev_path=reversal_state_path(model_dir,suffix); rev_state=read_reversal_state(rev_path)
+    if last_seen is not None and last_seen==last_close_ms: print("Already acted on this bar for Coinbase — not acting again."); return
+    take_long=(p_last>=pos_thr) and (p_prev<pos_thr); take_short=(p_last<=neg_thr) and (p_prev>neg_thr)
+    if not (take_long or take_short): print("No fresh signal on the last bar — not acting."); return
+    ex=make_exchange(args.pub_key,args.sec_key,keys_file=args.keys_file); symbol=resolve_symbol(ex,ticker)
+    pos=get_swap_position(ex,symbol)
+    last_close=float(df["close"].iloc[-1]); last_high=float(df["high"].iloc[-1]); last_low=float(df["low"].iloc[-1])
+    if pos and pos.get("side"):
+        entry=float(pos.get("entry") or last_close); side_open=pos["side"]; sz=float(pos.get("size") or 0.0)
+        tp_hit=sl_hit=False
+        if side_open=="long":
+            if tp is not None and last_high>=entry*(1.0+tp): tp_hit=True
+            if sl is not None and last_low <=entry*(1.0-sl): sl_hit=True
+        else:
+            if tp is not None and last_low <=entry*(1.0-tp): tp_hit=True
+            if sl is not None and last_high>=entry*(1.0+sl): sl_hit=True
+        if tp_hit or sl_hit:
+            reason="TP" if tp_hit else "SL"
+            try:
+                side="buy" if side_open=="short" else "sell"
+                print(f"{reason} hit — closing existing {side_open} position.")
+                ex.create_order(symbol,"market",side,sz or 1,None,{"reduceOnly":True})
+                write_last_executed(guard_path,last_close_ms)
+            except Exception as e: print(f"[ERROR] close on {reason} failed: {e}")
+            return
+    if pos and pos.get("side") and ((take_long and pos["side"]=="long") or (take_short and pos["side"]=="short")):
+        print("Avoiding opening another position - pyramiding."); return
+    opposite=pos and pos.get("side") and ((pos["side"]=="long" and take_short) or (pos["side"]=="short" and take_long))
+    if opposite:
+        try:
+            side_open=pos["side"]; sz=float(pos.get("size") or 0.0); side="buy" if side_open=="short" else "sell"
+            policy=args.reversal
+            if policy=="flip": print("Signal reversal — flip mode: closing existing, then opening opposite.")
+            elif policy=="cooldown": print("Signal reversal — cooldown mode: closing existing; no new open until cooldown expires.")
+            else: print("Signal reversal — close-only mode: closing existing; not opening a new one this bar.")
+            ex.create_order(symbol,"market",side,sz or 1,None,{"reduceOnly":True})
+            if args.reversal in ("close","cooldown"):
+                write_reversal_state(rev_path,{"last_close_time_ms":now_ms,"last_bar_ts":int(ts_last_open)})
+                write_last_executed(guard_path,last_close_ms); return
+        except Exception as e: print(f"[WARN] failed to close before reversal handling: {e}")
+        if args.reversal=="flip": time.sleep(0.2)
+    if args.reversal=="cooldown":
+        cd_ms=int(max(0,args.cooldown_seconds))*1000; last_c=int(rev_state.get("last_close_time_ms",0))
+        if cd_ms>0 and (now_ms-last_c)<cd_ms:
+            remain=(cd_ms-(now_ms-last_c))/1000.0; print(f"Cooldown active ({remain:.1f}s) — not opening."); write_last_executed(guard_path,last_close_ms); return
+    code=quote_code_from_symbol(symbol)
+    # (No auto-transfer here; Coinbase Intl wallets may vary. You can add if you use sub-accounts that support it.)
+    try:
+        quote_free=fetch_quote_balance_swap(ex, code)
+        side="buy" if take_long else "sell"
+        usd_to_use=(quote_free*(1.00 if take_long else 0.80)) if quote_free>0 else 0.0
+        if usd_to_use<=0: print(f"No {code} balance available on perps."); return
+        qty_approx=usd_to_use/max(1e-12,last_close); qty=amount_to_precision(ex,symbol,qty_approx)
+        if qty<=0: print("Calculated order size is zero after precision rounding."); return
+        try: ex.set_leverage(1,symbol)
+        except Exception: pass
+        px=price_to_precision(ex,symbol,last_close)
+        print(f"Opening {('LONG' if side=='buy' else 'SHORT')} (perps) — MARKET {side.upper()} {symbol} qty={qty} (px≈{px})")
+        order=ex.create_order(symbol,"market",side,qty,None,{"reduceOnly":False})
+        oid=order.get("id") or order.get("orderId") or order; print(f"Order placed: {oid}")
+        write_last_executed(guard_path,last_close_ms)
+    except Exception as e:
+        print(f"[ERROR] order failed: {e}")
+
+def parse_args():
+    ap=argparse.ArgumentParser(description="Run LSTM bundle; Coinbase International PERPS on fresh signal within 6 minutes — bars from JSON.")
+    ap.add_argument("--model-dir",required=True); ap.add_argument("--bars-json",required=True)
+    ap.add_argument("--ticker",default=None); ap.add_argument("--timeframe",default=None)
+    ap.add_argument("--reversal",choices=["close","flip","cooldown"],default="close")
+    ap.add_argument("--cooldown-seconds",type=int,default=0); ap.add_argument("--debug",action="store_true")
+    ap.add_argument("--pub_key",default=None); ap.add_argument("--sec_key",default=None)
+    ap.add_argument("--keys-file",default=None, help="Env file (default ~/.ssh/coinbase_keys.env)")
+    return ap.parse_args()
+
+if __name__=="__main__":
+    decide_and_maybe_trade(parse_args())
