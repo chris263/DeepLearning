@@ -494,38 +494,25 @@ def to_sequences_latest(feat_df: pd.DataFrame, features: List[str], lookback: in
     return X, ts_seq
 
 def run_model(model, X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> Tuple[float, float]:
-    # Match training scaler exactly: (X - mean) / std  (no epsilon)
-    # Ensure contiguous float32 for consistent tensor creation
-    Xn = np.asarray((X - mean) / std, dtype=np.float32, order="C")
-
-    # Eval mode + send to the model's device (parity with backtest 'device' arg)
-    model.eval()
-    try:
-        model_device = next(model.parameters()).device
-    except StopIteration:
-        model_device = torch.device("cpu")
+    # X shape: (2, lookback, n_features) — run two independent forwards
+    Xn = (X - mean) / (std + 1e-12)
 
     with torch.no_grad():
-        # Identical to backtest style: build tensor directly on the target device
-        t = torch.tensor(Xn, dtype=torch.float32, device=model_device)  # shape (2, L, C)
+        # prev window
+        t_prev = torch.from_numpy(Xn[0:1]).float()   # (1, L, C)
+        out_prev = model(t_prev)
+        if isinstance(out_prev, (list, tuple)):
+            out_prev = out_prev[0]
+        p_prev = float(torch.sigmoid(out_prev).reshape(-1)[-1].item())
 
-        out = model(t)
-        if isinstance(out, (list, tuple)):
-            out = out[0]
-
-        # Backtest does: probs = sigmoid(model(xb))
-        probs = torch.sigmoid(out)
-
-        # Reduce to a single scalar per sample (if sequence logits, take LAST step)
-        p = probs.reshape(probs.shape[0], -1)  # (2, K)
-        p_prev = float(p[0, -1].item())
-        p_last = float(p[1, -1].item())
+        # last window
+        t_last = torch.from_numpy(Xn[1:2]).float()   # (1, L, C)
+        out_last = model(t_last)
+        if isinstance(out_last, (list, tuple)):
+            out_last = out_last[0]
+        p_last = float(torch.sigmoid(out_last).reshape(-1)[-1].item())
 
     return p_prev, p_last
-
-
-
-
 
 def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: float) -> str:
     fp = lambda x: f"{x:.3f}"

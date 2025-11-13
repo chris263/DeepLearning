@@ -73,13 +73,25 @@ def load_bars_from_json(path):
     return df[["timestamp","ts","open","high","low","close","volume"]]
 
 # ---------- Features (same as others) ----------
-def rolling_mid(h,l,n): n=int(n); return (h.rolling(n,min_periods=n).max()+l.rolling(n,min_periods=n).min())/2.0
-def ichimoku(df,tenkan,kijun,senkou):
-    d=df.copy()
-    d["tenkan"]=rolling_mid(d.high,d.low,int(tenkan)); d["kijun"]=rolling_mid(d.high,d.low,int(kijun))
-    d["span_a"]=(d["tenkan"]+d["kijun"])/2.0; d["span_b"]=rolling_mid(d.high,d.low,int(senkou))
-    d["chikou"]=d["close"].shift(-int(kijun)); return d
-def slope(s,w=8): return s.diff(int(w))
+def rolling_mid(high: pd.Series, low: pd.Series, n: int) -> pd.Series:
+    n = int(n)
+    hh = high.rolling(n, min_periods=n).max()
+    ll = low.rolling(n, min_periods=n).min()
+    return (hh + ll) / 2.0
+
+def ichimoku(df: pd.DataFrame, tenkan: int, kijun: int, senkou: int) -> pd.DataFrame:
+    d = df.copy()
+    d["tenkan"] = rolling_mid(d.high, d.low, tenkan)
+    d["kijun"] = rolling_mid(d.high, d.low, kijun)
+    d["span_a"] = (d["tenkan"] + d["kijun"]) / 2.0
+    d["span_b"] = rolling_mid(d.high, d.low, senkou)
+    d["cloud_top"] = d[["span_a", "span_b"]].max(axis=1)
+    d["cloud_bot"] = d[["span_a", "span_b"]].min(axis=1)
+    return d
+
+def slope(series: pd.Series, w: int = 8) -> pd.Series:
+    return series.diff(w)
+
 _SYNONYMS={"ret1":["ret_1","r1","return1"],"oc_diff":["ocdiff","oc_change"],"hl_range":["hlrange","high_low_range"],"logv_chg":["logv_change","dlogv","logv_diff"],"dist_px_cloud_top":["dist_px_cloudtop"],"dist_px_cloud_bot":["dist_px_cloudbot"],"dist_tk_kj":["dist_tk_kijun","tk_kj_dist"],"span_order":["spanOrder","span_order_flag"],"tk_slope":["tenkan_slope","tkSlope"],"kj_slope":["kijun_slope","kjSlope"],"span_a_slope":["spana_slope","spanA_slope"],"span_b_slope":["spanb_slope","spanB_slope"],"chikou_above":["chikou_flag"],"vol20":["vol_20","volatility20"]}
 def align_features_to_meta(feat_df,meta_features):
     cols=set(feat_df.columns)
@@ -88,16 +100,34 @@ def align_features_to_meta(feat_df,meta_features):
         for cand in _SYNONYMS.get(n,[]):
             if cand in cols: feat_df[n]=feat_df[cand]; cols.add(n); break
     return feat_df
-def build_features(df,tenkan,kijun,senkou,displacement, slope_window=8):
-    d=ichimoku(df,tenkan,kijun,senkou)
-    d["ret1"]=d["close"].pct_change(); d["oc_diff"]=d["close"]-d["open"]; d["hl_range"]=d["high"]-d["low"]; d["logv_chg"]=np.log1p(d["volume"]).diff()
-    d["dist_px_cloud_top"]=d["close"]-d[["span_a","span_b"]].max(axis=1); d["dist_px_cloud_bot"]=d["close"]-d[["span_a","span_b"]].min(axis=1)
-    d["dist_tk_kj"]=d["tenkan"]-d["kijun"]; d["span_order"]=np.where(d["span_a"]>=d["span_b"],1.0,-1.0)
-    d["tk_slope"]=slope(d["tenkan"],slope_window); d["kj_slope"]=slope(d["kijun"],slope_window)
-    d["span_a_slope"]=slope(d["span_a"],slope_window); d["span_b_slope"]=slope(d["span_b"],slope_window)
-    D=int(displacement); d["chikou_above"]=(d["close"]>d["close"].shift(D)).astype(float)
-    d["vol20"]=d["volume"].rolling(20,min_periods=1).mean(); d["ts"]=df["ts"].values; d["timestamp"]=df["timestamp"].values; return d
+def build_features(df: pd.DataFrame, tenkan: int, kijun: int, senkou: int,
+                   displacement: int, slope_window: int = 8) -> pd.DataFrame:
+    d = ichimoku(df, tenkan, kijun, senkou)
+    d["px"] = d["close"]
+    d["ret1"] = d["close"].pct_change().fillna(0)
+    d["oc_diff"] = (d["close"] - d["open"]) / d["open"]
+    d["hl_range"] = (d["high"] - d["low"]) / d["px"]
+    d["logv"] = np.log1p(d["volume"])
+    d["logv_chg"] = d["logv"].diff().fillna(0)
 
+    d["dist_px_cloud_top"] = (d["px"] - d["cloud_top"]) / d["px"]
+    d["dist_px_cloud_bot"] = (d["px"] - d["cloud_bot"]) / d["px"]
+    d["dist_tk_kj"] = (d["tenkan"] - d["kijun"]) / d["px"]
+    d["span_order"] = (d["span_a"] > d["span_b"]).astype(float)
+
+    sw = int(max(1, slope_window))
+    d["tk_slope"] = (d["tenkan"] - d["tenkan"].shift(sw)) / (d["px"] + 1e-9)
+    d["kj_slope"] = (d["kijun"] - d["kijun"].shift(sw)) / (d["px"] + 1e-9)
+    d["span_a_slope"] = (d["span_a"] - d["span_a"].shift(sw)) / (d["px"] + 1e-9)
+    d["span_b_slope"] = (d["span_b"] - d["span_b"].shift(sw)) / (d["px"] + 1e-9)
+
+    D = int(displacement)
+    d["chikou_above"] = (d["close"] > d["close"].shift(D)).astype(float)
+    d["vol20"] = d["ret1"].rolling(20, min_periods=20).std().fillna(0)
+    d["ts"] = df["ts"].values
+    d["timestamp"] = df["timestamp"].values
+    return d
+    
 # ---------- Bundle ----------
 def load_bundle(model_dir: str):
     model_dir = os.path.abspath(os.path.expanduser(model_dir))
