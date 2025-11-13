@@ -144,10 +144,11 @@ def rolling_mid(high: pd.Series, low: pd.Series, n: int) -> pd.Series:
 def ichimoku(df: pd.DataFrame, tenkan: int, kijun: int, senkou: int) -> pd.DataFrame:
     d = df.copy()
     d["tenkan"] = rolling_mid(d.high, d.low, tenkan)
-    d["kijun"]  = rolling_mid(d.high, d.low, kijun)
+    d["kijun"] = rolling_mid(d.high, d.low, kijun)
     d["span_a"] = (d["tenkan"] + d["kijun"]) / 2.0
     d["span_b"] = rolling_mid(d.high, d.low, senkou)
-    d["chikou"] = d["close"].shift(-kijun)  # trainer-parity assumption
+    d["cloud_top"] = d[["span_a", "span_b"]].max(axis=1)
+    d["cloud_bot"] = d[["span_a", "span_b"]].min(axis=1)
     return d
 
 def slope(series: pd.Series, w: int = 8) -> pd.Series:
@@ -185,22 +186,27 @@ def align_features_to_meta(feat_df: pd.DataFrame, meta_features: List[str]) -> p
 def build_features(df: pd.DataFrame, tenkan: int, kijun: int, senkou: int,
                    displacement: int, slope_window: int = 8) -> pd.DataFrame:
     d = ichimoku(df, tenkan, kijun, senkou)
-    d["ret1"] = d["close"].pct_change()
-    d["oc_diff"] = d["close"] - d["open"]
-    d["hl_range"] = d["high"] - d["low"]
-    d["logv_chg"] = np.log1p(d["volume"]).diff()
-    d["dist_px_cloud_top"] = d["close"] - d[["span_a","span_b"]].max(axis=1)
-    d["dist_px_cloud_bot"] = d["close"] - d[["span_a","span_b"]].min(axis=1)
-    d["dist_tk_kj"]        = d["tenkan"] - d["kijun"]
-    d["span_order"]        = np.where(d["span_a"] >= d["span_b"], 1.0, -1.0)
-    d["tk_slope"]     = slope(d["tenkan"], slope_window)
-    d["kj_slope"]     = slope(d["kijun"], slope_window)
-    d["span_a_slope"] = slope(d["span_a"], slope_window)
-    d["span_b_slope"] = slope(d["span_b"], slope_window)
-    # keep "chikou_above" aligned with displacement-style meta (synonyms can map if needed)
+    d["px"] = d["close"]
+    d["ret1"] = d["close"].pct_change().fillna(0)
+    d["oc_diff"] = (d["close"] - d["open"]) / d["open"]
+    d["hl_range"] = (d["high"] - d["low"]) / d["px"]
+    d["logv"] = np.log1p(d["volume"])
+    d["logv_chg"] = d["logv"].diff().fillna(0)
+
+    d["dist_px_cloud_top"] = (d["px"] - d["cloud_top"]) / d["px"]
+    d["dist_px_cloud_bot"] = (d["px"] - d["cloud_bot"]) / d["px"]
+    d["dist_tk_kj"] = (d["tenkan"] - d["kijun"]) / d["px"]
+    d["span_order"] = (d["span_a"] > d["span_b"]).astype(float)
+
+    sw = int(max(1, slope_window))
+    d["tk_slope"] = (d["tenkan"] - d["tenkan"].shift(sw)) / (d["px"] + 1e-9)
+    d["kj_slope"] = (d["kijun"] - d["kijun"].shift(sw)) / (d["px"] + 1e-9)
+    d["span_a_slope"] = (d["span_a"] - d["span_a"].shift(sw)) / (d["px"] + 1e-9)
+    d["span_b_slope"] = (d["span_b"] - d["span_b"].shift(sw)) / (d["px"] + 1e-9)
+
     D = int(displacement)
     d["chikou_above"] = (d["close"] > d["close"].shift(D)).astype(float)
-    d["vol20"] = d["volume"].rolling(20, min_periods=1).mean()
+    d["vol20"] = d["ret1"].rolling(20, min_periods=20).std().fillna(0)
     d["ts"] = df["ts"].values
     d["timestamp"] = df["timestamp"].values
     return d
