@@ -569,9 +569,15 @@ def decide_and_maybe_trade(args):
         print("Not enough bars to build features.")
         return
 
+    # Enforce strict time order & no duplicate bars
+    ts_col = "timestamp" if "timestamp" in df.columns else ("ts" if "ts" in df.columns else None)
+    if ts_col:
+        df = df.sort_values(ts_col).drop_duplicates(subset=[ts_col], keep="last").reset_index(drop=True)
+
     # Build + align features & check names
+    cols = [c for c in ["timestamp","ts","open","high","low","close","volume"] if c in df.columns]
     feat_df_full = build_features(
-        df[["timestamp","ts","open","high","low","close","volume"]].copy(),
+        df[cols].copy(),
         ik["tenkan"], ik["kijun"], ik["senkou"], ik["displacement"]
     )
     feat_df_full = align_features_to_meta(feat_df_full, feats)
@@ -580,8 +586,21 @@ def decide_and_maybe_trade(args):
             raise SystemExit(f"Feature '{c}' missing in computed frame.")
     feat_df = feat_df_full.copy()
 
-    # 4) Inference (prev vs last bar)
-    X, ts_seq = to_sequences_latest(feat_df[feats + ["ts"]], feats, lookback)
+    # 4) Inference (prev vs last bar) — explicit windows (no helper)
+    feat_mat = feat_df[feats].to_numpy(dtype=np.float32)
+    if len(feat_mat) < (lookback + 1):
+        print(f"Not enough rows for two windows: have={len(feat_mat)} need={lookback+1}")
+        return
+
+    X_prev = feat_mat[-lookback-1 : -1]   # ends at bar t-1
+    X_last = feat_mat[-lookback   :   ]   # ends at bar t
+    X = np.stack([X_prev, X_last], axis=0)
+
+    if getattr(args, "debug", False):
+        closes = df["close"].to_numpy()
+        feat_l1 = float(np.abs(X_last - X_prev).sum())
+        print(f"[DEBUG] prev_close→last_close: {closes[-2]:.4f}→{closes[-1]:.4f} | feat_L1_diff={feat_l1:.6g}")
+
     p_prev, p_last = run_model(model, X, mean, std)
     print(f"LSTM inference | p_prev={p_prev:.3f} | p_last={p_last:.3f} | pos_thr={pos_thr:.3f} | neg_thr={neg_thr:.3f}")
 
