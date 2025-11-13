@@ -485,6 +485,7 @@ def decide_and_maybe_trade(args):
     if pos and pos.get("side") and ((take_long and pos["side"]=="long") or (take_short and pos["side"]=="short")):
         print("Avoiding opening another position - pyramiding."); return
     opposite = pos and pos.get("side") and ((pos["side"]=="long" and take_short) or (pos["side"]=="short" and take_long))
+    
     if opposite:
         try:
             side_open=pos["side"]; sz=float(pos.get("size") or 0.0); side="buy" if side_open=="short" else "sell"
@@ -498,10 +499,27 @@ def decide_and_maybe_trade(args):
                 write_last_executed(guard_path,last_close_ms); return
         except Exception as e: print(f"[WARN] failed to close before reversal handling: {e}")
         if args.reversal=="flip": time.sleep(0.2)
-    if args.reversal=="cooldown":
-        cd_ms=int(max(0,args.cooldown_seconds))*1000; last_c=int(rev_state.get("last_close_time_ms",0))
-        if cd_ms>0 and (now_ms-last_c)<cd_ms:
-            remain=(cd_ms-(now_ms-last_c))/1000.0; print(f"Cooldown active ({remain:.1f}s) — not opening."); write_last_executed(guard_path,last_close_ms); return
+    
+    cooldown_active = False
+    remain = None
+    if args.reversal == "cooldown" and os.path.exists(rev_state_path):
+        try:
+            with open(rev_state_path, "r") as f:
+                st = json.load(f)
+            last_ms = int(st.get("last_close_time_ms") or 0)
+            cd_ms = int(getattr(args, "cooldown_seconds", 0) or 0) * 1000
+            if last_ms and cd_ms:
+                elapsed = now_ms - last_ms
+                if elapsed < cd_ms:
+                    cooldown_active = True
+                    remain = int((cd_ms - elapsed) / 1000)
+        except Exception as e:
+            print(f"[WARN] cooldown state read failed: {e}")
+
+    if cooldown_active:
+        print(f"Cooldown active — {remain}s remaining; not opening new positions.")
+        return
+    
     quote=get_quote_code_from_symbol(symbol)
     if args.auto_transfer: transfer_spot_to_future_if_needed(ex, quote, min_amt=50.0, buffer_frac=args.transfer_buffer, debug=args.debug)
     try:
