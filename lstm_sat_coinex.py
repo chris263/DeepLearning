@@ -490,7 +490,6 @@ def to_sequences_latest(feat_df: pd.DataFrame, features: List[str], lookback: in
 def run_model(model, X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> Tuple[float, float]:
     # X shape: (2, lookback, n_features) — run two independent forwards
     Xn = (X - mean) / (std + 1e-12)
-
     with torch.no_grad():
         # prev window
         t_prev = torch.from_numpy(Xn[0:1]).float()   # (1, L, C)
@@ -506,19 +505,8 @@ def run_model(model, X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> Tuple[
             out_last = out_last[0]
         p_last = float(torch.sigmoid(out_last).reshape(-1)[-1].item())
 
-    # after out_prev/out_last (before sigmoid)
-    if getattr(args, "debug", False):
-        shp_prev = tuple(out_prev.shape) if hasattr(out_prev, "shape") else ("?",)
-        shp_last = tuple(out_last.shape) if hasattr(out_last, "shape") else ("?",)
-        print(f"[DEBUG] model out shapes — prev={shp_prev} last={shp_last}")
-
-    # after sigmoid
-    if getattr(args, "debug", False):
-        raw_prev = float(torch.sigmoid(out_prev).reshape(-1)[-1].item())
-        raw_last = float(torch.sigmoid(out_last).reshape(-1)[-1].item())
-        print(f"[DEBUG] proba(last-logit) — prev={raw_prev:.8f} last={raw_last:.8f} Δ={raw_last-raw_prev:+.8f}")
-
     return p_prev, p_last
+
 
 
 def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: float) -> str:
@@ -614,13 +602,7 @@ def decide_and_maybe_trade(args):
         print(f"[DEBUG] prev_close→last_close: {closes[-2]:.4f}→{closes[-1]:.4f} | feat_L1_diff={feat_l1:.6g}")
 
     p_prev, p_last = run_model(model, X, mean, std)
-    print(
-        f"LSTM inference | "
-        f"p_prev={p_prev:.6f} | p_last={p_last:.6f} | "
-        f"Δ={p_last - p_prev:+.6f} | "
-        f"pos_thr={pos_thr:.3f} | neg_thr={neg_thr:.3f}"
-    )
-
+    print(f"LSTM inference | p_prev={p_prev:.3f} | p_last={p_last:.3f} | pos_thr={pos_thr:.3f} | neg_thr={neg_thr:.3f}")
 
     # 5) Time gating (6-minute window after close)
     now_ms = int(time.time() * 1000)
