@@ -12,7 +12,7 @@
     "tenkan": 9,
     "kijun": 26,
     "senkou": 52,
-    "displacement": 41
+    "displacement": 26
   },
   "n_features": 14,
   "in_channels": 14,
@@ -33,7 +33,7 @@
     "vol20"
   ],
   "preprocess_file": "preprocess.json",
-  "created_at": "2025-11-11T18:38:05Z",
+  "created_at": "2025-11-13T16:26:51Z",
   "pos_thr": 0.55,
   "neg_thr": 0.44999999999999996,
   "prob_threshold": 0.55,
