@@ -490,23 +490,26 @@ def to_sequences_latest(feat_df: pd.DataFrame, features: List[str], lookback: in
     return X, ts_seq
 
 def run_model(model, X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> Tuple[float, float]:
-    # X shape: (2, lookback, n_features)  -> separate forward passes
+    # X shape: (2, lookback, n_features) — run two independent forwards
     Xn = (X - mean) / (std + 1e-12)
 
     with torch.no_grad():
         # prev window
         t_prev = torch.from_numpy(Xn[0:1]).float()   # (1, L, C)
         out_prev = model(t_prev)
-        if isinstance(out_prev, (list, tuple)): out_prev = out_prev[0]
-        p_prev = float(torch.sigmoid(out_prev).view(-1)[0].item())
+        if isinstance(out_prev, (list, tuple)):
+            out_prev = out_prev[0]
+        p_prev = float(torch.sigmoid(out_prev).reshape(-1)[-1].item())
 
         # last window
         t_last = torch.from_numpy(Xn[1:2]).float()   # (1, L, C)
         out_last = model(t_last)
-        if isinstance(out_last, (list, tuple)): out_last = out_last[0]
-        p_last = float(torch.sigmoid(out_last).view(-1)[0].item())
+        if isinstance(out_last, (list, tuple)):
+            out_last = out_last[0]
+        p_last = float(torch.sigmoid(out_last).reshape(-1)[-1].item())
 
     return p_prev, p_last
+
 
 def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: float) -> str:
     fp = lambda x: f"{x:.3f}"
