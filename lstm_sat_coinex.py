@@ -775,7 +775,7 @@ def decide_and_maybe_trade(args):
     if args.auto_transfer:
         transfer_spot_to_swap_if_needed(ex, min_usdt=50.0, buffer_frac=args.transfer_buffer, debug=args.debug)
 
-    # 15) OPEN order — balance-based sizing (old behavior)
+    # 15) OPEN order — balance-based sizing, now with attached TP/SL on exchange
     try:
         quote_bal_swap = fetch_usdt_balance_swap(ex)
         side = "buy" if take_long else "sell"
@@ -793,11 +793,89 @@ def decide_and_maybe_trade(args):
         except Exception:
             pass
         px = price_to_precision(ex, symbol, last_close)
-        print(f"Opening {('LONG' if side=='buy' else 'SHORT')} (futures/swap) — MARKET {side.upper()} {symbol} qty={qty} (px≈{px})")
+        print(f"Opening {('LONG' if side=='buy' else 'SHORT')} (futures/swap) — "
+              f"MARKET {side.upper()} {symbol} qty={qty} (px≈{px})")
+
+        # Entry order (same behavior as before)
         order = ex.create_order(symbol, "market", side, qty, None, {"reduceOnly": False})
         oid = order.get("id") or order.get("orderId") or order
         print(f"Order placed: {oid}")
+
+        # --- NEW: Attach TP & SL as exchange-side reduce-only orders ---
+        try:
+            entry_price = float(order.get("average") or order.get("price") or last_close)
+
+            tp_order_id = None
+            sl_order_id = None
+
+            if side == "buy":
+                # LONG: TP above, SL below
+                if tp_pct is not None and tp_pct > 0:
+                    tp_price = price_to_precision(ex, symbol, entry_price * (1.0 + tp_pct))
+                    tp = ex.create_order(
+                        symbol,
+                        "limit",
+                        "sell",
+                        qty,
+                        tp_price,
+                        {"reduceOnly": True},
+                    )
+                    tp_order_id = tp.get("id") or tp.get("orderId") or tp
+
+                if sl_pct is not None and sl_pct > 0:
+                    sl_price = price_to_precision(ex, symbol, entry_price * (1.0 - sl_pct))
+                    sl = ex.create_order(
+                        symbol,
+                        "market",
+                        "sell",
+                        qty,
+                        None,
+                        {
+                            "reduceOnly": True,
+                            # CCXT param for Coinbase International stop-loss trigger
+                            "stopLossPrice": float(sl_price),
+                        },
+                    )
+                    sl_order_id = sl.get("id") or sl.get("orderId") or sl
+
+            else:
+                # SHORT: TP below, SL above
+                if tp_pct is not None and tp_pct > 0:
+                    tp_price = price_to_precision(ex, symbol, entry_price * (1.0 - tp_pct))
+                    tp = ex.create_order(
+                        symbol,
+                        "limit",
+                        "buy",
+                        qty,
+                        tp_price,
+                        {"reduceOnly": True},
+                    )
+                    tp_order_id = tp.get("id") or tp.get("orderId") or tp
+
+                if sl_pct is not None and sl_pct > 0:
+                    sl_price = price_to_precision(ex, symbol, entry_price * (1.0 + sl_pct))
+                    sl = ex.create_order(
+                        symbol,
+                        "market",
+                        "buy",
+                        qty,
+                        None,
+                        {
+                            "reduceOnly": True,
+                            "stopLossPrice": float(sl_price),
+                        },
+                    )
+                    sl_order_id = sl.get("id") or sl.get("orderId") or sl
+
+            if tp_order_id or sl_order_id:
+                print(f"Attached TP/SL orders — TP={tp_order_id!r} SL={sl_order_id!r}")
+
+        except Exception as e:
+            print(f"[WARN] failed to attach TP/SL orders: {e}")
+
+        # Guard file (unchanged)
         write_last_executed(guard_path, last_close_ms)
+
     except Exception as e:
         print(f"[ERROR] order failed: {e}")
 
