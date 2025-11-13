@@ -487,15 +487,38 @@ def to_sequences_latest(feat_df: pd.DataFrame, features: List[str], lookback: in
     ts_seq = sub["ts"].to_numpy()
     return X, ts_seq
 
-def run_model(model: nn.Module, X: np.ndarray, device: str) -> np.ndarray:
+def run_model(model, X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> Tuple[float, float]:
+    # Match training scaler exactly: (X - mean) / std  (no epsilon)
+    # Ensure contiguous float32 for consistent tensor creation
+    Xn = np.asarray((X - mean) / std, dtype=np.float32, order="C")
+
+    # Eval mode + send to the model's device (parity with backtest 'device' arg)
     model.eval()
-    out = []
+    try:
+        model_device = next(model.parameters()).device
+    except StopIteration:
+        model_device = torch.device("cpu")
+
     with torch.no_grad():
-        for i in range(0, len(X), 2048):
-            xb = torch.tensor(X[i:i+2048], dtype=torch.float32, device=device)
-            probs = torch.sigmoid(model(xb)).cpu().numpy()
-            out.append(probs)
-    return np.concatenate(out, axis=0) if out else np.zeros((0,), np.float32)
+        # Identical to backtest style: build tensor directly on the target device
+        t = torch.tensor(Xn, dtype=torch.float32, device=model_device)  # shape (2, L, C)
+
+        out = model(t)
+        if isinstance(out, (list, tuple)):
+            out = out[0]
+
+        # Backtest does: probs = sigmoid(model(xb))
+        probs = torch.sigmoid(out)
+
+        # Reduce to a single scalar per sample (if sequence logits, take LAST step)
+        p = probs.reshape(probs.shape[0], -1)  # (2, K)
+        p_prev = float(p[0, -1].item())
+        p_last = float(p[1, -1].item())
+
+    return p_prev, p_last
+
+
+
 
 
 def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: float) -> str:
@@ -576,23 +599,18 @@ def decide_and_maybe_trade(args):
     feat_df = feat_df_full.copy()
 
     # 4) Inference (prev vs last bar) — explicit windows (no helper)
+    feat_mat = feat_df[feats].to_numpy(dtype=np.float32)
+ 
+    X_prev = feat_mat[-lookback-1 : -1]   # ends at bar t-1
+    X_last = feat_mat[-lookback   :   ]   # ends at bar t
+    X = np.stack([X_prev, X_last], axis=0)
 
-    feat_mat = feat_df[feats].to_numpy(np.float32)
+    if getattr(args, "debug", False):
+        closes = df["close"].to_numpy()
+        feat_l1 = float(np.abs(X_last - X_prev).sum())
+        print(f"[DEBUG] prev_close→last_close: {closes[-2]:.4f}→{closes[-1]:.4f} | feat_L1_diff={feat_l1:.6g}")
 
-    # p_last uses bars [j-lookback+1 : j]  → last L rows
-    seq_last = feat_mat[-lookback:][None, :, :]          # shape (1, L, C)
-
-    # p_prev uses bars [j-lookback : j-1]  → the L rows before those
-    seq_prev = feat_mat[-lookback-1:-1][None, :, :]      # shape (1, L, C)
-
-    # --- Scale exactly like training/backtest (NO epsilon) ---
-    seq_last = (seq_last - mean) / std
-    seq_prev = (seq_prev - mean) / std
-    
-    p_last = float(run_model(model, seq_last, device="cpu")[0])
-    p_prev = float(run_model(model, seq_prev, device="cpu")[0])
-    
-
+    p_prev, p_last = run_model(model, X, mean, std)
     if getattr(args, "debug", False):
         print(f"[DEBUG] proba — prev={p_prev:.8f} last={p_last:.8f} Δ={p_last-p_prev:+.8f}")
     print(f"LSTM inference | p_prev={p_prev:.6f} | p_last={p_last:.6f} | pos_thr={pos_thr:.3f} | neg_thr={neg_thr:.3f}")
