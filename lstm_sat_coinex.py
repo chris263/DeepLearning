@@ -640,8 +640,8 @@ def decide_and_maybe_trade(args):
         return
 
     # 8) Fresh-cross trigger logic (from old)
-    take_long  = (p_last >= pos_thr) and (p_prev <  pos_thr)
-    take_short = (p_last <= neg_thr) and (p_prev >  neg_thr)
+    take_long  = (p_last > pos_thr) #and (p_prev <  pos_thr)
+    take_short = (p_last < neg_thr) #and (p_prev >  neg_thr)
     
     # 9) Exchange (swap only)
     ex = make_exchange(args.pub_key, args.sec_key)
@@ -749,9 +749,6 @@ def decide_and_maybe_trade(args):
                 f"p_last={p_last:.3f}, pos_thr={pos_thr:.3f}, neg_thr={neg_thr:.3f}"
             )
             return
-    else:
-        print("[DEBUG] No open position to close — treating as flat for this bar.")
-        return
 
     # 11) If flat and no fresh signal, do nothing
     if not (take_long or take_short):
