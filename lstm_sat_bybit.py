@@ -637,10 +637,6 @@ def decide_and_maybe_trade(args):
     take_long  = (p_last >= pos_thr) and (p_prev <  p_last)
     take_short = (p_last <= neg_thr) and (p_prev >  p_last)
 
-    if not take_long and not take_short:
-        print(_explain_no_open(p_prev, p_last, pos_thr, neg_thr))
-        return
-
     # 9) Exchange (unified swap)
     ex = make_exchange(args.pub_key, args.sec_key, keys_file=args.keys_file)
     symbol = resolve_symbol(ex, ticker)
