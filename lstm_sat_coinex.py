@@ -512,7 +512,7 @@ def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: floa
 
     # 1) Neutral band => close any open position and wait
     if in_neutral_now:
-        if p_prev >= pos_thr:
+        if p_prev > pos_thr:
             # Came from LONG zone into neutral
             return (
                 f"NEUTRAL Zone: p_last={fp(p_last)} moved down from the LONG zone "
@@ -521,7 +521,7 @@ def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: floa
                 f"Strategy closes any open LONG here and waits for a fresh cross: "
                 f"p_prev<{fp(pos_thr)}≤p_last for LONG or p_prev>{fp(neg_thr)}≥p_last for SHORT."
             )
-        if p_prev <= neg_thr:
+        if p_prev < neg_thr:
             # Came from SHORT zone into neutral
             return (
                 f"NEUTRAL Zone: p_last={fp(p_last)} moved up from the SHORT zone "
@@ -540,14 +540,14 @@ def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: floa
         )
 
     # 2) Already in LONG or SHORT zone and stayed there => no re-open without fresh cross
-    if p_last >= pos_thr and p_prev >= pos_thr:
+    if p_last > pos_thr and p_prev > pos_thr:
         return (
             f"No new LONG: probability stayed in the LONG zone "
             f"(p_prev={fp(p_prev)} → p_last={fp(p_last)} ≥ pos_thr={fp(pos_thr)}). "
             f"We only open a LONG on a fresh cross up from below pos_thr."
         )
 
-    if p_last <= neg_thr and p_prev <= neg_thr:
+    if p_last < neg_thr and p_prev < neg_thr:
         return (
             f"No new SHORT: probability stayed in the SHORT zone "
             f"(p_prev={fp(p_prev)} → p_last={fp(p_last)} ≤ neg_thr={fp(neg_thr)}). "
