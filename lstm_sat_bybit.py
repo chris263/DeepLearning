@@ -754,7 +754,7 @@ def decide_and_maybe_trade(args):
     if args.auto_transfer:
         transfer_spot_to_swap_if_needed(ex, min_usdt=50.0, buffer_frac=args.transfer_buffer, debug=args.debug)
 
-    # 15) OPEN order — balance-based sizing (with verification + retry)
+    # 15) OPEN order — balance-based sizing (with verification + retry, now attaching TP/SL inside order)
     try:
         quote_bal_swap = fetch_usdt_balance_swap(ex)
         side = "buy" if take_long else "sell"
@@ -796,12 +796,46 @@ def decide_and_maybe_trade(args):
         # Position before
         pos_before = get_swap_position(ex, symbol) or {}
 
+        # Base params
         params = {
             "reduceOnly": False,
             "accountType": "UNIFIED",
             "category": "linear",     # Bybit v5
             "timeInForce": "IOC",     # market IOC
         }
+
+        # --- NEW: attach SL & TP inside the Bybit order (unified futures) ---
+        try:
+            entry_ref = float(last_close)
+
+            tp_price = None
+            sl_price = None
+
+            if side == "buy":
+                # LONG: TP above, SL below
+                if tp_pct is not None and tp_pct > 0:
+                    tp_price = price_to_precision(ex, symbol, entry_ref * (1.0 + tp_pct))
+                    params["takeProfitPrice"] = float(tp_price)
+                if sl_pct is not None and sl_pct > 0:
+                    sl_price = price_to_precision(ex, symbol, entry_ref * (1.0 - sl_pct))
+                    params["stopLossPrice"] = float(sl_price)
+            else:
+                # SHORT: TP below, SL above
+                if tp_pct is not None and tp_pct > 0:
+                    tp_price = price_to_precision(ex, symbol, entry_ref * (1.0 - tp_pct))
+                    params["takeProfitPrice"] = float(tp_price)
+                if sl_pct is not None and sl_pct > 0:
+                    sl_price = price_to_precision(ex, symbol, entry_ref * (1.0 + sl_pct))
+                    params["stopLossPrice"] = float(sl_price)
+
+            if ("takeProfitPrice" in params) or ("stopLossPrice" in params):
+                # full-position TP/SL management on Bybit
+                params["tpslMode"] = "full"
+                if args.debug:
+                    print(f"[DEBUG] attaching TP/SL to entry — "
+                          f"tp={tp_price} sl={sl_price}")
+        except Exception as e:
+            print(f"[WARN] failed to prepare TP/SL params for entry: {e}")
 
         print(f"Opening {('LONG' if side=='buy' else 'SHORT')} (futures/swap) — "
               f"MARKET {side.upper()} {symbol} qty={qty} (px≈{px})")
@@ -833,7 +867,7 @@ def decide_and_maybe_trade(args):
             except Exception as e:
                 print(f"[WARN] Could not verify via fetch_order: {e}")
 
-            # Retry once with convenience helpers
+            # Retry once with convenience helpers (same params, including TP/SL)
             try:
                 if side == "buy":
                     ord_retry = ex.create_market_buy_order(symbol, qty, params)
