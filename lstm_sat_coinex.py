@@ -750,7 +750,7 @@ def decide_and_maybe_trade(args):
             )
             return
     else:
-        print("No open position to close!")
+        print("[DEBUG] No open position to close — treating as flat for this bar.")
         return
 
     # 11) If flat and no fresh signal, do nothing
