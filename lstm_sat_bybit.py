@@ -634,8 +634,8 @@ def decide_and_maybe_trade(args):
         return
 
     # 8) Fresh-cross trigger logic (old)
-    take_long  = (p_last >= pos_thr) #and (p_prev <  pos_thr)
-    take_short = (p_last <= neg_thr) #and (p_prev >  neg_thr)
+    take_long  = (p_last >= pos_thr) and (p_prev <  p_last)
+    take_short = (p_last <= neg_thr) and (p_prev >  p_last)
 
     if not take_long and not take_short:
         print(_explain_no_open(p_prev, p_last, pos_thr, neg_thr))
