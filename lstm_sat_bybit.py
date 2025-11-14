@@ -518,7 +518,7 @@ def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: floa
         if p_prev >= pos_thr:
             # Came from LONG zone into neutral
             return (
-                f"Exit to NEUTRAL: p_last={fp(p_last)} moved down from the LONG zone "
+                f"NEUTRAL Zone: p_last={fp(p_last)} moved down from the LONG zone "
                 f"(p_prev={fp(p_prev)} ≥ pos_thr={fp(pos_thr)}) into the neutral band "
                 f"({fp(neg_thr)} < p_last < {fp(pos_thr)}). "
                 f"Strategy closes any open LONG here and waits for a fresh cross: "
@@ -527,7 +527,7 @@ def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: floa
         if p_prev <= neg_thr:
             # Came from SHORT zone into neutral
             return (
-                f"Exit to NEUTRAL: p_last={fp(p_last)} moved up from the SHORT zone "
+                f"NEUTRAL Zone: p_last={fp(p_last)} moved up from the SHORT zone "
                 f"(p_prev={fp(p_prev)} ≤ neg_thr={fp(neg_thr)}) into the neutral band "
                 f"({fp(neg_thr)} < p_last < {fp(pos_thr)}). "
                 f"Strategy closes any open SHORT here and waits for a fresh cross: "
@@ -776,11 +776,20 @@ def decide_and_maybe_trade(args):
         print(f"Order placed: {oid}")
 
         # Attach TP/SL as reduce-only orders
+        # --- Attach TP & SL as exchange-side reduce-only orders (if supported) ---
         try:
             entry_price = float(order.get("average") or order.get("price") or last_close)
 
             tp_order_id = None
             sl_order_id = None
+            tp_price_logged = None
+            sl_price_logged = None
+
+            def _safe_order_id(o):
+                # handle dict or raw id
+                if isinstance(o, dict):
+                    return o.get("id") or o.get("orderId")
+                return o
 
             if side == "buy":
                 # LONG: TP above, SL below
@@ -794,7 +803,12 @@ def decide_and_maybe_trade(args):
                         tp_price,
                         {"reduceOnly": True},
                     )
-                    tp_order_id = tp.get("id") or tp.get("orderId") or tp
+                    oid = _safe_order_id(tp)
+                    if oid:
+                        tp_order_id = oid
+                        tp_price_logged = tp_price
+                    else:
+                        print(f"[WARN] TP order returned no id on {ex.id}: {tp!r}")
 
                 if sl_pct is not None and sl_pct > 0:
                     sl_price = price_to_precision(ex, symbol, entry_price * (1.0 - sl_pct))
@@ -806,10 +820,16 @@ def decide_and_maybe_trade(args):
                         None,
                         {
                             "reduceOnly": True,
+                            # CCXT param for stop-loss trigger (supported on some exchanges)
                             "stopLossPrice": float(sl_price),
                         },
                     )
-                    sl_order_id = sl.get("id") or sl.get("orderId") or sl
+                    oid = _safe_order_id(sl)
+                    if oid:
+                        sl_order_id = oid
+                        sl_price_logged = sl_price
+                    else:
+                        print(f"[WARN] SL order returned no id on {ex.id}: {sl!r}")
 
             else:
                 # SHORT: TP below, SL above
@@ -823,7 +843,12 @@ def decide_and_maybe_trade(args):
                         tp_price,
                         {"reduceOnly": True},
                     )
-                    tp_order_id = tp.get("id") or tp.get("orderId") or tp
+                    oid = _safe_order_id(tp)
+                    if oid:
+                        tp_order_id = oid
+                        tp_price_logged = tp_price
+                    else:
+                        print(f"[WARN] TP order returned no id on {ex.id}: {tp!r}")
 
                 if sl_pct is not None and sl_pct > 0:
                     sl_price = price_to_precision(ex, symbol, entry_price * (1.0 + sl_pct))
@@ -838,13 +863,24 @@ def decide_and_maybe_trade(args):
                             "stopLossPrice": float(sl_price),
                         },
                     )
-                    sl_order_id = sl.get("id") or sl.get("orderId") or sl
+                    oid = _safe_order_id(sl)
+                    if oid:
+                        sl_order_id = oid
+                        sl_price_logged = sl_price
+                    else:
+                        print(f"[WARN] SL order returned no id on {ex.id}: {sl!r}")
 
             if tp_order_id or sl_order_id:
-                print(f"Attached TP/SL orders — TP={tp_order_id!r} SL={sl_order_id!r}")
+                parts = []
+                if tp_order_id:
+                    parts.append(f"TP[id={tp_order_id!r}, px={tp_price_logged}]")
+                if sl_order_id:
+                    parts.append(f"SL[id={sl_order_id!r}, px={sl_price_logged}]")
+                print("Attached TP/SL orders — " + ", ".join(parts))
 
         except Exception as e:
             print(f"[WARN] failed to attach TP/SL orders: {e}")
+
 
         # Guard file: one action per bar across brokers
         write_last_executed(guard_path, last_close_ms)
