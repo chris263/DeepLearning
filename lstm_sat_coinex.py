@@ -623,8 +623,7 @@ def decide_and_maybe_trade(args):
     p_prev, p_last = run_model(model, X, mean, std)
     if getattr(args, "debug", False):
         print(f"[DEBUG] proba — prev={p_prev:.8f} last={p_last:.8f} Δ={p_last-p_prev:+.8f}")
-    print(f"LSTM inference | p_prev={p_prev:.6f} | p_last={p_last:.6f} | pos_thr={pos_thr:.3f} | neg_thr={neg_thr:.3f}")
-
+ 
     # 5) Time gating (6-minute window after close)
     now_ms = int(time.time() * 1000)
     ts_last_open = int(df["ts"].iloc[-1])

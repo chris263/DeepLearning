@@ -604,8 +604,16 @@ def decide_and_maybe_trade(args):
     # 4) Inference (prev vs last bar)
     X, ts_seq = to_sequences_latest(feat_df[feats + ["ts"]], feats, lookback)
     p_prev, p_last = run_model(model, X, mean, std)
-    print(f"LSTM inference | p_prev={p_prev:.3f} | p_last={p_last:.3f} | pos_thr={pos_thr:.3f} | neg_thr={neg_thr:.3f}")
 
+    if getattr(args, "debug", False):
+        closes = df["close"].to_numpy()
+        feat_l1 = float(np.abs(X_last - X_prev).sum())
+        print(f"[DEBUG] prev_close→last_close: {closes[-2]:.4f}→{closes[-1]:.4f} | feat_L1_diff={feat_l1:.6g}")
+
+    p_prev, p_last = run_model(model, X, mean, std)
+    if getattr(args, "debug", False):
+        print(f"[DEBUG] proba — prev={p_prev:.8f} last={p_last:.8f} Δ={p_last-p_prev:+.8f}")
+ 
     # 5) Time gating (6-minute window after close)
     now_ms = int(time.time() * 1000)
     ts_last_open = int(df["ts"].iloc[-1])
