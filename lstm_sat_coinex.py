@@ -803,7 +803,10 @@ def decide_and_maybe_trade(args):
                         "sell",
                         qty,
                         tp_price,
-                        {"reduceOnly": True},
+                        {
+                            "reduceOnly": True,
+                            "takeProfitPrice": float(tp_price),
+                        },
                     )
                     tp_order_id = tp.get("id") or tp.get("orderId") or tp
 
@@ -832,7 +835,10 @@ def decide_and_maybe_trade(args):
                         "buy",
                         qty,
                         tp_price,
-                        {"reduceOnly": True},
+                        {
+                            "reduceOnly": True,
+                            "takeProfitPrice": float(tp_price),
+                        },
                     )
                     tp_order_id = tp.get("id") or tp.get("orderId") or tp
 
@@ -856,7 +862,6 @@ def decide_and_maybe_trade(args):
 
         except Exception as e:
             print(f"[WARN] failed to attach TP/SL orders: {e}")
-
         # Guard file: one action per bar across brokers
         write_last_executed(guard_path, last_close_ms)
 
