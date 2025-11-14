@@ -519,38 +519,54 @@ def run_model(model, X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> Tuple[
 
 def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: float) -> str:
     fp = lambda x: f"{x:.3f}"
-    # Sanity: neutral band
-    if neg_thr < p_last < pos_thr:
-        return (f"No fresh signal: p_last={fp(p_last)} is inside the neutral band "
+
+    in_neutral_now = (neg_thr < p_last < pos_thr)
+    in_neutral_prev = (neg_thr < p_prev < pos_thr)
+
+    # 1) Neutral band => close any open position and wait
+    if in_neutral_now:
+        if p_prev >= pos_thr:
+            # Came from LONG zone into neutral
+            return (
+                f"Exit to NEUTRAL: p_last={fp(p_last)} moved down from the LONG zone "
+                f"(p_prev={fp(p_prev)} ≥ pos_thr={fp(pos_thr)}) into the neutral band "
                 f"({fp(neg_thr)} < p_last < {fp(pos_thr)}). "
-                f"Fresh-cross requires p_prev<{fp(pos_thr)}≤p_last for LONG or "
-                f"p_prev>{fp(neg_thr)}≥p_last for SHORT.")
+                f"Strategy closes any open LONG here and waits for a fresh cross: "
+                f"p_prev<{fp(pos_thr)}≤p_last for LONG or p_prev>{fp(neg_thr)}≥p_last for SHORT."
+            )
+        if p_prev <= neg_thr:
+            # Came from SHORT zone into neutral
+            return (
+                f"Exit to NEUTRAL: p_last={fp(p_last)} moved up from the SHORT zone "
+                f"(p_prev={fp(p_prev)} ≤ neg_thr={fp(neg_thr)}) into the neutral band "
+                f"({fp(neg_thr)} < p_last < {fp(pos_thr)}). "
+                f"Strategy closes any open SHORT here and waits for a fresh cross: "
+                f"p_prev<{fp(pos_thr)}≤p_last for LONG or p_prev>{fp(neg_thr)}≥p_last for SHORT."
+            )
 
-    # Already in zones (no re-open without a fresh cross)
+        # Neutral → neutral: just stay flat
+        return (
+            f"No trade: probability remains inside the neutral band "
+            f"({fp(neg_thr)} < p_last={fp(p_last)} < {fp(pos_thr)}). "
+            f"No position is opened until we cross above {fp(pos_thr)} (LONG) "
+            f"or below {fp(neg_thr)} (SHORT)."
+        )
+
+    # 2) Already in LONG or SHORT zone and stayed there => no re-open without fresh cross
     if p_last >= pos_thr and p_prev >= pos_thr:
-        return (f"No LONG open: previous bar already in LONG zone "
-                f"(p_prev={fp(p_prev)} ≥ pos_thr={fp(pos_thr)}), so no fresh cross. "
-                f"Current p_last={fp(p_last)}.")
+        return (
+            f"No new LONG: probability stayed in the LONG zone "
+            f"(p_prev={fp(p_prev)} → p_last={fp(p_last)} ≥ pos_thr={fp(pos_thr)}). "
+            f"We only open a LONG on a fresh cross up from below pos_thr."
+        )
+
     if p_last <= neg_thr and p_prev <= neg_thr:
-        return (f"No SHORT open: previous bar already in SHORT zone "
-                f"(p_prev={fp(p_prev)} ≤ neg_thr={fp(neg_thr)}), so no fresh cross. "
-                f"Current p_last={fp(p_last)}.")
-
-    # Approaching but didn’t cross
-    if p_prev < pos_thr and p_last < pos_thr:
-        gap = pos_thr - p_last
-        return (f"No LONG: probability stayed below pos_thr "
-                f"(p_prev={fp(p_prev)} → p_last={fp(p_last)}; needs +{fp(gap)} to reach {fp(pos_thr)}).")
-    if p_prev > neg_thr and p_last > neg_thr:
-        gap = p_last - neg_thr
-        return (f"No SHORT: probability stayed above neg_thr "
-                f"(p_prev={fp(p_prev)} → p_last={fp(p_last)}; needs -{fp(gap)} to reach {fp(neg_thr)}).")
-
-    # Edge/equality cases (e.g., sitting exactly on a threshold without fresh-cross)
-    return (f"No fresh signal: p_prev={fp(p_prev)} → p_last={fp(p_last)}; "
-            f"thresholds pos_thr={fp(pos_thr)}, neg_thr={fp(neg_thr)}. "
-            f"Fresh-cross requires p_prev<{fp(pos_thr)}≤p_last (LONG) or p_prev>{fp(neg_thr)}≥p_last (SHORT).")
-
+        return (
+            f"No new SHORT: probability stayed in the SHORT zone "
+            f"(p_prev={fp(p_prev)} → p_last={fp(p_last)} ≤ neg_thr={fp(neg_thr)}). "
+            f"We only open a SHORT on a fresh cross down from above neg_thr."
+        )
+        
 # =========================
 # Core flow (futures only, close-only reversal by default)
 # =========================
@@ -628,24 +644,29 @@ def decide_and_maybe_trade(args):
     ex = make_exchange(args.pub_key, args.sec_key, keys_file=args.keys_file)
     symbol = resolve_symbol(ex, ticker)
 
-    # 10) Position & SL/TP (+ signal exit)
+    # 10) Position & SL/TP (+ signal exit on neutral)
     pos = get_swap_position(ex, symbol)
     last_close = float(df["close"].iloc[-1])
     last_high  = float(df["high"].iloc[-1])
     last_low   = float(df["low"].iloc[-1])
 
+    # Neutral band helper
+    in_neutral = (neg_thr < p_last < pos_thr)
+
     if pos is not None and pos.get("side"):
+        # There is an open position on the exchange
+        side_open = str(pos["side"]).lower()  # expect 'long' or 'short'
         entry = float(pos.get("entry") or last_close)
-        side_open = pos["side"]  # 'long' or 'short'
         sz = float(pos.get("size") or 0.0)
 
         if side_open == "long":
+            # LONG SL/TP prices
             sl_px = entry * (1.0 - (sl_pct or 0.0)) if sl_pct is not None else None
             tp_px = entry * (1.0 + (tp_pct or 0.0)) if tp_pct is not None else None
             hit_sl = (sl_px is not None) and (last_low  <= sl_px)
             hit_tp = (tp_px is not None) and (last_high >= tp_px)
 
-            # SL-first (backtest parity)
+            # 10a) SL/TP first (backtest parity)
             if hit_sl or hit_tp:
                 reason = "SL" if hit_sl else "TP"
                 try:
@@ -656,23 +677,29 @@ def decide_and_maybe_trade(args):
                     print(f"[ERROR] close LONG on {reason} failed: {e}")
                 return
 
-            # SIGNAL EXIT: close LONG when p_last drops below pos_thr (no cross required)
+            # 10b) SIGNAL EXIT: close LONG when we leave LONG zone
+            #     (i.e. probability drops below pos_thr → neutral or short zone)
             if p_last < pos_thr:
                 try:
                     ex.create_order(symbol, "market", "sell", sz or 1, None, {"reduceOnly": True})
-                    print(f"Signal exit — p_last={p_last:.3f} < pos_thr={pos_thr:.3f}: closing LONG at ~{last_close}")
+                    zone = "neutral" if in_neutral else "short"
+                    print(
+                        f"Signal exit — LONG → {zone} zone: "
+                        f"p_last={p_last:.3f} < pos_thr={pos_thr:.3f}; closing LONG at ~{last_close}"
+                    )
                     write_last_executed(guard_path, last_close_ms)
                 except Exception as e:
                     print(f"[ERROR] close LONG (SIG) failed: {e}")
                 return
 
-        else:  # side_open == "short"
+        elif side_open == "short":
+            # SHORT SL/TP prices
             sl_px = entry * (1.0 + (sl_pct or 0.0)) if sl_pct is not None else None
             tp_px = entry * (1.0 - (tp_pct or 0.0)) if tp_pct is not None else None
             hit_sl = (sl_px is not None) and (last_high >= sl_px)
             hit_tp = (tp_px is not None) and (last_low  <= tp_px)
 
-            # SL-first (backtest parity)
+            # 10c) SL/TP first (backtest parity)
             if hit_sl or hit_tp:
                 reason = "SL" if hit_sl else "TP"
                 try:
@@ -683,213 +710,146 @@ def decide_and_maybe_trade(args):
                     print(f"[ERROR] close SHORT on {reason} failed: {e}")
                 return
 
-            # SIGNAL EXIT: close SHORT when p_last rises above neg_thr (no cross required)
+            # 10d) SIGNAL EXIT: close SHORT when we leave SHORT zone
+            #     (i.e. probability rises above neg_thr → neutral or long zone)
             if p_last > neg_thr:
                 try:
                     ex.create_order(symbol, "market", "buy", sz or 1, None, {"reduceOnly": True})
-                    print(f"Signal exit — p_last={p_last:.3f} > neg_thr={neg_thr:.3f}: closing SHORT at ~{last_close}")
+                    zone = "neutral" if in_neutral else "long"
+                    print(
+                        f"Signal exit — SHORT → {zone} zone: "
+                        f"p_last={p_last:.3f} > neg_thr={neg_thr:.3f}; closing SHORT at ~{last_close}"
+                    )
                     write_last_executed(guard_path, last_close_ms)
                 except Exception as e:
                     print(f"[ERROR] close SHORT (SIG) failed: {e}")
                 return
 
+        else:
+            # Unknown side string: be safe and do not open anything new
+            print(f"[WARN] Unknown open side {side_open!r}; keeping position and not opening new trades.")
+            return
 
-    # 11) Avoid pyramiding
-    if pos is not None and pos.get("side") and (
-        (take_long  and pos["side"] == "long") or
-        (take_short and pos["side"] == "short")
-    ):
-        print("Avoiding opening another position - pyramiding.")
+        # If we still have a position and no SL/TP or signal-exit, we **keep** it and
+        # do not allow any new opens this bar (no flip, no pyramiding).
+        print(
+            f"Keeping existing {side_open.upper()} open — "
+            f"p_last={p_last:.3f}, pos_thr={pos_thr:.3f}, neg_thr={neg_thr:.3f}"
+        )
         return
 
-    # 12) Reversal handling (CLOSE ONLY default)
-    opposite = pos is not None and pos.get("side") and (
-        (pos["side"] == "long" and take_short) or
-        (pos["side"] == "short" and take_long)
-    )
-    if opposite:
-        try:
-            side_open = pos["side"]; sz = float(pos.get("size") or 0.0)
-            side = "buy" if side_open == "short" else "sell"
-            policy = args.reversal
-            if policy == "flip":
-                print("Signal reversal — flip mode: closing existing, then opening opposite.")
-            elif policy == "cooldown":
-                print("Signal reversal — cooldown mode: closing existing; no new open until cooldown expires.")
-            else:
-                print("Signal reversal — close-only mode: closing existing; not opening a new one this bar.")
-            ex.create_order(symbol, "market", side, sz or 1, None, {"reduceOnly": True, "accountType": "UNIFIED"})
-            if args.reversal in ("close", "cooldown"):
-                rev_state = {"last_close_time_ms": now_ms, "last_bar_ts": int(ts_last_open)}
-                write_reversal_state(rev_state_path, rev_state)
-                write_last_executed(guard_path, last_close_ms)
-                return
-        except Exception as e:
-            print(f"[WARN] failed to close before handling reversal: {e}")
-        if args.reversal == "flip":
-            time.sleep(0.2)  # tiny pause before opening
-
-    # 13) Cooldown block (if enabled)
-    cooldown_active = False
-    remain = None
-    if args.reversal == "cooldown" and os.path.exists(rev_state_path):
-        try:
-            with open(rev_state_path, "r") as f:
-                st = json.load(f)
-            last_ms = int(st.get("last_close_time_ms") or 0)
-            cd_ms = int(getattr(args, "cooldown_seconds", 0) or 0) * 1000
-            if last_ms and cd_ms:
-                elapsed = now_ms - last_ms
-                if elapsed < cd_ms:
-                    cooldown_active = True
-                    remain = int((cd_ms - elapsed) / 1000)
-        except Exception as e:
-            print(f"[WARN] cooldown state read failed: {e}")
-
-    if cooldown_active:
-        print(f"Cooldown active — {remain}s remaining; not opening new positions.")
+    # 11) If flat and no fresh signal, do nothing
+    if not (take_long or take_short):
+        msg = _explain_no_open(p_prev, p_last, pos_thr, neg_thr)
+        print(msg)
         return
 
-    # 14) Optional top-up for swap margin
+    # 12) Optional top-up for swap (unchanged)
     if args.auto_transfer:
         transfer_spot_to_swap_if_needed(ex, min_usdt=50.0, buffer_frac=args.transfer_buffer, debug=args.debug)
 
-    # 15) OPEN order — balance-based sizing (with verification + retry, now attaching TP/SL inside order)
+    # 13) OPEN order — balance-based sizing, now with attached TP/SL on exchange
     try:
         quote_bal_swap = fetch_usdt_balance_swap(ex)
         side = "buy" if take_long else "sell"
         usd_to_use = (quote_bal_swap * (1.00 if take_long else 0.80)) if quote_bal_swap > 0 else 0.0
-        if args.debug:
-            print(f"[DEBUG] swap free USDT={quote_bal_swap:.4f} using={usd_to_use:.4f}")
         if usd_to_use <= 0:
-            print("No USDT balance available in UNIFIED/swap.")
+            print("No USDT balance available in SWAP.")
             return
-
-        # Market limits sanity (qty + notional)
-        mkt = ex.market(symbol)
-        last_close = float(df["close"].iloc[-1])
         qty_approx = usd_to_use / max(1e-12, last_close)
-
-        # Round to precision
         qty = amount_to_precision(ex, symbol, qty_approx)
-        px  = price_to_precision(ex, symbol, last_close)
-
-        # Enforce min amount / min cost if present
-        min_qty  = float((((mkt.get("limits") or {}).get("amount") or {}).get("min") or 0) or 0)
-        min_cost = float((((mkt.get("limits") or {}).get("cost")   or {}).get("min") or 0) or 0)
-        notional = qty * px
-        if qty <= 0 or (min_qty and qty < min_qty) or (min_cost and notional < min_cost):
-            print(f"[WARN] Order below market limits "
-                  f"(qty={qty} min_qty={min_qty} notional≈{notional:.4f} min_cost={min_cost}). Not acting.")
+        if qty <= 0:
+            print("Calculated order size is zero after precision rounding.")
             return
-
-        # One-way position mode (best effort)
-        try:
-            ex.set_position_mode(False, symbol)
-        except Exception:
-            pass
         try:
             ex.set_leverage(1, symbol)
         except Exception:
             pass
+        px = price_to_precision(ex, symbol, last_close)
+        print(f"Opening {('LONG' if side=='buy' else 'SHORT')} (futures/swap) — "
+              f"MARKET {side.upper()} {symbol} qty={qty} (px≈{px})")
 
-        # Position before
-        pos_before = get_swap_position(ex, symbol) or {}
+        # Entry order
+        order = ex.create_order(symbol, "market", side, qty, None, {"reduceOnly": False})
+        oid = order.get("id") or order.get("orderId") or order
+        print(f"Order placed: {oid}")
 
-        # Base params
-        params = {
-            "reduceOnly": False,
-            "accountType": "UNIFIED",
-            "category": "linear",     # Bybit v5
-            "timeInForce": "IOC",     # market IOC
-        }
-
-        # --- NEW: attach SL & TP inside the Bybit order (unified futures) ---
+        # Attach TP/SL as reduce-only orders
         try:
-            entry_ref = float(last_close)
+            entry_price = float(order.get("average") or order.get("price") or last_close)
 
-            tp_price = None
-            sl_price = None
+            tp_order_id = None
+            sl_order_id = None
 
             if side == "buy":
                 # LONG: TP above, SL below
                 if tp_pct is not None and tp_pct > 0:
-                    tp_price = price_to_precision(ex, symbol, entry_ref * (1.0 + tp_pct))
-                    params["takeProfitPrice"] = float(tp_price)
+                    tp_price = price_to_precision(ex, symbol, entry_price * (1.0 + tp_pct))
+                    tp = ex.create_order(
+                        symbol,
+                        "limit",
+                        "sell",
+                        qty,
+                        tp_price,
+                        {"reduceOnly": True},
+                    )
+                    tp_order_id = tp.get("id") or tp.get("orderId") or tp
+
                 if sl_pct is not None and sl_pct > 0:
-                    sl_price = price_to_precision(ex, symbol, entry_ref * (1.0 - sl_pct))
-                    params["stopLossPrice"] = float(sl_price)
+                    sl_price = price_to_precision(ex, symbol, entry_price * (1.0 - sl_pct))
+                    sl = ex.create_order(
+                        symbol,
+                        "market",
+                        "sell",
+                        qty,
+                        None,
+                        {
+                            "reduceOnly": True,
+                            "stopLossPrice": float(sl_price),
+                        },
+                    )
+                    sl_order_id = sl.get("id") or sl.get("orderId") or sl
+
             else:
                 # SHORT: TP below, SL above
                 if tp_pct is not None and tp_pct > 0:
-                    tp_price = price_to_precision(ex, symbol, entry_ref * (1.0 - tp_pct))
-                    params["takeProfitPrice"] = float(tp_price)
+                    tp_price = price_to_precision(ex, symbol, entry_price * (1.0 - tp_pct))
+                    tp = ex.create_order(
+                        symbol,
+                        "limit",
+                        "buy",
+                        qty,
+                        tp_price,
+                        {"reduceOnly": True},
+                    )
+                    tp_order_id = tp.get("id") or tp.get("orderId") or tp
+
                 if sl_pct is not None and sl_pct > 0:
-                    sl_price = price_to_precision(ex, symbol, entry_ref * (1.0 + sl_pct))
-                    params["stopLossPrice"] = float(sl_price)
+                    sl_price = price_to_precision(ex, symbol, entry_price * (1.0 + sl_pct))
+                    sl = ex.create_order(
+                        symbol,
+                        "market",
+                        "buy",
+                        qty,
+                        None,
+                        {
+                            "reduceOnly": True,
+                            "stopLossPrice": float(sl_price),
+                        },
+                    )
+                    sl_order_id = sl.get("id") or sl.get("orderId") or sl
 
-            if ("takeProfitPrice" in params) or ("stopLossPrice" in params):
-                # full-position TP/SL management on Bybit
-                params["tpslMode"] = "full"
-                if args.debug:
-                    print(f"[DEBUG] attaching TP/SL to entry — "
-                          f"tp={tp_price} sl={sl_price}")
+            if tp_order_id or sl_order_id:
+                print(f"Attached TP/SL orders — TP={tp_order_id!r} SL={sl_order_id!r}")
+
         except Exception as e:
-            print(f"[WARN] failed to prepare TP/SL params for entry: {e}")
+            print(f"[WARN] failed to attach TP/SL orders: {e}")
 
-        print(f"Opening {('LONG' if side=='buy' else 'SHORT')} (futures/swap) — "
-              f"MARKET {side.upper()} {symbol} qty={qty} (px≈{px})")
-
-        order = ex.create_order(symbol, "market", side, qty, None, params)
-        oid = order.get("id") or order.get("orderId") or (order.get("info", {}) or {}).get("orderId") or order
-        print(f"Order placed: {oid}")
-
-        # Verify via position delta (most reliable for market orders)
-        time.sleep(0.8)
-        pos_after = get_swap_position(ex, symbol) or {}
-        sz_before = float(pos_before.get("size") or 0.0)
-        sz_after  = float(pos_after.get("size")  or 0.0)
-        opened = (sz_after > sz_before + 1e-12) and (
-            (side == "buy"  and (pos_after.get("side") == "long")) or
-            (side == "sell" and (pos_after.get("side") == "short"))
-        )
-
-        if not opened:
-            # Try to fetch normalized order status (may be missing for fully-filled market orders)
-            try:
-                ord2 = ex.fetch_order(oid, symbol)
-                status = ord2.get("status")
-                filled = ord2.get("filled")
-                remaining = ord2.get("remaining")
-                info = ord2.get("info")
-                print(f"[WARN] Order not reflected in position — status={status} filled={filled} "
-                      f"remaining={remaining} info={info}")
-            except Exception as e:
-                print(f"[WARN] Could not verify via fetch_order: {e}")
-
-            # Retry once with convenience helpers (same params, including TP/SL)
-            try:
-                if side == "buy":
-                    ord_retry = ex.create_market_buy_order(symbol, qty, params)
-                else:
-                    ord_retry = ex.create_market_sell_order(symbol, qty, params)
-                oid2 = ord_retry.get("id") or ord_retry
-                print(f"[RETRY] Order placed: {oid2}")
-                time.sleep(0.6)
-                pos_after2 = get_swap_position(ex, symbol) or {}
-                sz_after2  = float(pos_after2.get("size") or 0.0)
-                opened = (sz_after2 > sz_before + 1e-12)
-            except Exception as e2:
-                print(f"[ERROR] Retry failed: {e2}")
-
-        if opened:
-            write_last_executed(guard_path, last_close_ms)
-        else:
-            print("[ERROR] Order did not result in an open position; check API keys, permissions, balance, and account type.")
+        # Guard file: one action per bar across brokers
+        write_last_executed(guard_path, last_close_ms)
 
     except Exception as e:
         print(f"[ERROR] order failed: {e}")
-
 
 
 # =========================

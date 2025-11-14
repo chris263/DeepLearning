@@ -516,37 +516,54 @@ def run_model(model, X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> Tuple[
 
 def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: float) -> str:
     fp = lambda x: f"{x:.3f}"
-    # Sanity: neutral band
-    if neg_thr < p_last < pos_thr:
-        return (f"No fresh signal: p_last={fp(p_last)} is inside the neutral band "
+
+    in_neutral_now = (neg_thr < p_last < pos_thr)
+    in_neutral_prev = (neg_thr < p_prev < pos_thr)
+
+    # 1) Neutral band => close any open position and wait
+    if in_neutral_now:
+        if p_prev >= pos_thr:
+            # Came from LONG zone into neutral
+            return (
+                f"Exit to NEUTRAL: p_last={fp(p_last)} moved down from the LONG zone "
+                f"(p_prev={fp(p_prev)} ≥ pos_thr={fp(pos_thr)}) into the neutral band "
                 f"({fp(neg_thr)} < p_last < {fp(pos_thr)}). "
-                f"Fresh-cross requires p_prev<{fp(pos_thr)}≤p_last for LONG or "
-                f"p_prev>{fp(neg_thr)}≥p_last for SHORT.")
+                f"Strategy closes any open LONG here and waits for a fresh cross: "
+                f"p_prev<{fp(pos_thr)}≤p_last for LONG or p_prev>{fp(neg_thr)}≥p_last for SHORT."
+            )
+        if p_prev <= neg_thr:
+            # Came from SHORT zone into neutral
+            return (
+                f"Exit to NEUTRAL: p_last={fp(p_last)} moved up from the SHORT zone "
+                f"(p_prev={fp(p_prev)} ≤ neg_thr={fp(neg_thr)}) into the neutral band "
+                f"({fp(neg_thr)} < p_last < {fp(pos_thr)}). "
+                f"Strategy closes any open SHORT here and waits for a fresh cross: "
+                f"p_prev<{fp(pos_thr)}≤p_last for LONG or p_prev>{fp(neg_thr)}≥p_last for SHORT."
+            )
 
-    # Already in zones (no re-open without a fresh cross)
+        # Neutral → neutral: just stay flat
+        return (
+            f"No trade: probability remains inside the neutral band "
+            f"({fp(neg_thr)} < p_last={fp(p_last)} < {fp(pos_thr)}). "
+            f"No position is opened until we cross above {fp(pos_thr)} (LONG) "
+            f"or below {fp(neg_thr)} (SHORT)."
+        )
+
+    # 2) Already in LONG or SHORT zone and stayed there => no re-open without fresh cross
     if p_last >= pos_thr and p_prev >= pos_thr:
-        return (f"No LONG open: previous bar already in LONG zone "
-                f"(p_prev={fp(p_prev)} ≥ pos_thr={fp(pos_thr)}), so no fresh cross. "
-                f"Current p_last={fp(p_last)}.")
+        return (
+            f"No new LONG: probability stayed in the LONG zone "
+            f"(p_prev={fp(p_prev)} → p_last={fp(p_last)} ≥ pos_thr={fp(pos_thr)}). "
+            f"We only open a LONG on a fresh cross up from below pos_thr."
+        )
+
     if p_last <= neg_thr and p_prev <= neg_thr:
-        return (f"No SHORT open: previous bar already in SHORT zone "
-                f"(p_prev={fp(p_prev)} ≤ neg_thr={fp(neg_thr)}), so no fresh cross. "
-                f"Current p_last={fp(p_last)}.")
+        return (
+            f"No new SHORT: probability stayed in the SHORT zone "
+            f"(p_prev={fp(p_prev)} → p_last={fp(p_last)} ≤ neg_thr={fp(neg_thr)}). "
+            f"We only open a SHORT on a fresh cross down from above neg_thr."
+        )
 
-    # Approaching but didn’t cross
-    if p_prev < pos_thr and p_last < pos_thr:
-        gap = pos_thr - p_last
-        return (f"No LONG: probability stayed below pos_thr "
-                f"(p_prev={fp(p_prev)} → p_last={fp(p_last)}; needs +{fp(gap)} to reach {fp(pos_thr)}).")
-    if p_prev > neg_thr and p_last > neg_thr:
-        gap = p_last - neg_thr
-        return (f"No SHORT: probability stayed above neg_thr "
-                f"(p_prev={fp(p_prev)} → p_last={fp(p_last)}; needs -{fp(gap)} to reach {fp(neg_thr)}).")
-
-    # Edge/equality cases (e.g., sitting exactly on a threshold without fresh-cross)
-    return (f"No fresh signal: p_prev={fp(p_prev)} → p_last={fp(p_last)}; "
-            f"thresholds pos_thr={fp(pos_thr)}, neg_thr={fp(neg_thr)}. "
-            f"Fresh-cross requires p_prev<{fp(pos_thr)}≤p_last (LONG) or p_prev>{fp(neg_thr)}≥p_last (SHORT).")
 
 # =========================
 # Core flow (futures only, close-only reversal by default)
@@ -645,24 +662,29 @@ def decide_and_maybe_trade(args):
     ex = make_exchange(args.pub_key, args.sec_key)
     symbol = resolve_symbol(ex, ticker)
 
-    # 10) Position & SL/TP (+ signal exit)
+    # 10) Position & SL/TP (+ signal exit on neutral)
     pos = get_swap_position(ex, symbol)
     last_close = float(df["close"].iloc[-1])
     last_high  = float(df["high"].iloc[-1])
     last_low   = float(df["low"].iloc[-1])
 
+    # Neutral band helper
+    in_neutral = (neg_thr < p_last < pos_thr)
+
     if pos is not None and pos.get("side"):
+        # There is an open position on the exchange
+        side_open = str(pos["side"]).lower()  # expect 'long' or 'short'
         entry = float(pos.get("entry") or last_close)
-        side_open = pos["side"]  # 'long' or 'short'
         sz = float(pos.get("size") or 0.0)
 
         if side_open == "long":
+            # LONG SL/TP prices
             sl_px = entry * (1.0 - (sl_pct or 0.0)) if sl_pct is not None else None
             tp_px = entry * (1.0 + (tp_pct or 0.0)) if tp_pct is not None else None
             hit_sl = (sl_px is not None) and (last_low  <= sl_px)
             hit_tp = (tp_px is not None) and (last_high >= tp_px)
 
-            # SL-first (backtest parity)
+            # 10a) SL/TP first (backtest parity)
             if hit_sl or hit_tp:
                 reason = "SL" if hit_sl else "TP"
                 try:
@@ -673,23 +695,29 @@ def decide_and_maybe_trade(args):
                     print(f"[ERROR] close LONG on {reason} failed: {e}")
                 return
 
-            # SIGNAL EXIT: close LONG when p_last drops below pos_thr (no cross required)
+            # 10b) SIGNAL EXIT: close LONG when we leave LONG zone
+            #     (i.e. probability drops below pos_thr → neutral or short zone)
             if p_last < pos_thr:
                 try:
                     ex.create_order(symbol, "market", "sell", sz or 1, None, {"reduceOnly": True})
-                    print(f"Signal exit — p_last={p_last:.3f} < pos_thr={pos_thr:.3f}: closing LONG at ~{last_close}")
+                    zone = "neutral" if in_neutral else "short"
+                    print(
+                        f"Signal exit — LONG → {zone} zone: "
+                        f"p_last={p_last:.3f} < pos_thr={pos_thr:.3f}; closing LONG at ~{last_close}"
+                    )
                     write_last_executed(guard_path, last_close_ms)
                 except Exception as e:
                     print(f"[ERROR] close LONG (SIG) failed: {e}")
                 return
 
-        else:  # side_open == "short"
+        elif side_open == "short":
+            # SHORT SL/TP prices
             sl_px = entry * (1.0 + (sl_pct or 0.0)) if sl_pct is not None else None
             tp_px = entry * (1.0 - (tp_pct or 0.0)) if tp_pct is not None else None
             hit_sl = (sl_px is not None) and (last_high >= sl_px)
             hit_tp = (tp_px is not None) and (last_low  <= tp_px)
 
-            # SL-first (backtest parity)
+            # 10c) SL/TP first (backtest parity)
             if hit_sl or hit_tp:
                 reason = "SL" if hit_sl else "TP"
                 try:
@@ -700,82 +728,45 @@ def decide_and_maybe_trade(args):
                     print(f"[ERROR] close SHORT on {reason} failed: {e}")
                 return
 
-            # SIGNAL EXIT: close SHORT when p_last rises above neg_thr (no cross required)
+            # 10d) SIGNAL EXIT: close SHORT when we leave SHORT zone
+            #     (i.e. probability rises above neg_thr → neutral or long zone)
             if p_last > neg_thr:
                 try:
                     ex.create_order(symbol, "market", "buy", sz or 1, None, {"reduceOnly": True})
-                    print(f"Signal exit — p_last={p_last:.3f} > neg_thr={neg_thr:.3f}: closing SHORT at ~{last_close}")
+                    zone = "neutral" if in_neutral else "long"
+                    print(
+                        f"Signal exit — SHORT → {zone} zone: "
+                        f"p_last={p_last:.3f} > neg_thr={neg_thr:.3f}; closing SHORT at ~{last_close}"
+                    )
                     write_last_executed(guard_path, last_close_ms)
                 except Exception as e:
                     print(f"[ERROR] close SHORT (SIG) failed: {e}")
                 return
 
+        else:
+            # Unknown side string: be safe and do not open anything new
+            print(f"[WARN] Unknown open side {side_open!r}; keeping position and not opening new trades.")
+            return
 
-    # 11) Avoid pyramiding
-    if pos is not None and pos.get("side") and (
-        (take_long  and pos["side"] == "long") or
-        (take_short and pos["side"] == "short")
-    ):
-        print("Avoiding opening another position - pyramiding.")
+        # If we still have a position and no SL/TP or signal-exit, we **keep** it and
+        # do not allow any new opens this bar (no flip, no pyramiding).
+        print(
+            f"Keeping existing {side_open.upper()} open — "
+            f"p_last={p_last:.3f}, pos_thr={pos_thr:.3f}, neg_thr={neg_thr:.3f}"
+        )
         return
 
-    # 12) Reversal handling (CLOSE ONLY by default; supports flip/cooldown)
-    opposite = pos is not None and pos.get("side") and (
-        (pos["side"] == "long" and take_short) or
-        (pos["side"] == "short" and take_long)
-    )
-
-    if opposite:
-        try:
-            side_open = pos["side"]
-            sz = float(pos.get("size") or 0.0)
-            side = "buy" if side_open == "short" else "sell"
-            policy = args.reversal
-            if policy == "flip":
-                print("Signal reversal — flip mode: closing existing, then opening opposite.")
-            elif policy == "cooldown":
-                print("Signal reversal — cooldown mode: closing existing; no new open until cooldown expires.")
-            else:
-                print("Signal reversal — close-only mode: closing existing; not opening a new one this bar.")
-            ex.create_order(symbol, "market", side, sz or 1, None, {"reduceOnly": True})
-            # record reversal time for cooldown / and mark this bar executed for close-only
-            if args.reversal in ("close", "cooldown"):
-                rev_state = {"last_close_time_ms": now_ms, "last_bar_ts": int(ts_last_open)}
-                write_reversal_state(rev_state_path, rev_state)
-                write_last_executed(guard_path, last_close_ms)
-                return
-        except Exception as e:
-            print(f"[WARN] failed to close before handling reversal: {e}")
-        if args.reversal == "flip":
-            time.sleep(0.2)  # tiny pause before opening
-
-    # 13) If cooldown active, block opening
-    cooldown_active = False
-    remain = None
-    if args.reversal == "cooldown" and os.path.exists(rev_state_path):
-        try:
-            with open(rev_state_path, "r") as f:
-                st = json.load(f)
-            last_ms = int(st.get("last_close_time_ms") or 0)
-            cd_ms = int(getattr(args, "cooldown_seconds", 0) or 0) * 1000
-            if last_ms and cd_ms:
-                elapsed = now_ms - last_ms
-                if elapsed < cd_ms:
-                    cooldown_active = True
-                    remain = int((cd_ms - elapsed) / 1000)
-        except Exception as e:
-            print(f"[WARN] cooldown state read failed: {e}")
-
-    if cooldown_active:
-        print(f"Cooldown active — {remain}s remaining; not opening new positions.")
+    # 11) If flat and no fresh signal, do nothing
+    if not (take_long or take_short):
+        msg = _explain_no_open(p_prev, p_last, pos_thr, neg_thr)
+        print(msg)
         return
 
-
-    # 14) Optional top-up for swap
+    # 12) Optional top-up for swap (unchanged)
     if args.auto_transfer:
         transfer_spot_to_swap_if_needed(ex, min_usdt=50.0, buffer_frac=args.transfer_buffer, debug=args.debug)
 
-    # 15) OPEN order — balance-based sizing, now with attached TP/SL on exchange
+    # 13) OPEN order — balance-based sizing, now with attached TP/SL on exchange
     try:
         quote_bal_swap = fetch_usdt_balance_swap(ex)
         side = "buy" if take_long else "sell"
@@ -796,12 +787,12 @@ def decide_and_maybe_trade(args):
         print(f"Opening {('LONG' if side=='buy' else 'SHORT')} (futures/swap) — "
               f"MARKET {side.upper()} {symbol} qty={qty} (px≈{px})")
 
-        # Entry order (same behavior as before)
+        # Entry order
         order = ex.create_order(symbol, "market", side, qty, None, {"reduceOnly": False})
         oid = order.get("id") or order.get("orderId") or order
         print(f"Order placed: {oid}")
 
-        # --- NEW: Attach TP & SL as exchange-side reduce-only orders ---
+        # Attach TP/SL as reduce-only orders
         try:
             entry_price = float(order.get("average") or order.get("price") or last_close)
 
@@ -832,7 +823,6 @@ def decide_and_maybe_trade(args):
                         None,
                         {
                             "reduceOnly": True,
-                            # CCXT param for Coinbase International stop-loss trigger
                             "stopLossPrice": float(sl_price),
                         },
                     )
@@ -873,11 +863,12 @@ def decide_and_maybe_trade(args):
         except Exception as e:
             print(f"[WARN] failed to attach TP/SL orders: {e}")
 
-        # Guard file (unchanged)
+        # Guard file: one action per bar across brokers
         write_last_executed(guard_path, last_close_ms)
 
     except Exception as e:
         print(f"[ERROR] order failed: {e}")
+
 
 # =========================
 # CLI
