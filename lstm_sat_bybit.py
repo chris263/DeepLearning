@@ -485,16 +485,6 @@ def get_swap_position(ex, symbol: str) -> Optional[Dict]:
 # =========================
 # Inference helpers
 # =========================
-def to_sequences_latest(feat_df: pd.DataFrame, features: List[str], lookback: int) -> Tuple[np.ndarray, np.ndarray]:
-    if len(feat_df) < (lookback + 1):
-        raise SystemExit("Not enough rows to build lookback sequences")
-    sub = feat_df.iloc[-(lookback+1):].copy().reset_index(drop=True)
-    prev = sub.iloc[:-1][features].to_numpy(dtype=np.float32)
-    last = sub.iloc[1:][features].to_numpy(dtype=np.float32)
-    X = np.stack([prev, last], axis=0)
-    ts_seq = sub["ts"].to_numpy()
-    return X, ts_seq
-
 def run_model(model, X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> Tuple[float, float]:
     # X shape: (2, lookback, n_features) — run two independent forwards
     Xn = (X - mean) / (std + 1e-12)
@@ -601,9 +591,12 @@ def decide_and_maybe_trade(args):
             raise SystemExit(f"Feature '{c}' missing in computed frame.")
     feat_df = feat_df_full.copy()
 
-    # 4) Inference (prev vs last bar)
-    X, ts_seq = to_sequences_latest(feat_df[feats + ["ts"]], feats, lookback)
-    p_prev, p_last = run_model(model, X, mean, std)
+    # 4) Inference (prev vs last bar) — explicit windows (no helper)
+    feat_mat = feat_df[feats].to_numpy(dtype=np.float32)
+ 
+    X_prev = feat_mat[-lookback-1 : -1] 
+    X_last = feat_mat[-lookback   :   ] 
+    X = np.stack([X_prev, X_last], axis=0)
 
     if getattr(args, "debug", False):
         closes = df["close"].to_numpy()
