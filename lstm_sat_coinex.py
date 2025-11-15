@@ -520,20 +520,37 @@ def price_to_precision(ex, symbol: str, price: float) -> float:
         return float(f"{price:.6f}")
 
 
+def get_min_amount(ex, symbol: str) -> float:
+    """
+    Return the exchange-reported minimum tradable amount for this symbol,
+    or 0.0 if not available.
+    """
+    try:
+        m = ex.markets.get(symbol) or ex.market(symbol)
+        limits = m.get("limits") or {}
+        amt = limits.get("amount") or {}
+        mn = amt.get("min")
+        if mn is not None:
+            return float(mn)
+    except Exception:
+        pass
+    return 0.0
+
+
 def safe_close_amount(ex, symbol: str, position_size: float) -> float:
     """
     Compute a close quantity that:
-      - respects the symbol's amount precision; and
-      - never exceeds the current position size (floor to step).
+      - never exceeds the current position size; and
+      - respects amount precision if available.
 
-    This prevents CoinEx 'amount exceed limit' errors when the true
-    on-exchange position is slightly smaller than the rounded value.
+    This helps avoid 'amount exceed limit' errors when the on-exchange
+    position is slightly smaller than rounded values.
     """
     sz = float(abs(position_size))
     if sz <= 0:
         return 0.0
 
-    # Try to floor using the amount precision (number of decimals)
+    # Use decimal precision if present
     try:
         m = ex.markets.get(symbol) or {}
         prec_obj = m.get("precision") or {}
@@ -765,15 +782,16 @@ def decide_and_maybe_trade(args):
         entry = float(pos.get("entry") or last_close)
 
         raw_size = float(pos.get("size") or 0.0)
-        close_qty = safe_close_amount(ex, symbol, raw_size)
+        sz_abs = abs(raw_size)
+        close_qty = safe_close_amount(ex, symbol, sz_abs)
 
-        print(
-            f"[DEBUG] Existing position detected: side={side_open_raw!r}, "
-            f"raw_size={raw_size}, close_qty={close_qty}, entry={entry}"
-        )
+        print(f"[DEBUG] Existing position detected: side={side_open_raw!r}, "
+              f"raw_size={raw_size}, close_qty={close_qty}, entry={entry}")
 
         if close_qty <= 0:
-            print("[WARN] Position size is zero or below minimum after precision; treating as flat.")
+            print("[WARN] Position size is below minimum tradable size after precision; "
+                  "cannot safely close — skipping new trades.")
+            return
         else:
             if side_open == "long":
                 # LONG SL/TP prices
@@ -868,16 +886,24 @@ def decide_and_maybe_trade(args):
     try:
         quote_bal_swap = fetch_usdt_balance_swap(ex)
         side = "buy" if take_long else "sell"
-        usd_to_use = (quote_bal_swap * (1.00 if take_long else 0.80)) if quote_bal_swap > 0 else 0.0
+        use_frac = 0.95 if take_long else 0.80  # 95% for LONG, 80% for SHORT
+        usd_to_use = (quote_bal_swap * use_frac) if quote_bal_swap > 0 else 0.0
         if usd_to_use <= 0:
             print("No USDT balance available in SWAP.")
             return
 
         qty_approx = usd_to_use / max(1e-12, last_close)
         qty = amount_to_precision(ex, symbol, qty_approx)
+
+        min_amt = get_min_amount(ex, symbol)
+        if min_amt > 0 and qty < min_amt:
+            print(f"Calculated order size {qty} is below exchange minimum {min_amt} for {symbol}; skipping trade.")
+            return
+
         if qty <= 0:
             print("Calculated order size is zero after precision rounding.")
             return
+
 
         try:
             ex.set_leverage(1, symbol)
@@ -928,6 +954,7 @@ def decide_and_maybe_trade(args):
                         tp_price,
                         {
                             "reduceOnly": True,
+                            "takeProfitPrice": float(tp_price),
                         },
                     )
                     oid = _safe_order_id(tp)
@@ -969,6 +996,7 @@ def decide_and_maybe_trade(args):
                         tp_price,
                         {
                             "reduceOnly": True,
+                            "takeProfitPrice": float(tp_price),
                         },
                     )
                     oid = _safe_order_id(tp)
