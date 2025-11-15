@@ -16,7 +16,7 @@ Requires: torch, ccxt, numpy, pandas
 """
 
 from __future__ import annotations
-import os, sys, json, time, argparse, pathlib, tempfile
+import os, sys, json, time, argparse, pathlib, tempfile, math
 from typing import List, Dict, Tuple, Optional
 
 import numpy as np
@@ -458,6 +458,48 @@ def price_to_precision(ex, symbol: str, price: float) -> float:
     except Exception:
         return float(f"{price:.6f}")
 
+def safe_close_amount(ex, symbol: str, position_size: float) -> float:
+    """
+    Compute a close quantity that:
+      - respects the symbol's amount precision; and
+      - never exceeds the current position size (floor to step).
+    This avoids CoinEx 'amount exceed limit' errors when the true
+    position is slightly smaller than the rounded value.
+    """
+    sz = float(abs(position_size))
+    if sz <= 0:
+        return 0.0
+
+    # Try to floor using the amount precision (number of decimals)
+    try:
+        m = ex.markets.get(symbol) or {}
+        prec_obj = m.get("precision") or {}
+        prec = prec_obj.get("amount", None)
+    except Exception:
+        prec = None
+
+    if prec is not None:
+        try:
+            decimals = int(prec)
+            step = 10.0 ** (-decimals)
+            steps = math.floor(sz / step)
+            qty = steps * step
+            qty = float(f"{qty:.12f}")
+            return qty if qty > 0 else 0.0
+        except Exception:
+            pass
+
+    # Fallback: clamp amount_to_precision result to <= position size
+    try:
+        q = float(ex.amount_to_precision(symbol, sz))
+        if q > sz:
+            eps = sz * 1e-6 or 1e-8
+            q = float(ex.amount_to_precision(symbol, max(0.0, sz - eps)))
+        q = float(f"{q:.12f}")
+        return q if q > 0 else 0.0
+    except Exception:
+        return sz
+
 def get_swap_position(ex, symbol: str) -> Optional[Dict]:
     def _scan(ps):
         if not ps:
@@ -662,16 +704,16 @@ def decide_and_maybe_trade(args):
         side_open = str(side_open_raw).lower()  # 'long' or 'short' ideally
         entry = float(pos.get("entry") or last_close)
 
-        # IMPORTANT: get a safe, positive, precision-checked size
+        # IMPORTANT: get a safe, positive, precision-checked size that never exceeds the position
         raw_size = float(pos.get("size") or 0.0)
         sz_abs = abs(raw_size)
-        close_qty = amount_to_precision(ex, symbol, sz_abs)
+        close_qty = safe_close_amount(ex, symbol, sz_abs)
 
         print(f"[DEBUG] Existing position detected: side={side_open_raw!r}, "
               f"raw_size={raw_size}, close_qty={close_qty}, entry={entry}")
 
         if close_qty <= 0:
-            print("[WARN] Position size is zero after precision; treating as flat.")
+            print("[WARN] Position size is zero or below minimum trade size after precision; treating as flat.")
             # fall through as flat (no return here)
         else:
             if side_open == "long":

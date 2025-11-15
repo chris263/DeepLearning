@@ -17,7 +17,7 @@ Requires: torch, ccxt, numpy, pandas
 """
 
 from __future__ import annotations
-import os, sys, json, time, argparse, pathlib, tempfile
+import os, sys, json, time, argparse, pathlib, tempfile, math
 from typing import List, Dict, Tuple, Optional
 
 import numpy as np
@@ -459,6 +459,49 @@ def price_to_precision(ex, symbol: str, price: float) -> float:
     except Exception:
         return float(f"{price:.6f}")
 
+def safe_close_amount(ex, symbol: str, position_size: float) -> float:
+    """
+    Compute a close quantity that:
+      - respects the symbol's amount precision; and
+      - never exceeds the current position size (floor to step).
+
+    This prevents 'amount exceed limit' / 'insufficient size' type errors
+    when the true position is slightly smaller than the rounded value.
+    """
+    sz = float(abs(position_size))
+    if sz <= 0:
+        return 0.0
+
+    # Try to floor using the amount precision (number of decimals)
+    try:
+        m = ex.markets.get(symbol) or {}
+        prec_obj = m.get("precision") or {}
+        prec = prec_obj.get("amount", None)
+    except Exception:
+        prec = None
+
+    if prec is not None:
+        try:
+            decimals = int(prec)
+            step = 10.0 ** (-decimals)
+            steps = math.floor(sz / step)
+            qty = steps * step
+            qty = float(f"{qty:.12f}")
+            return qty if qty > 0 else 0.0
+        except Exception:
+            pass
+
+    # Fallback: clamp amount_to_precision result to <= position size
+    try:
+        q = float(ex.amount_to_precision(symbol, sz))
+        if q > sz:
+            eps = sz * 1e-6 or 1e-8
+            q = float(ex.amount_to_precision(symbol, max(0.0, sz - eps)))
+        q = float(f"{q:.12f}")
+        return q if q > 0 else 0.0
+    except Exception:
+        return sz
+
 def get_swap_position(ex, symbol: str) -> Optional[Dict]:
     def _scan(ps):
         if not ps:
@@ -652,79 +695,89 @@ def decide_and_maybe_trade(args):
 
     if pos is not None and pos.get("side"):
         # There is an open position on the exchange
-        side_open = str(pos["side"]).lower()  # expect 'long' or 'short'
+        side_open_raw = pos.get("side")
+        side_open = str(side_open_raw).lower()  # expect 'long' or 'short'
         entry = float(pos.get("entry") or last_close)
-        sz = float(pos.get("size") or 0.0)
 
-        if side_open == "long":
-            # LONG SL/TP prices
-            sl_px = entry * (1.0 - (sl_pct or 0.0)) if sl_pct is not None else None
-            tp_px = entry * (1.0 + (tp_pct or 0.0)) if tp_pct is not None else None
-            hit_sl = (sl_px is not None) and (last_low  <= sl_px)
-            hit_tp = (tp_px is not None) and (last_high >= tp_px)
+        raw_size = float(pos.get("size") or 0.0)
+        sz_abs = abs(raw_size)
+        close_qty = safe_close_amount(ex, symbol, sz_abs)
 
-            # 10a) SL/TP first (backtest parity)
-            if hit_sl or hit_tp:
-                reason = "SL" if hit_sl else "TP"
-                try:
-                    ex.create_order(symbol, "market", "sell", sz or 1, None, {"reduceOnly": True})
-                    print(f"{reason} hit — closing existing LONG at ~{(sl_px if hit_sl else tp_px):.8g}")
-                    write_last_executed(guard_path, last_close_ms)
-                except Exception as e:
-                    print(f"[ERROR] close LONG on {reason} failed: {e}")
-                return
+        print(f"[DEBUG] Existing position detected: side={side_open_raw!r}, "
+              f"raw_size={raw_size}, close_qty={close_qty}, entry={entry}")
 
-            # 10b) SIGNAL EXIT: close LONG when we leave LONG zone
-            #     (i.e. probability drops below pos_thr → neutral or short zone)
-            if p_last < pos_thr:
-                try:
-                    ex.create_order(symbol, "market", "sell", sz or 1, None, {"reduceOnly": True})
-                    zone = "neutral" if in_neutral else "short"
-                    print(
-                        f"Signal exit — LONG → {zone} zone: "
-                        f"p_last={p_last:.3f} < pos_thr={pos_thr:.3f}; closing LONG at ~{last_close}"
-                    )
-                    write_last_executed(guard_path, last_close_ms)
-                except Exception as e:
-                    print(f"[ERROR] close LONG (SIG) failed: {e}")
-                return
-
-        elif side_open == "short":
-            # SHORT SL/TP prices
-            sl_px = entry * (1.0 + (sl_pct or 0.0)) if sl_pct is not None else None
-            tp_px = entry * (1.0 - (tp_pct or 0.0)) if tp_pct is not None else None
-            hit_sl = (sl_px is not None) and (last_high >= sl_px)
-            hit_tp = (tp_px is not None) and (last_low  <= tp_px)
-
-            # 10c) SL/TP first (backtest parity)
-            if hit_sl or hit_tp:
-                reason = "SL" if hit_sl else "TP"
-                try:
-                    ex.create_order(symbol, "market", "buy", sz or 1, None, {"reduceOnly": True})
-                    print(f"{reason} hit — closing existing SHORT at ~{(sl_px if hit_sl else tp_px):.8g}")
-                    write_last_executed(guard_path, last_close_ms)
-                except Exception as e:
-                    print(f"[ERROR] close SHORT on {reason} failed: {e}")
-                return
-
-            # 10d) SIGNAL EXIT: close SHORT when we leave SHORT zone
-            #     (i.e. probability rises above neg_thr → neutral or long zone)
-            if p_last > neg_thr:
-                try:
-                    ex.create_order(symbol, "market", "buy", sz or 1, None, {"reduceOnly": True})
-                    zone = "neutral" if in_neutral else "long"
-                    print(
-                        f"Signal exit — SHORT → {zone} zone: "
-                        f"p_last={p_last:.3f} > neg_thr={neg_thr:.3f}; closing SHORT at ~{last_close}"
-                    )
-                    write_last_executed(guard_path, last_close_ms)
-                except Exception as e:
-                    print(f"[ERROR] close SHORT (SIG) failed: {e}")
-                return
+        if close_qty <= 0:
+            print("[WARN] Position size is zero or below minimum trade size after precision; treating as flat.")
         else:
-            # Unknown side string: be safe and do not open anything new
-            print(f"[WARN] Unknown open side {side_open!r}; keeping position and not opening new trades.")
-            return
+            if side_open == "long":
+                # LONG SL/TP prices
+                sl_px = entry * (1.0 - (sl_pct or 0.0)) if sl_pct is not None else None
+                tp_px = entry * (1.0 + (tp_pct or 0.0)) if tp_pct is not None else None
+                hit_sl = (sl_px is not None) and (last_low  <= sl_px)
+                hit_tp = (tp_px is not None) and (last_high >= tp_px)
+
+                # 10a) SL/TP first (backtest parity)
+                if hit_sl or hit_tp:
+                    reason = "SL" if hit_sl else "TP"
+                    try:
+                        ex.create_order(symbol, "market", "sell", close_qty, None, {"reduceOnly": True})
+                        print(f"{reason} hit — closing existing LONG at ~{(sl_px if hit_sl else tp_px):.8g}")
+                        write_last_executed(guard_path, last_close_ms)
+                    except Exception as e:
+                        print(f"[ERROR] close LONG on {reason} failed: {e}")
+                    return
+
+                # 10b) SIGNAL EXIT: close LONG when we leave LONG zone
+                #     (i.e. probability drops below pos_thr → neutral or short zone)
+                if p_last < pos_thr:
+                    try:
+                        ex.create_order(symbol, "market", "sell", close_qty, None, {"reduceOnly": True})
+                        zone = "neutral" if in_neutral else "short"
+                        print(
+                            f"Signal exit — LONG → {zone} zone: "
+                            f"p_last={p_last:.3f} < pos_thr={pos_thr:.3f}; closing LONG at ~{last_close}"
+                        )
+                        write_last_executed(guard_path, last_close_ms)
+                    except Exception as e:
+                        print(f"[ERROR] close LONG (SIG) failed: {e}")
+                    return
+
+            elif side_open == "short":
+                # SHORT SL/TP prices
+                sl_px = entry * (1.0 + (sl_pct or 0.0)) if sl_pct is not None else None
+                tp_px = entry * (1.0 - (tp_pct or 0.0)) if tp_pct is not None else None
+                hit_sl = (sl_px is not None) and (last_high >= sl_px)
+                hit_tp = (tp_px is not None) and (last_low  <= tp_px)
+
+                # 10c) SL/TP first (backtest parity)
+                if hit_sl or hit_tp:
+                    reason = "SL" if hit_sl else "TP"
+                    try:
+                        ex.create_order(symbol, "market", "buy", close_qty, None, {"reduceOnly": True})
+                        print(f"{reason} hit — closing existing SHORT at ~{(sl_px if hit_sl else tp_px):.8g}")
+                        write_last_executed(guard_path, last_close_ms)
+                    except Exception as e:
+                        print(f"[ERROR] close SHORT on {reason} failed: {e}")
+                    return
+
+                # 10d) SIGNAL EXIT: close SHORT when we leave SHORT zone
+                #     (i.e. probability rises above neg_thr → neutral or long zone)
+                if p_last > neg_thr:
+                    try:
+                        ex.create_order(symbol, "market", "buy", close_qty, None, {"reduceOnly": True})
+                        zone = "neutral" if in_neutral else "long"
+                        print(
+                            f"Signal exit — SHORT → {zone} zone: "
+                            f"p_last={p_last:.3f} > neg_thr={neg_thr:.3f}; closing SHORT at ~{last_close}"
+                        )
+                        write_last_executed(guard_path, last_close_ms)
+                    except Exception as e:
+                        print(f"[ERROR] close SHORT (SIG) failed: {e}")
+                    return
+            else:
+                # Unknown side string: be safe and do not open anything new
+                print(f"[WARN] Unknown open side {side_open_raw!r}; keeping position and not opening new trades.")
+                return
 
         # If we still have a position and no SL/TP or signal-exit, we **keep** it and
         # do not allow any new opens this bar (no flip, no pyramiding).
