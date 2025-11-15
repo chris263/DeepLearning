@@ -748,19 +748,38 @@ def decide_and_maybe_trade(args):
     try:
         quote_bal_swap = fetch_usdt_balance_swap(ex)
         side = "buy" if take_long else "sell"
-        usd_to_use = (quote_bal_swap * (1.00 if take_long else 0.80)) if quote_bal_swap > 0 else 0.0
+
+        # Leave a small safety buffer so Bybit has room for fees / margin.
+        # LONG ~97% of free balance, SHORT ~77% (keeping your 20% relative idea).
+        risk_long = 0.97
+        risk_short = 0.77
+
+        usd_to_use = (
+            quote_bal_swap * (risk_long if take_long else risk_short)
+            if quote_bal_swap > 0
+            else 0.0
+        )
         if usd_to_use <= 0:
             print("No USDT balance available in SWAP.")
             return
+
         qty_approx = usd_to_use / max(1e-12, last_close)
         qty = amount_to_precision(ex, symbol, qty_approx)
         if qty <= 0:
             print("Calculated order size is zero after precision rounding.")
             return
+
+        # Helpful debug
+        print(
+            f"[DEBUG] swap_bal={quote_bal_swap:.4f} usd_to_use={usd_to_use:.4f} "
+            f"qty≈{qty_approx:.6f} notional≈{qty*last_close:.4f}"
+        )
+
         try:
             ex.set_leverage(1, symbol)
         except Exception:
             pass
+
         px = price_to_precision(ex, symbol, last_close)
         print(f"Opening {('LONG' if side=='buy' else 'SHORT')} (futures/swap) — "
               f"MARKET {side.upper()} {symbol} qty={qty} (px≈{px})")
