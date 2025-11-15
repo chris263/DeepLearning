@@ -3,12 +3,11 @@
 """
 LSTM Ichimoku runner for CoinEx (USDT linear swap, i.e., futures only).
 
-- Always futures (swap).
-- Fresh-cross trigger logic (prev vs last bar).
-- Close-only on reversal by default (no immediate flip).
+- Fresh-cross trigger logic (from old).
+- Close-only on reversal by default (from new). Optional: --reversal flip|cooldown
 - Robust JSON loader; 6-minute window after real close time.
-- SL/TP exits from meta.json (sl_pct / tp_pct) + exchange-attached TP/SL.
-- Balance-based sizing: 100% long, 80% short.
+- SL/TP exits from meta.json (sl_pct / tp_pct).
+- Balance-based sizing: 95% long, 80% short.
 - Feature-name alignment to meta["features"].
 - Shared last-bar ID at ~/.sat_state/lastbars.json (override via SAT_STATE_DIR).
 - Per-broker idempotency file to avoid double actions per bar.
@@ -17,14 +16,7 @@ Requires: torch, ccxt, numpy, pandas
 """
 
 from __future__ import annotations
-import os
-import sys
-import json
-import time
-import math
-import argparse
-import pathlib
-import tempfile
+import os, sys, json, time, argparse, pathlib, tempfile, math
 from typing import List, Dict, Tuple, Optional
 
 import numpy as np
@@ -42,12 +34,12 @@ except Exception:
     print("Please install ccxt:  pip install ccxt", file=sys.stderr)
     raise
 
-
 # =========================
-# Timeframe helpers
+# Constants / timeframe helpers
 # =========================
 
 SIX_MIN_MS = 6 * 60 * 1000
+
 TF_TO_MS = {
     "1m": 60_000,
     "3m": 180_000,
@@ -183,7 +175,6 @@ def slope(series: pd.Series, w: int = 8) -> pd.Series:
     return series.diff(w)
 
 
-# Synonyms for meta["features"]
 _SYNONYMS = {
     "ret1": ["ret_1", "r1", "return1"],
     "oc_diff": ["ocdiff", "oc_change"],
@@ -550,9 +541,10 @@ def safe_close_amount(ex, symbol: str, position_size: float) -> float:
     if sz <= 0:
         return 0.0
 
-    # Use decimal precision if present
+    # Try to derive a step from precision
+    step = None
     try:
-        m = ex.markets.get(symbol) or {}
+        m = ex.markets.get(symbol) or ex.market(symbol)
         prec_obj = m.get("precision") or {}
         prec = prec_obj.get("amount", None)
     except Exception:
@@ -560,20 +552,30 @@ def safe_close_amount(ex, symbol: str, position_size: float) -> float:
 
     if prec is not None:
         try:
-            decimals = int(prec)
-            step = 10.0 ** (-decimals)
-            steps = math.floor(sz / step)
-            qty = steps * step
-            qty = float(f"{qty:.12f}")
-            return qty if qty > 0 else 0.0
+            # If prec is an integer like 3 or 4, treat it as decimal places
+            if isinstance(prec, int) or (isinstance(prec, float) and prec >= 1 and float(prec).is_integer()):
+                decimals = int(prec)
+                if 0 <= decimals <= 18:
+                    step = 10.0 ** (-decimals)
+            # If prec is a small float < 1, treat it as a step size directly (common on CoinEx)
+            elif isinstance(prec, float) and 0 < prec < 1:
+                step = float(prec)
         except Exception:
-            pass
+            step = None
 
-    # Fallback: clamp amount_to_precision result to <= position size
+    if step is not None and step > 0:
+        steps = math.floor(sz / step)
+        qty = steps * step
+        qty = float(f"{qty:.12f}")
+        if qty <= 0:
+            return 0.0
+        return qty
+
+    # Fallback: use amount_to_precision but clamp to <= position size
     try:
         q = float(ex.amount_to_precision(symbol, sz))
         if q > sz:
-            eps = sz * 1e-6 or 1e-8
+            eps = max(sz * 1e-6, 1e-12)
             q = float(ex.amount_to_precision(symbol, max(0.0, sz - eps)))
         q = float(f"{q:.12f}")
         return q if q > 0 else 0.0
@@ -636,32 +638,46 @@ def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: floa
     fp = lambda x: f"{x:.3f}"
 
     in_neutral_now = (neg_thr < p_last < pos_thr)
+    in_neutral_prev = (neg_thr < p_prev < pos_thr)
 
-    # 1) Neutral band => close any open position and wait (but here we are flat)
+    # 1) Neutral band => close any open position and wait
     if in_neutral_now:
+        if p_prev > pos_thr:
+            # Came from LONG zone into neutral
+            return (
+                f"Neutral band: p_last={fp(p_last)} moved down from LONG zone "
+                f"(p_prev={fp(p_prev)} ≥ pos_thr={fp(pos_thr)}). "
+                "Strategy closes any existing LONG here, but no fresh position is opened."
+            )
+        if p_prev < neg_thr:
+            # Came from SHORT zone into neutral
+            return (
+                f"Neutral band: p_last={fp(p_last)} moved up from SHORT zone "
+                f"(p_prev={fp(p_prev)} ≤ neg_thr={fp(neg_thr)}). "
+                "Strategy closes any existing SHORT here, but no fresh position is opened."
+            )
+        # Stayed inside neutral
         return (
-            f"No trade: probability remains inside the neutral band "
-            f"({fp(neg_thr)} < p_last={fp(p_last)} < {fp(pos_thr)}). "
-            f"No position is opened until we cross above {fp(pos_thr)} (LONG) "
-            f"or below {fp(neg_thr)} (SHORT)."
+            f"No trade: p_prev={fp(p_prev)} → p_last={fp(p_last)} both inside "
+            f"neutral band ({fp(neg_thr)} < p < {fp(pos_thr)}). "
+            "We require a cross out of neutral to open a position."
         )
 
     # 2) Already in LONG or SHORT zone and stayed there => no fresh cross
     if p_last >= pos_thr and p_prev >= pos_thr:
         return (
-            f"No new LONG: probability stayed in the LONG zone "
+            f"No new LONG: probability stayed in LONG zone "
             f"(p_prev={fp(p_prev)} → p_last={fp(p_last)} ≥ pos_thr={fp(pos_thr)}). "
-            f"We only open a LONG on a fresh cross up from below pos_thr."
+            f"We only open a LONG on a fresh cross up from below {fp(pos_thr)}."
         )
-
     if p_last <= neg_thr and p_prev <= neg_thr:
         return (
-            f"No new SHORT: probability stayed in the SHORT zone "
+            f"No new SHORT: probability stayed in SHORT zone "
             f"(p_prev={fp(p_prev)} → p_last={fp(p_last)} ≤ neg_thr={fp(neg_thr)}). "
-            f"We only open a SHORT on a fresh cross down from above neg_thr."
+            f"We only open a SHORT on a fresh cross down from above {fp(neg_thr)}."
         )
 
-    # 3) Crossed but in wrong direction or not enough separation
+    # 3) Crossed but not in a valid fresh-cross configuration
     return (
         f"No trade: p_prev={fp(p_prev)}, p_last={fp(p_last)} — does not satisfy "
         f"fresh-cross rules for LONG (p_prev<pos_thr≤p_last) or SHORT (p_prev>neg_thr≥p_last)."
@@ -718,13 +734,13 @@ def decide_and_maybe_trade(args):
     # 5) Inference windows
     feat_mat = feat_df[feats].to_numpy(dtype=np.float32)
     X_prev = feat_mat[-lookback - 1: -1]  # ends at t-1
-    X_last = feat_mat[-lookback: ]        # ends at t
+    X_last = feat_mat[-lookback:]         # ends at t
     X = np.stack([X_prev, X_last], axis=0)
 
     if args.debug:
         closes = df["close"].to_numpy()
         feat_l1 = float(np.abs(X_last - X_prev).sum())
-        print(f"[DEBUG] prev_close→last_close: {closes[-2]:.4f}→{closes[-1]:.4f} | feat_L1_diff={feat_l1:.6g}")
+        print(f"[DEBUG] prev_close→last_close: {closes[-2]:.4f}→{closes[-1]:.4f} | feat_L1_diff={feat_l1:.4f}")
 
     p_prev, p_last = run_model(model, X, mean, std)
     if args.debug:
@@ -754,14 +770,15 @@ def decide_and_maybe_trade(args):
     suffix = f"coinex_swap_{ticker}_{timeframe}"
     last_seen_ts, guard_path = last_executed_guard(model_dir, suffix)
     rev_state_path = reversal_state_paths(model_dir, suffix)
-    rev_state = read_reversal_state(rev_state_path)  # not used yet but kept for future
+    rev_state = read_reversal_state(rev_state_path)  # reserved for future use
+
     if last_seen_ts is not None and last_seen_ts == last_close_ms:
         print("Already acted on this bar for CoinEx — not acting again.")
         return
 
     # 9) Fresh-cross trigger logic
-    take_long = (p_last >= pos_thr) and (p_prev < p_last)
-    take_short = (p_last <= neg_thr) and (p_prev > p_last)
+    take_long = (p_last >= pos_thr) and (p_prev < pos_thr) and (p_prev < p_last)
+    take_short = (p_last <= neg_thr) and (p_prev > neg_thr) and (p_prev > p_last)
 
     # 10) Exchange (swap only)
     ex = make_exchange(args.pub_key, args.sec_key)
@@ -776,11 +793,12 @@ def decide_and_maybe_trade(args):
     in_neutral = (neg_thr < p_last < pos_thr)
 
     if pos is not None and pos.get("side"):
-        # Existing position on exchange
+        # WE HAVE AN OPEN POSITION ON EXCHANGE ----
         side_open_raw = pos.get("side")
-        side_open = str(side_open_raw).lower()
+        side_open = str(side_open_raw).lower()  # 'long' or 'short' ideally
         entry = float(pos.get("entry") or last_close)
 
+        # IMPORTANT: get a safe, positive, precision-checked size that never exceeds the current position
         raw_size = float(pos.get("size") or 0.0)
         sz_abs = abs(raw_size)
         close_qty = safe_close_amount(ex, symbol, sz_abs)
@@ -789,8 +807,7 @@ def decide_and_maybe_trade(args):
               f"raw_size={raw_size}, close_qty={close_qty}, entry={entry}")
 
         if close_qty <= 0:
-            print("[WARN] Position size is below minimum tradable size after precision; "
-                  "cannot safely close — skipping new trades.")
+            print("[WARN] Position size is below minimum tradable size after precision; cannot safely close — skipping new trades.")
             return
         else:
             if side_open == "long":
@@ -861,6 +878,7 @@ def decide_and_maybe_trade(args):
                 print(f"[WARN] Unknown open side {side_open_raw!r}; not opening new trades.")
                 return
 
+            # If we reach here, we decided to keep the position
             print(
                 f"Keeping existing {side_open.upper()} open — "
                 f"p_last={p_last:.3f}, pos_thr={pos_thr:.3f}, neg_thr={neg_thr:.3f}"
@@ -873,25 +891,14 @@ def decide_and_maybe_trade(args):
         print(msg)
         return
 
-    # 13) Optional top-up for swap
-    if args.auto_transfer:
-        transfer_spot_to_swap_if_needed(
-            ex,
-            min_usdt=50.0,
-            buffer_frac=args.transfer_buffer,
-            debug=args.debug,
-        )
-
-    # 14) OPEN order — balance-based sizing
+    # 13) OPEN order — balance-based sizing, now with attached TP/SL on exchange
     try:
         quote_bal_swap = fetch_usdt_balance_swap(ex)
         side = "buy" if take_long else "sell"
-        use_frac = 0.95 if take_long else 0.80  # 95% for LONG, 80% for SHORT
-        usd_to_use = (quote_bal_swap * use_frac) if quote_bal_swap > 0 else 0.0
+        usd_to_use = (quote_bal_swap * (0.95 if take_long else 0.80)) if quote_bal_swap > 0 else 0.0
         if usd_to_use <= 0:
             print("No USDT balance available in SWAP.")
             return
-
         qty_approx = usd_to_use / max(1e-12, last_close)
         qty = amount_to_precision(ex, symbol, qty_approx)
 
@@ -903,49 +910,30 @@ def decide_and_maybe_trade(args):
         if qty <= 0:
             print("Calculated order size is zero after precision rounding.")
             return
-
-
         try:
             ex.set_leverage(1, symbol)
         except Exception:
             pass
-
         px = price_to_precision(ex, symbol, last_close)
-        print(
-            f"Opening {('LONG' if side == 'buy' else 'SHORT')} (futures/swap) — "
-            f"MARKET {side.upper()} {symbol} qty={qty} (px≈{px})"
-        )
+        print(f"Opening {('LONG' if side=='buy' else 'SHORT')} (futures/swap) — "
+              f"MARKET {side.upper()} {symbol} qty={qty} (px≈{px})")
 
+        # Entry order
         order = ex.create_order(symbol, "market", side, qty, None, {"reduceOnly": False})
         oid = order.get("id") or order.get("orderId") or order
         print(f"Order placed: {oid}")
 
-        # 15) Attach TP/SL on exchange (CoinEx-specific)
+        # Attach TP/SL as reduce-only orders
         try:
             entry_price = float(order.get("average") or order.get("price") or last_close)
 
             tp_order_id = None
             sl_order_id = None
-            tp_price_logged = None
-            sl_price_logged = None
-
-            def _safe_order_id(o):
-                if isinstance(o, dict):
-                    info = o.get("info") or {}
-                    return (
-                        o.get("id")
-                        or o.get("orderId")
-                        or info.get("orderId")
-                        or info.get("order_id")
-                    )
-                return o
 
             if side == "buy":
                 # LONG: TP above, SL below
                 if tp_pct is not None and tp_pct > 0:
                     tp_price = price_to_precision(ex, symbol, entry_price * (1.0 + tp_pct))
-                    # IMPORTANT: On CoinEx we do NOT send 'takeProfitPrice' param,
-                    # just a reduce-only limit order at the TP price.
                     tp = ex.create_order(
                         symbol,
                         "limit",
@@ -957,12 +945,7 @@ def decide_and_maybe_trade(args):
                             "takeProfitPrice": float(tp_price),
                         },
                     )
-                    oid = _safe_order_id(tp)
-                    if oid:
-                        tp_order_id = oid
-                        tp_price_logged = tp_price
-                    else:
-                        print(f"[WARN] TP order returned no id on {ex.id}: {tp!r}")
+                    tp_order_id = tp.get("id") or tp.get("orderId") or tp
 
                 if sl_pct is not None and sl_pct > 0:
                     sl_price = price_to_precision(ex, symbol, entry_price * (1.0 - sl_pct))
@@ -977,12 +960,7 @@ def decide_and_maybe_trade(args):
                             "stopLossPrice": float(sl_price),
                         },
                     )
-                    oid = _safe_order_id(sl)
-                    if oid:
-                        sl_order_id = oid
-                        sl_price_logged = sl_price
-                    else:
-                        print(f"[WARN] SL order returned no id on {ex.id}: {sl!r}")
+                    sl_order_id = sl.get("id") or sl.get("orderId") or sl
 
             else:
                 # SHORT: TP below, SL above
@@ -999,12 +977,7 @@ def decide_and_maybe_trade(args):
                             "takeProfitPrice": float(tp_price),
                         },
                     )
-                    oid = _safe_order_id(tp)
-                    if oid:
-                        tp_order_id = oid
-                        tp_price_logged = tp_price
-                    else:
-                        print(f"[WARN] TP order returned no id on {ex.id}: {tp!r}")
+                    tp_order_id = tp.get("id") or tp.get("orderId") or tp
 
                 if sl_pct is not None and sl_pct > 0:
                     sl_price = price_to_precision(ex, symbol, entry_price * (1.0 + sl_pct))
@@ -1019,19 +992,14 @@ def decide_and_maybe_trade(args):
                             "stopLossPrice": float(sl_price),
                         },
                     )
-                    oid = _safe_order_id(sl)
-                    if oid:
-                        sl_order_id = oid
-                        sl_price_logged = sl_price
-                    else:
-                        print(f"[WARN] SL order returned no id on {ex.id}: {sl!r}")
+                    sl_order_id = sl.get("id") or sl.get("orderId") or sl
 
             if tp_order_id or sl_order_id:
                 parts = []
                 if tp_order_id:
-                    parts.append(f"TP[id={tp_order_id!r}, px={tp_price_logged}]")
+                    parts.append(f"TP[id={tp_order_id!r}, px={tp_price}]")
                 if sl_order_id:
-                    parts.append(f"SL[id={sl_order_id!r}, px={sl_price_logged}]")
+                    parts.append(f"SL[id={sl_order_id!r}, px={sl_price}]")
                 print("Attached TP/SL orders — " + ", ".join(parts))
 
         except Exception as e:
@@ -1060,12 +1028,12 @@ def parse_args():
     ap.add_argument("--ticker", default=None, help="Override ticker (otherwise meta.json or BTCUSDT)")
     ap.add_argument("--timeframe", default=None, help="Override timeframe (otherwise meta.json or 1h)")
     ap.add_argument("--auto-transfer", action="store_true", help="Auto-transfer USDT spot→swap before opening futures")
-    ap.add_argument("--transfer-buffer", type=float,  default=0.01, help="Extra fraction to transfer (e.g., 0.01=+1%)")
-    ap.add_argument( "--reversal",   choices=["close", "flip", "cooldown"],  default="close",    help="How to react on opposite signal: close (default), flip, cooldown")
-    ap.add_argument("--cooldown-seconds", type=int, default=0, help="Cooldown duration when --reversal=cooldown")
+    ap.add_argument("--transfer-buffer", type=float,  default=0.01,   help="Extra fraction to transfer (e.g., 0.01=+1%)")
+    ap.add_argument("--reversal",  choices=["close", "flip", "cooldown"],     default="close",     help="How to react on opposite signal: close (default), flip, cooldown" )
+    ap.add_argument("--cooldown-seconds",    type=int, default=0,   help="Cooldown duration when --reversal=cooldown")
     ap.add_argument("--debug", action="store_true", help="Verbose debug logs")
     ap.add_argument("--pub_key", default=None, help="Name of the API key variable in ~/.ssh/coinex_keys.env" )
-    ap.add_argument("--sec_key", default=None, help="Name of the API secret variable in ~/.ssh/coinex_keys.env")
+    ap.add_argument("--sec_key", default=None,  help="Name of the API secret variable in ~/.ssh/coinex_keys.env")
     return ap.parse_args()
 
 
