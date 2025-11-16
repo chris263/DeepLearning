@@ -20,7 +20,7 @@ python3 update_bybit_json.py --json-file /home/production/tmp/BTCUSDT_30m_2y.jso
 MINUTE=$(date +%M)
 echo "Current minute: $MINUTE"
 
-if [ "$MINUTE" -eq 0 ]; then
+if [ "$MINUTE" -le 2 ]; then
     echo "Top of hour detected — running 1h updates."
     python3 update_bybit_json.py --json-file /home/production/tmp/ETHUSDT_1h_2y.json --symbol ETH/USDT:USDT --timeframe 1h
     python3 update_bybit_json.py --json-file /home/production/tmp/BTCUSDT_1h_2y.json --symbol BTC/USDT:USDT --timeframe 1h
@@ -44,7 +44,7 @@ echo
 echo "Bybit SAT BTC 30M"
 python3 $WORKDIR/lstm_sat_bybit.py  --model-dir "$WORKDIR/lstm/btc_lstm_30m_2025/"  --bars-json "/home/production/tmp/BTCUSDT_30m_2y.json" --ticker BTCUSDT --timeframe 30m  --pub_key API_BYBIT_SAT --sec_key API_BYBIT_SECRET_SAT --debug
 
-if [ "$MINUTE" -eq 0 ]; then
+if [ "$MINUTE" -le 2 ]; then
 	echo 
 	echo "Coinex BTC 1h script"
 	python3 $WORKDIR/lstm_sat_coinex.py  --model-dir "$WORKDIR/lstm/btc_lstm_1h_2025/"   --bars-json "/home/production/tmp/BTCUSDT_1h_2y.json" --ticker BTCUSDT --timeframe 1h  --pub_key API_KEY --sec_key API_SECRET --debug
