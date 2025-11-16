@@ -10,12 +10,23 @@ echo "started at: $(date '+%F %T %Z')"
 echo "log file  : $LOG_FILE"
 echo "==============================================="
 
-cd $WORKDIR
+cd "$WORKDIR"
 
+# Always update 30m files
 python3 update_bybit_json.py --json-file /home/production/tmp/ETHUSDT_30m_2y.json --symbol ETH/USDT:USDT --timeframe 30m
-python3 update_bybit_json.py --json-file /home/production/tmp/ETHUSDT_1h_2y.json  --symbol ETH/USDT:USDT --timeframe 1h
 python3 update_bybit_json.py --json-file /home/production/tmp/BTCUSDT_30m_2y.json --symbol BTC/USDT:USDT --timeframe 30m
-python3 update_bybit_json.py --json-file /home/production/tmp/BTCUSDT_1h_2y.json  --symbol BTC/USDT:USDT --timeframe 1h
+
+# Run 1h updates only near full hour
+MINUTE=$(date +%M)
+echo "Current minute: $MINUTE"
+
+if [ "$MINUTE" -eq 0 ]; then
+    echo "Top of hour detected — running 1h updates."
+    python3 update_bybit_json.py --json-file /home/production/tmp/ETHUSDT_1h_2y.json --symbol ETH/USDT:USDT --timeframe 1h
+    python3 update_bybit_json.py --json-file /home/production/tmp/BTCUSDT_1h_2y.json --symbol BTC/USDT:USDT --timeframe 1h
+else
+    echo "Not top of hour — skipping 1h updates."
+fi
 
 echo "Load finished at: $(date '+%F %T %Z')"
 echo "================================================"
@@ -33,14 +44,17 @@ echo
 echo "Bybit SAT BTC 30M"
 python3 $WORKDIR/lstm_sat_bybit.py  --model-dir "$WORKDIR/lstm/btc_lstm_30m_2025/"  --bars-json "/home/production/tmp/BTCUSDT_30m_2y.json" --ticker BTCUSDT --timeframe 30m  --pub_key API_BYBIT_SAT --sec_key API_BYBIT_SECRET_SAT --debug
 
-echo 
-echo "Coinex BTC 1h script"
-python3 $WORKDIR/lstm_sat_coinex.py  --model-dir "$WORKDIR/lstm/btc_lstm_1h_2025/"   --bars-json "/home/production/tmp/BTCUSDT_1h_2y.json" --ticker BTCUSDT --timeframe 1h  --pub_key API_KEY --sec_key API_SECRET --debug
+if [ "$MINUTE" -eq 0 ]; then
+	echo 
+	echo "Coinex BTC 1h script"
+	python3 $WORKDIR/lstm_sat_coinex.py  --model-dir "$WORKDIR/lstm/btc_lstm_1h_2025/"   --bars-json "/home/production/tmp/BTCUSDT_1h_2y.json" --ticker BTCUSDT --timeframe 1h  --pub_key API_KEY --sec_key API_SECRET --debug
 
-echo
-echo "Bybit ETH 1h - Conta: BTC 1h"
-python3 $WORKDIR/lstm_sat_bybit.py  --model-dir "$WORKDIR/lstm/eth_lstm_1h_2025/"  --bars-json "/home/production/tmp/ETHUSDT_1h_2y.json" --ticker ETHUSDT --timeframe 1h  --pub_key API_BYBIT_BTC --sec_key API_BYBIT_SECRET_BTC --debug
-
+	echo
+	echo "Bybit ETH 1h - Conta: BTC 4h"
+	python3 $WORKDIR/lstm_sat_bybit.py  --model-dir "$WORKDIR/lstm/eth_lstm_1h_2025/"  --bars-json "/home/production/tmp/ETHUSDT_1h_2y.json" --ticker ETHUSDT --timeframe 1h  --pub_key API_BYBIT_BTC --sec_key API_BYBIT_SECRET_BTC --debug
+else
+    echo "Not running 1 hour scripts."
+fi
 
 
 echo
