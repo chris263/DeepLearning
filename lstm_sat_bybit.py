@@ -578,44 +578,44 @@ def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: floa
         if p_prev > pos_thr:
             # Came from LONG zone into neutral
             return (
-                f"NEUTRAL Zone: p_last={fp(p_last)} moved down from the LONG zone "
-                f"(p_prev={fp(p_prev)} ≥ pos_thr={fp(pos_thr)}) into the neutral band "
-                f"({fp(neg_thr)} < p_last < {fp(pos_thr)}). "
-                f"Strategy closes any open LONG here and waits for a fresh cross: "
-                f"p_prev<{fp(pos_thr)}≤p_last for LONG or p_prev>{fp(neg_thr)}≥p_last for SHORT."
+                f"Neutral band: p_last={fp(p_last)} moved down from LONG zone "
+                f"(p_prev={fp(p_prev)} ≥ pos_thr={fp(pos_thr)}). "
+                "Strategy closes any existing LONG here, but no fresh position is opened."
             )
         if p_prev < neg_thr:
             # Came from SHORT zone into neutral
             return (
-                f"NEUTRAL Zone: p_last={fp(p_last)} moved up from the SHORT zone "
-                f"(p_prev={fp(p_prev)} ≤ neg_thr={fp(neg_thr)}) into the neutral band "
-                f"({fp(neg_thr)} < p_last < {fp(pos_thr)}). "
-                f"Strategy closes any open SHORT here and waits for a fresh cross: "
-                f"p_prev<{fp(pos_thr)}≤p_last for LONG or p_prev>{fp(neg_thr)}≥p_last for SHORT."
+                f"Neutral band: p_last={fp(p_last)} moved up from SHORT zone "
+                f"(p_prev={fp(p_prev)} ≤ neg_thr={fp(neg_thr)}). "
+                "Strategy closes any existing SHORT here, but no fresh position is opened."
             )
-
-        # Neutral → neutral: just stay flat
+        # Stayed inside neutral
         return (
-            f"No trade: probability remains inside the neutral band "
-            f"({fp(neg_thr)} < p_last={fp(p_last)} < {fp(pos_thr)}). "
-            f"No position is opened until we cross above {fp(pos_thr)} (LONG) "
-            f"or below {fp(neg_thr)} (SHORT)."
+            f"No trade: p_prev={fp(p_prev)} → p_last={fp(p_last)} both inside "
+            f"neutral band ({fp(neg_thr)} < p < {fp(pos_thr)}). "
+            "We require a cross out of neutral to open a position."
         )
 
-    # 2) Already in LONG or SHORT zone and stayed there => no re-open without fresh cross
-    if p_last > pos_thr and p_prev > pos_thr:
+    # 2) Already in LONG or SHORT zone and stayed there => no fresh cross
+    if p_last >= pos_thr and p_prev > p_last:
         return (
-            f"No new LONG: probability stayed in the LONG zone "
-            f"(p_prev={fp(p_prev)} → p_last={fp(p_last)} ≥ pos_thr={fp(pos_thr)}). "
-            f"We only open a LONG on a fresh cross up from below pos_thr."
+            f"No new LONG: probability stayed in LONG zone "
+            f"(p_prev={fp(p_prev)}  →  p_last={fp(p_last)} ≥ pos_thr={fp(pos_thr)}). "
+            f"We only open a LONG when p_last > p_prev."
         )
-
-    if p_last < neg_thr and p_prev < neg_thr:
+    if p_last <= neg_thr and p_prev < p_last:
         return (
-            f"No new SHORT: probability stayed in the SHORT zone "
+            f"No new SHORT: probability stayed in SHORT zone "
             f"(p_prev={fp(p_prev)} → p_last={fp(p_last)} ≤ neg_thr={fp(neg_thr)}). "
-            f"We only open a SHORT on a fresh cross down from above neg_thr."
+            f"We only open a LONG when p_last < p_prev."
         )
+
+    # 3) Crossed but not in a valid fresh-cross configuration
+    return (
+        f"No trade: p_prev={fp(p_prev)}, p_last={fp(p_last)} — does not satisfy "
+        f"fresh-cross rules for LONG (p_prev<pos_thr≤p_last) or SHORT (p_prev>neg_thr≥p_last)."
+    )
+
 
         
 # =========================

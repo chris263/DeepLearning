@@ -664,17 +664,17 @@ def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: floa
         )
 
     # 2) Already in LONG or SHORT zone and stayed there => no fresh cross
-    if p_last >= pos_thr and p_prev >= pos_thr:
+    if p_last >= pos_thr and p_prev > p_last:
         return (
             f"No new LONG: probability stayed in LONG zone "
-            f"(p_prev={fp(p_prev)} → p_last={fp(p_last)} ≥ pos_thr={fp(pos_thr)}). "
-            f"We only open a LONG on a fresh cross up from below {fp(pos_thr)}."
+            f"(p_prev={fp(p_prev)}  →  p_last={fp(p_last)} ≥ pos_thr={fp(pos_thr)}). "
+            f"We only open a LONG when p_last > p_prev."
         )
-    if p_last <= neg_thr and p_prev <= neg_thr:
+    if p_last <= neg_thr and p_prev < p_last:
         return (
             f"No new SHORT: probability stayed in SHORT zone "
             f"(p_prev={fp(p_prev)} → p_last={fp(p_last)} ≤ neg_thr={fp(neg_thr)}). "
-            f"We only open a SHORT on a fresh cross down from above {fp(neg_thr)}."
+            f"We only open a LONG when p_last < p_prev."
         )
 
     # 3) Crossed but not in a valid fresh-cross configuration
