@@ -14,6 +14,7 @@ cd "$WORKDIR"
 
 # Always update 30m files
 python3 update_bybit_json.py --json-file /home/production/tmp/ETHUSDT_30m_2y.json --symbol ETH/USDT:USDT --timeframe 30m
+python3 update_bybit_json.py --json-file /home/production/tmp/ETHUSDC_30m_2y.json --symbol ETH/USDC:USDC --timeframe 30m
 python3 update_bybit_json.py --json-file /home/production/tmp/BTCUSDT_30m_2y.json --symbol BTC/USDT:USDT --timeframe 30m
 
 # Run 1h updates only near full hour
@@ -43,6 +44,11 @@ python3 $WORKDIR/lstm_sat_coinex.py  --model-dir "$WORKDIR/lstm/eth_lstm_30m_202
 echo
 echo "Bybit SAT BTC 30M"
 python3 $WORKDIR/lstm_sat_bybit.py  --model-dir "$WORKDIR/lstm/btc_lstm_30m_2025/"  --bars-json "/home/production/tmp/BTCUSDT_30m_2y.json" --ticker BTCUSDT --timeframe 30m  --pub_key API_BYBIT_SAT --sec_key API_BYBIT_SECRET_SAT --debug
+
+echo
+echo "COINBASE SAT ETH 30M"
+python3 $WORKDIR/lstm_sat_coinbase.py  --model-dir "$WORKDIR/lstm/eth_lstm_30m_2025/"  --bars-json "/home/production/tmp/ETHUSDT_30m_2y.json" --ticker BTCUSDT --timeframe 30m  --pub_key API_COINBASE_SAT --sec_key API_COINBASE_SECRET_SAT --debug
+
 
 if [ "$MINUTE" -le 2 ]; then
 	echo 
