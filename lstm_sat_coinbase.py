@@ -659,7 +659,7 @@ def make_exchange(pub_key_name: Optional[str], sec_key_name: Optional[str], debu
     - If OK, instantiates ccxt.coinbase with the same credentials
     """
 
-    keyfile = os.path.expanduser("~/.ssh/coinbase_keys.env")
+    keyfile = os.path.expanduser("~/.ssh/coinex_keys.env")
     if not (pub_key_name or sec_key_name):
         print("[ERROR] make_exchange: pub_key_name or sec_key_name must be provided.")
         return None
