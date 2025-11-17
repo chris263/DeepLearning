@@ -45,9 +45,9 @@ echo
 echo "Bybit SAT BTC 30M"
 python3 $WORKDIR/lstm_sat_bybit.py  --model-dir "$WORKDIR/lstm/btc_lstm_30m_2025/"  --bars-json "/home/production/tmp/BTCUSDT_30m_2y.json" --ticker BTCUSDT --timeframe 30m  --pub_key API_BYBIT_SAT --sec_key API_BYBIT_SECRET_SAT --debug
 
-# echo
-# echo "COINBASE SAT ETH 30M"
-# python3 $WORKDIR/lstm_sat_coinbase.py  --model-dir "$WORKDIR/lstm/ethusdc_lstm_30m/"  --bars-json "/home/production/tmp/ETHUSDT_30m_2y.json" --ticker ETHUSDT --timeframe 30m  --pub_key API_COINBASE_SAT --sec_key API_COINBASE_SECRET_SAT --debug
+echo
+echo "COINBASE SAT ETH 30M"
+python3 $WORKDIR/lstm_sat_coinbase.py  --model-dir "$WORKDIR/lstm/ethusdc_lstm_30m/"  --bars-json "/home/production/tmp/ETHUSDC_30m_2y.json" --ticker ETHUSDC --timeframe 30m  --pub_key API_COINBASE_SAT --sec_key API_COINBASE_SECRET_SAT --debug
 
 
 if [ "$MINUTE" -le 2 ]; then
