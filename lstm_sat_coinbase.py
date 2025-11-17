@@ -52,6 +52,235 @@ def tf_ms(tf: str) -> int:
         raise SystemExit(f"Unsupported timeframe '{tf}' — add it to TF_TO_MS.")
     return v
 
+import time, hmac, hashlib, base64, json, uuid, subprocess, secrets, re, textwrap
+from typing import Dict, Any, Optional, Tuple, List
+import requests
+
+# ---------- small helpers ----------
+def now_s() -> str:
+    return str(int(time.time()))
+
+def get_public_ip() -> str:
+    try:
+        r = requests.get("https://ifconfig.me", timeout=4)
+        if r.ok:
+            return r.text.strip()
+    except Exception:
+        pass
+    try:
+        return subprocess.check_output(["curl", "-s", "ifconfig.me"], timeout=4).decode().strip()
+    except Exception:
+        return "unknown"
+
+def explain_http(status: int) -> str:
+    if status == 401:
+        return "HTTP 401: Unauthorized."
+    if status == 403:
+        return "HTTP 403: Forbidden."
+    if status >= 500:
+        return f"HTTP {status}: server issue."
+    return f"HTTP {status}"
+
+def check_time_skew() -> float:
+    try:
+        r = requests.get("https://api.coinbase.com/v2/time", timeout=4)
+        if r.ok:
+            server = int(r.json().get("data", {}).get("epoch", 0))
+            local = int(time.time())
+            return server - local
+    except Exception:
+        pass
+    return 0.0
+
+def map_symbol(sym: str) -> str:
+    s = (sym or "").upper()
+    if "-" in s:
+        return s
+    for q in ("USD", "USDT", "USDC", "EUR", "GBP"):
+        if s.endswith(q):
+            return s.replace(q, f"-{q}")
+    return s
+
+def map_symbol_future(sym: str, suffix: str = "PERP-INTX") -> str:
+    """
+    Heuristic mapping to a Coinbase perpetual futures product code.
+    Examples:
+      BTCUSDC -> BTC-PERP-INTX   (default)
+      ETHUSDT -> ETH-PERP-INTX
+    """
+    s = (sym or "").upper()
+    s = s.replace("-", "")
+    base = s
+    for q in ("USDT", "USDC", "USD", "EUR", "GBP"):
+        if s.endswith(q):
+            base = s[:-len(q)]
+            break
+    return f"{base}-{suffix}"
+
+# ---------- normalization ----------
+def _coinbase_normalize_key(key: str) -> str:
+    k = (key or "").strip()
+    if (k.startswith('"') and k.endswith('"')) or (k.startswith("'") and k.endswith("'")):
+        k = k[1:-1]
+    return k
+
+def _coinbase_normalize_pem(secret: str) -> bytes:
+    """
+    Accepts:
+      - Full PEM (BEGIN/END), possibly with literal '\\n' escapes
+      - Base64 body only (we wrap it)
+      - Strings with stray quotes/whitespace
+    Returns a valid PEM as bytes.
+    """
+    if secret is None:
+        raise ValueError("Empty Coinbase secret")
+    s = str(secret).strip()
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1]
+    s = s.replace("\\r", "").replace("\\n", "\n").replace("\r\n", "\n").strip()
+    if "BEGIN" in s:
+        return s.encode("utf-8")
+    body = re.sub(r"\s+", "", s)
+    wrapped = "\n".join(textwrap.wrap(body, 64))
+    pem = f"-----BEGIN EC PRIVATE KEY-----\n{wrapped}\n-----END EC PRIVATE KEY-----\n"
+    return pem.encode("utf-8")
+
+# ---------- HMAC signing (for old APIs – mostly unused here, but harmless) ----------
+def _sign_preimage(ts: str, method: str, request_path: str, body: Optional[str]) -> bytes:
+    pre = ts + method.upper() + request_path + (body or "")
+    return pre.encode("utf-8")
+
+def _hmac_b64(secret_bytes: bytes, preimage: bytes) -> str:
+    digest = hmac.new(secret_bytes, preimage, hashlib.sha256).digest()
+    return base64.b64encode(digest).decode()
+
+def _maybe_secret_bytes(secret: str, mode: str) -> Tuple[Optional[bytes], Optional[str]]:
+    if mode == "base64":
+        try:
+            return (base64.b64decode(secret), "base64")
+        except Exception:
+            return (None, None)
+    elif mode == "raw":
+        return (secret.encode("utf-8"), "raw")
+    else:
+        return (None, None)
+
+def _hmac_headers(api_key: str, secret: str, method: str, path: str, body_str: Optional[str],
+                  secret_mode: str, debug: bool=False) -> Dict[str, str]:
+    ts = now_s()
+    preimage = _sign_preimage(ts, method, path, body_str)
+    sec_bytes, _ = _maybe_secret_bytes(secret, secret_mode)
+    if sec_bytes is None:
+        raise ValueError("secret decode failed (HMAC)")
+    sign = _hmac_b64(sec_bytes, preimage)
+    if debug:
+        print(f"[debug] preimage: {preimage.decode('utf-8')}")
+        print(f"[debug] signature(Base64 HMAC-SHA256): {sign}")
+    return {
+        "CB-ACCESS-KEY": api_key,
+        "CB-ACCESS-SIGN": sign,
+        "CB-ACCESS-TIMESTAMP": ts,
+        "Content-Type": "application/json",
+    }
+
+# ---------- JWT (ES256) ----------
+def _coinbase_make_jwt(key_resource_name: str, secret_pem_bytes: bytes,
+                       method: str, host: str, path: str) -> str:
+    """
+    Build a JWT per CDP docs:
+      header: kid=<key_resource_name>, alg=ES256, nonce=random
+      payload: sub=<kid>, iss="cdp", nbf=now, exp=now+120, uri="<METHOD> <host><path>"
+    """
+    import jwt  # PyJWT
+    from cryptography.hazmat.primitives import serialization
+
+    priv = serialization.load_pem_private_key(secret_pem_bytes, password=None)
+    now = int(time.time())
+    payload = {
+        "sub": key_resource_name,
+        "iss": "cdp",
+        "nbf": now,
+        "exp": now + 120,
+        "uri": f"{method.upper()} {host}{path}",
+    }
+    headers = {"kid": key_resource_name, "nonce": secrets.token_hex()}
+    token = jwt.encode(payload, priv, algorithm="ES256", headers=headers)
+    return token if isinstance(token, str) else token.decode("utf-8")
+
+def _jwt_headers(kid: str, pem_secret: str, method: str, host: str, path: str, debug: bool=False) -> Dict[str, str]:
+    pem_bytes = _coinbase_normalize_pem(pem_secret)
+    tok = _coinbase_make_jwt(kid, pem_bytes, method, host, path)
+    if debug:
+        print(f"[debug] jwt: kid={kid} alg=ES256 host={host} path={path}")
+    return {
+        "Authorization": f"Bearer {tok}",
+        "Content-Type": "application/json",
+    }
+
+def _host_from_base(base_host: str) -> str:
+    return base_host.replace("https://", "").replace("http://", "")
+
+# ---------- request wrapper (supports HMAC or JWT) ----------
+def _request(session: requests.Session, base_host: str, method: str, path: str,
+             auth_mode: str, *, api_key: str = "", secret: str = "", secret_format: str = "auto",
+             kid: str = "", debug: bool=False, timeout: int=10,
+             json_body: Optional[dict]=None) -> Tuple[int, Any, str]:
+    """
+    Returns (status, payload, mode_used_for_secret or 'jwt').
+    """
+    assert path.startswith("/"), "path must start with '/'"
+    url = f"{base_host}{path}"
+    body_str = json.dumps(json_body, separators=(",", ":")) if json_body is not None else None
+
+    def send(headers: Dict[str, str]) -> Tuple[int, Any]:
+        if method.upper() == "GET":
+            r = session.get(url, headers=headers, timeout=timeout)
+        else:
+            r = session.post(url, headers=headers, data=body_str or "", timeout=timeout)
+        try:
+            payload = r.json()
+        except Exception:
+            payload = r.text
+        return r.status_code, payload
+
+    if auth_mode == "jwt":
+        headers = _jwt_headers(kid, secret, method, host=_host_from_base(base_host), path=path, debug=debug)
+        st, pay = send(headers)
+        return st, pay, "jwt"
+
+    # HMAC mode (old API)
+    def do(mode: str) -> Tuple[int, Any]:
+        headers = _hmac_headers(api_key, secret, method, path, body_str, mode, debug)
+        return send(headers)
+
+    if secret_format in ("base64", "raw"):
+        st, pay = do(secret_format)
+        return st, pay, secret_format
+
+    st1, pay1 = do("base64")
+    if debug:
+        print(f"[auth] try #1 mode=base64 → HTTP {st1}")
+    if st1 == 200:
+        return st1, pay1, "base64"
+    st2, pay2 = do("raw")
+    if debug:
+        print(f"[auth] try #2 mode=raw    → HTTP {st2}")
+    if st2 == 200:
+        return st2, pay2, "raw"
+    if debug:
+        print(f"[auth] both modes failed. base64 payload: {pay1!r}")
+    return st2, pay2, "raw"
+
+# ---------- API calls ----------
+def preflight(session: requests.Session, base_host: str, auth_mode: str,
+              api_key: str, secret: str, secret_format: str, kid: str,
+              debug: bool=False) -> Tuple[int, Any, str]:
+    path = "/api/v3/brokerage/accounts"
+    return _request(session, base_host, "GET", path, auth_mode,
+                    api_key=api_key, secret=secret, secret_format=secret_format,
+                    kid=kid, debug=debug, timeout=10)
+
+
 
 # =========================
 # JSON bars I/O
@@ -417,76 +646,108 @@ def write_reversal_state(path: str, data: Dict[str, int]):
 # =========================
 
 
-def make_exchange(pub_key_name: Optional[str], sec_key_name: Optional[str]):
+import os
+import ccxt
+
+def make_exchange(pub_key_name: Optional[str], sec_key_name: Optional[str], debug: bool = False):
     """
-    Build a ccxt.coinbase instance using Coinbase App / Advanced ECDSA keys.
+    Coinbase-specific make_exchange:
 
-    Expects a keyfile at ~/.ssh/coinbase_keys.env with lines like:
-
-        COINBASE_KEY_NAME=organizations/xxxx/apiKeys/yyyy
-        COINBASE_PRIVATE_KEY=-----BEGIN EC PRIVATE KEY-----\nMHcC...==\n-----END EC PRIVATE KEY-----\n
-
-    pub_key_name / sec_key_name are the *names* of those env vars.
+    - Reads key name and private key from ~/.ssh/coinbase_keys.env
+    - Normalizes them with your helper functions
+    - Runs a JWT preflight on /api/v3/brokerage/accounts to validate auth
+    - If OK, instantiates ccxt.coinbase with the same credentials
     """
-    api_key = None
-    api_secret = None
 
-    if pub_key_name or sec_key_name:
-        keyfile = os.path.expanduser("~/.ssh/coinex_keys.env")
-        kv = {}
-
-        if os.path.exists(keyfile):
-            with open(keyfile, "r") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    k, v = line.split("=", 1)
-                    v = v.strip()
-
-                    # If stored with literal "\n" sequences, turn them into real newlines
-                    if "\\n" in v:
-                        v = v.replace("\\n", "\n")
-
-                    kv[k.strip()] = v
-        else:
-            print(f"[WARN] Coinbase keyfile not found: {keyfile}")
-
-        api_key = kv.get(pub_key_name) if pub_key_name else None
-        api_secret = kv.get(sec_key_name) if sec_key_name else None
-
-    if not api_key or not api_secret:
-        print("[ERROR] Missing Coinbase API credentials (api_key or api_secret is empty).")
+    keyfile = os.path.expanduser("~/.ssh/coinbase_keys.env")
+    if not (pub_key_name or sec_key_name):
+        print("[ERROR] make_exchange: pub_key_name or sec_key_name must be provided.")
         return None
 
+    if not os.path.exists(keyfile):
+        print(f"[ERROR] Coinbase keyfile not found: {keyfile}")
+        return None
+
+    # ------- load raw values from env-style file -------
+    kv: Dict[str, str] = {}
+    with open(keyfile, "r") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            kv[k.strip()] = v.strip()
+
+    raw_key = kv.get(pub_key_name, "")
+    raw_sec = kv.get(sec_key_name, "")
+
+    if not raw_key or not raw_sec:
+        print(f"[ERROR] Missing Coinbase credentials for pub={pub_key_name!r} sec={sec_key_name!r} in {keyfile}")
+        return None
+
+    api_key = _coinbase_normalize_key(raw_key)
+    secret_str = raw_sec  # _coinbase_normalize_pem will handle quotes / \\n
+
+    if debug:
+        print(f"[DEBUG] Coinbase api_key={api_key}, secret_len={len(secret_str)}")
+
+    # ------- preflight JWT auth against Advanced Trade REST -------
+    session = requests.Session()
+    base_host = "https://api.coinbase.com"
+
+    # For JWT mode, _request ignores api_key/secret_format and uses kid + secret.
+    status, payload, mode_used = preflight(
+        session=session,
+        base_host=base_host,
+        auth_mode="jwt",
+        api_key="",              # ignored in jwt mode
+        secret=secret_str,       # privateKey string from JSON / env
+        secret_format="auto",    # ignored in jwt mode
+        kid=api_key,             # full "name" field
+        debug=debug,
+    )
+
+    if status != 200:
+        print(f"[ERROR] Coinbase JWT preflight failed: {explain_http(status)}")
+        print(f"[ERROR] Response payload: {payload!r}")
+        skew = check_time_skew()
+        print(f"[INFO] Coinbase time skew (server-local) ≈ {skew} seconds")
+        print(f"[INFO] Public IP seen by Coinbase likely: {get_public_ip()}")
+        return None
+
+    if debug:
+        print(f"[DEBUG] Coinbase preflight OK (status={status}, mode={mode_used})")
+
+    # ------- instantiate ccxt.coinbase with normalized PEM secret -------
+    # ccxt expects the ES256 private key as a PEM string.
+    secret_pem_bytes = _coinbase_normalize_pem(secret_str)
+    secret_pem_str = secret_pem_bytes.decode("utf-8")
+
     ex = ccxt.coinbase({
-        "apiKey": api_key,     # MUST be the JSON 'name' field from Coinbase
-        "secret": api_secret,  # MUST be the full EC PRIVATE KEY (with header/footer + newlines)
+        "apiKey": api_key,          # full "name" from key JSON
+        "secret": secret_pem_str,   # full EC PRIVATE KEY PEM
         "enableRateLimit": True,
     })
 
-    # Coinbase + ccxt will try a private endpoint (transaction_summary) here.
-    # If auth fails, we catch it and abort cleanly instead of crashing your script.
     try:
         ex.load_markets()
     except ccxt.AuthenticationError as e:
-        print(f"[ERROR] Coinbase authentication failed during load_markets(): {e}")
+        print(f"[ERROR] ccxt.coinbase load_markets() failed with AuthenticationError: {e}")
         print(
-            "Check on Coinbase Developer Platform that:\n"
-            "  • The key is a **Secret API Key** for Coinbase App / Advanced Trade (not old Exchange/Pro).\n"
-            "  • Signature algorithm is **ECDSA / ES256** (NOT Ed25519).\n"
-            "  • You copied the `name` field into the env var used as apiKey.\n"
-            "  • You copied the `privateKey` field into the env var used as secret, "
-            "    preserving all `-----BEGIN/END EC PRIVATE KEY-----` lines and newlines.\n"
-            "  • The key has the required scopes (Advanced Trade, derivatives/perpetuals).\n"
-            "  • Your server's IP is in the key's IP allowlist, or IP restriction is disabled."
+            "Your key *did* pass JWT preflight, so auth is OK, but ccxt rejected it.\n"
+            "Most likely causes:\n"
+            "  • ccxt version too old for CDP / Advanced Trade keys.\n"
+            "  • A bug in ccxt's coinbase JWT 'uri' formatting for this endpoint.\n"
         )
         return None
     except Exception as e:
-        print(f"[ERROR] Failed to load Coinbase markets: {e}")
+        print(f"[ERROR] Failed to load Coinbase markets via ccxt: {e}")
         return None
 
+    if debug:
+        print("[DEBUG] Coinbase markets loaded successfully via ccxt.")
     return ex
+
 
 
 def resolve_symbol(ex, ticker: str) -> str:
