@@ -21,18 +21,8 @@ from typing import List, Dict, Tuple, Optional
 
 import numpy as np
 import pandas as pd
-
-try:
-    import torch
-except Exception:
-    print("Please install torch:  pip install torch", file=sys.stderr)
-    raise
-
-try:
-    import ccxt
-except Exception:
-    print("Please install ccxt:  pip install ccxt", file=sys.stderr)
-    raise
+import torch
+import ccxt
 
 # =========================
 # Constants / timeframe helpers
@@ -426,95 +416,77 @@ def write_reversal_state(path: str, data: Dict[str, int]):
 # Exchange helpers (Coinbase)
 # =========================
 
-import os
-from typing import Optional
-import ccxt
 
 def make_exchange(pub_key_name: Optional[str], sec_key_name: Optional[str]):
-    keyfile = os.path.expanduser("~/.ssh/coinex_keys.env")
-    if not os.path.exists(keyfile):
-        raise SystemExit(f"[FATAL] Keyfile not found: {keyfile}")
+    """
+    Build a ccxt.coinbase instance using Coinbase App / Advanced ECDSA keys.
 
-    with open(keyfile, "r") as fh:
-        lines = fh.readlines()
+    Expects a keyfile at ~/.ssh/coinbase_keys.env with lines like:
 
-    kv = {}
-    i = 0
-    while i < len(lines):
-        raw = lines[i].rstrip("\n").rstrip("\r")
-        if not raw or raw.lstrip().startswith("#"):
-            i += 1
-            continue
+        COINBASE_KEY_NAME=organizations/xxxx/apiKeys/yyyy
+        COINBASE_PRIVATE_KEY=-----BEGIN EC PRIVATE KEY-----\nMHcC...==\n-----END EC PRIVATE KEY-----\n
 
-        if "=" not in raw:
-            # plain line, only possible as part of multi-line PEM handled below
-            i += 1
-            continue
+    pub_key_name / sec_key_name are the *names* of those env vars.
+    """
+    api_key = None
+    api_secret = None
 
-        key, v0 = raw.split("=", 1)
-        key = key.strip()
-        v0 = v0.rstrip("\r")
+    if pub_key_name or sec_key_name:
+        keyfile = os.path.expanduser("~/.ssh/coinex_keys.env")
+        kv = {}
 
-        # Special handling for the secret key: it might be multi-line PEM.
-        if sec_key_name and key == sec_key_name:
-            value_lines = [v0]
-            j = i + 1
-            # Collect subsequent lines until we hit an 'END ...PRIVATE KEY-----'
-            # or another "KEY=VALUE" line.
-            while j < len(lines):
-                nxt = lines[j].rstrip("\n").rstrip("\r")
-                # Another KEY=VALUE line → stop, do not consume it.
-                if "=" in nxt and not nxt.lstrip().startswith("#") and not nxt.startswith(" "):
-                    break
-                value_lines.append(nxt)
-                if "END EC PRIVATE KEY-----" in nxt or "END PRIVATE KEY-----" in nxt:
-                    j += 1
-                    break
-                j += 1
+        if os.path.exists(keyfile):
+            with open(keyfile, "r") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    v = v.strip()
 
-            value = "\n".join(value_lines)
-            kv[key] = value
-            i = j
-            continue
+                    # If stored with literal "\n" sequences, turn them into real newlines
+                    if "\\n" in v:
+                        v = v.replace("\\n", "\n")
 
-        # Normal single-line KEY=VALUE
-        kv[key] = v0.strip()
-        i += 1
+                    kv[k.strip()] = v
+        else:
+            print(f"[WARN] Coinbase keyfile not found: {keyfile}")
 
-    api_key = kv.get(pub_key_name) if pub_key_name else None
-    api_secret = kv.get(sec_key_name) if sec_key_name else None
+        api_key = kv.get(pub_key_name) if pub_key_name else None
+        api_secret = kv.get(sec_key_name) if sec_key_name else None
 
     if not api_key or not api_secret:
-        raise SystemExit(
-            f"[FATAL] Missing Coinbase credentials for pub={pub_key_name!r} "
-            f"sec={sec_key_name!r} in {keyfile}"
-        )
-
-    # Case 1: stored as single line with literal '\n'
-    if "\\n" in api_secret:
-        api_secret = api_secret.replace("\\n", "\n")
-
-    # Sanity checks: must look like a PEM EC key
-    if "BEGIN" not in api_secret or "PRIVATE KEY" not in api_secret:
-        raise SystemExit(
-            "[FATAL] Coinbase secret does not look like a PEM EC private key. "
-            "Check COINBASE_SECRET formatting in ~/.ssh/coinex_keys.env"
-        )
-
-    # Optional debug; keep commented to avoid leaking anything
-    # print(f"[DEBUG] api_key={api_key}, secret_len={len(api_secret)}")
+        print("[ERROR] Missing Coinbase API credentials (api_key or api_secret is empty).")
+        return None
 
     ex = ccxt.coinbase({
-        "apiKey": api_key,
-        "secret": api_secret,
+        "apiKey": api_key,     # MUST be the JSON 'name' field from Coinbase
+        "secret": api_secret,  # MUST be the full EC PRIVATE KEY (with header/footer + newlines)
         "enableRateLimit": True,
     })
 
-    # This will now either succeed or give you a clear 401 if the key/scopes are wrong,
-    # but the PEM parsing error should be gone.
-    ex.load_markets()
-    return ex
+    # Coinbase + ccxt will try a private endpoint (transaction_summary) here.
+    # If auth fails, we catch it and abort cleanly instead of crashing your script.
+    try:
+        ex.load_markets()
+    except ccxt.AuthenticationError as e:
+        print(f"[ERROR] Coinbase authentication failed during load_markets(): {e}")
+        print(
+            "Check on Coinbase Developer Platform that:\n"
+            "  • The key is a **Secret API Key** for Coinbase App / Advanced Trade (not old Exchange/Pro).\n"
+            "  • Signature algorithm is **ECDSA / ES256** (NOT Ed25519).\n"
+            "  • You copied the `name` field into the env var used as apiKey.\n"
+            "  • You copied the `privateKey` field into the env var used as secret, "
+            "    preserving all `-----BEGIN/END EC PRIVATE KEY-----` lines and newlines.\n"
+            "  • The key has the required scopes (Advanced Trade, derivatives/perpetuals).\n"
+            "  • Your server's IP is in the key's IP allowlist, or IP restriction is disabled."
+        )
+        return None
+    except Exception as e:
+        print(f"[ERROR] Failed to load Coinbase markets: {e}")
+        return None
 
+    return ex
 
 
 def resolve_symbol(ex, ticker: str) -> str:
@@ -806,7 +778,12 @@ def decide_and_maybe_trade(args):
 
     # 10) Exchange (swap only)
     ex = make_exchange(args.pub_key, args.sec_key)
+    if ex is None:
+        print("Exchange initialization failed for Coinbase — aborting this run.")
+        return
+
     symbol = resolve_symbol(ex, ticker)
+
 
     # 11) Position & SL/TP (+ signal exit on neutral)
     pos = get_swap_position(ex, symbol)
