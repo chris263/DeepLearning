@@ -1,10 +1,10 @@
 {
-  "name": "lstm_longshort_ETHUSDT_30m",
+  "name": "lstm_longshort_ETHUSDC_30m",
   "framework": "torch",
   "torchscript": true,
   "model_kind": "lstm_ichimoku",
   "input_layout": "NLC",
-  "ticker": "ETHUSDT",
+  "ticker": "ETHUSDC",
   "timeframe": "30m",
   "lookback": 64,
   "horizon": 4,
@@ -33,7 +33,7 @@
     "vol20"
   ],
   "preprocess_file": "preprocess.json",
-  "created_at": "2025-11-17T00:17:33Z",
+  "created_at": "2025-11-17T02:36:09Z",
   "pos_thr": 0.55,
   "neg_thr": 0.44999999999999996,
   "prob_threshold": 0.55,
