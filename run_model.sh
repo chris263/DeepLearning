@@ -38,8 +38,8 @@ echo "started at: $(date '+%F %T %Z')"
 echo "log file  : $LOG_FILE"
 echo "==============================================="
 
-echo "Coinex ETH 30m script"
-python3 $WORKDIR/lstm_sat_coinex.py  --model-dir "$WORKDIR/lstm/eth_lstm_30m_2025/"   --bars-json "/home/production/tmp/ETHUSDT_30m_2y.json" --ticker ETHUSDT --timeframe 30m --pub_key API_KEY_ETH --sec_key API_SECRET_ETH --debug
+# echo "Coinex ETH 30m script"
+# python3 $WORKDIR/lstm_sat_coinex.py  --model-dir "$WORKDIR/lstm/eth_lstm_30m_2025/"   --bars-json "/home/production/tmp/ETHUSDT_30m_2y.json" --ticker ETHUSDT --timeframe 30m --pub_key API_KEY_ETH --sec_key API_SECRET_ETH --debug
 
 echo
 echo "Bybit SAT BTC 30M"

@@ -426,38 +426,92 @@ def write_reversal_state(path: str, data: Dict[str, int]):
 # Exchange helpers (Coinbase)
 # =========================
 
+import os
+from typing import Optional
+import ccxt
+
 def make_exchange(pub_key_name: Optional[str], sec_key_name: Optional[str]):
     keyfile = os.path.expanduser("~/.ssh/coinex_keys.env")
-    kv = {}
+    if not os.path.exists(keyfile):
+        raise SystemExit(f"[FATAL] Keyfile not found: {keyfile}")
 
-    if os.path.exists(keyfile):
-        with open(keyfile, "r") as fh:
-            for raw in fh:
-                line = raw.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)   # only first "=", keep all the rest (incl. "==")
-                v = v.strip()
-                # Strip optional surrounding quotes so we don’t keep "..." or '...'
-                if (len(v) >= 2) and (
-                    (v[0] == v[-1] == '"') or (v[0] == v[-1] == "'")
-                ):
-                    v = v[1:-1]
-                kv[k.strip()] = v
+    with open(keyfile, "r") as fh:
+        lines = fh.readlines()
+
+    kv = {}
+    i = 0
+    while i < len(lines):
+        raw = lines[i].rstrip("\n").rstrip("\r")
+        if not raw or raw.lstrip().startswith("#"):
+            i += 1
+            continue
+
+        if "=" not in raw:
+            # plain line, only possible as part of multi-line PEM handled below
+            i += 1
+            continue
+
+        key, v0 = raw.split("=", 1)
+        key = key.strip()
+        v0 = v0.rstrip("\r")
+
+        # Special handling for the secret key: it might be multi-line PEM.
+        if sec_key_name and key == sec_key_name:
+            value_lines = [v0]
+            j = i + 1
+            # Collect subsequent lines until we hit an 'END ...PRIVATE KEY-----'
+            # or another "KEY=VALUE" line.
+            while j < len(lines):
+                nxt = lines[j].rstrip("\n").rstrip("\r")
+                # Another KEY=VALUE line → stop, do not consume it.
+                if "=" in nxt and not nxt.lstrip().startswith("#") and not nxt.startswith(" "):
+                    break
+                value_lines.append(nxt)
+                if "END EC PRIVATE KEY-----" in nxt or "END PRIVATE KEY-----" in nxt:
+                    j += 1
+                    break
+                j += 1
+
+            value = "\n".join(value_lines)
+            kv[key] = value
+            i = j
+            continue
+
+        # Normal single-line KEY=VALUE
+        kv[key] = v0.strip()
+        i += 1
 
     api_key = kv.get(pub_key_name) if pub_key_name else None
     api_secret = kv.get(sec_key_name) if sec_key_name else None
 
-    # Important: we never strip or modify '=' inside the secret,
-    # so trailing '==' stays intact.
+    if not api_key or not api_secret:
+        raise SystemExit(
+            f"[FATAL] Missing Coinbase credentials for pub={pub_key_name!r} "
+            f"sec={sec_key_name!r} in {keyfile}"
+        )
+
+    # Case 1: stored as single line with literal '\n'
+    if "\\n" in api_secret:
+        api_secret = api_secret.replace("\\n", "\n")
+
+    # Sanity checks: must look like a PEM EC key
+    if "BEGIN" not in api_secret or "PRIVATE KEY" not in api_secret:
+        raise SystemExit(
+            "[FATAL] Coinbase secret does not look like a PEM EC private key. "
+            "Check COINBASE_SECRET formatting in ~/.ssh/coinex_keys.env"
+        )
+
+    # Optional debug; keep commented to avoid leaking anything
+    # print(f"[DEBUG] api_key={api_key}, secret_len={len(api_secret)}")
+
     ex = ccxt.coinbase({
         "apiKey": api_key,
         "secret": api_secret,
         "enableRateLimit": True,
-        # If you ever use old Coinbase Exchange / Pro style keys:
-        # "password": kv.get("COINBASE_PASSPHRASE"),
     })
 
+    # This will now either succeed or give you a clear 401 if the key/scopes are wrong,
+    # but the PEM parsing error should be gone.
     ex.load_markets()
     return ex
 
