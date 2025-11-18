@@ -1209,20 +1209,20 @@ def decide_and_maybe_trade(args):
                     )
                     tp_order_id = tp.get("id") or tp.get("orderId") or tp
 
-                if sl_pct is not None and sl_pct > 0:
-                    sl_price = price_to_precision(ex, symbol, entry_price * (1.0 - sl_pct))
-                    sl = ex.create_order(
-                        symbol,
-                        "market",
-                        "sell",
-                        qty,
-                        None,
-                        {
-                            "reduceOnly": True,
-                            "stopLossPrice": float(sl_price),
-                        },
-                    )
-                    sl_order_id = sl.get("id") or sl.get("orderId") or sl
+                # if sl_pct is not None and sl_pct > 0:
+                #     sl_price = price_to_precision(ex, symbol, entry_price * (1.0 - sl_pct))
+                #     sl = ex.create_order(
+                #         symbol,
+                #         "market",
+                #         "sell",
+                #         qty,
+                #         None,
+                #         {
+                #             "reduceOnly": True,
+                #             "stopLossPrice": float(sl_price),
+                #         },
+                #     )
+                #     sl_order_id = sl.get("id") or sl.get("orderId") or sl
 
             else:
                 # SHORT: TP below, SL above
@@ -1241,20 +1241,20 @@ def decide_and_maybe_trade(args):
                     )
                     tp_order_id = tp.get("id") or tp.get("orderId") or tp
 
-                if sl_pct is not None and sl_pct > 0:
-                    sl_price = price_to_precision(ex, symbol, entry_price * (1.0 + sl_pct))
-                    sl = ex.create_order(
-                        symbol,
-                        "market",
-                        "buy",
-                        qty,
-                        None,
-                        {
-                            "reduceOnly": True,
-                            "stopLossPrice": float(sl_price),
-                        },
-                    )
-                    sl_order_id = sl.get("id") or sl.get("orderId") or sl
+                # if sl_pct is not None and sl_pct > 0:
+                #     sl_price = price_to_precision(ex, symbol, entry_price * (1.0 + sl_pct))
+                #     sl = ex.create_order(
+                #         symbol,
+                #         "market",
+                #         "buy",
+                #         qty,
+                #         None,
+                #         {
+                #             "reduceOnly": True,
+                #             "stopLossPrice": float(sl_price),
+                #         },
+                #     )
+                #     sl_order_id = sl.get("id") or sl.get("orderId") or sl
 
             if tp_order_id or sl_order_id:
                 parts = []
