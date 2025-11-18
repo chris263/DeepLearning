@@ -5,8 +5,8 @@ from pathlib import Path
 
 import ccxt
 
-# 2 years in milliseconds
-TWO_YEARS_MS = int(2 * 365 * 24 * 60 * 60 * 1000)
+# 6 months in milliseconds
+TWO_YEARS_MS = int(0.6 * 365 * 24 * 60 * 60 * 1000)
 
 
 def dedupe_by_ts(candles):
