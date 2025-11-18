@@ -803,8 +803,8 @@ def decide_and_maybe_trade(args):
                   "falling back to raw position size.")
             close_qty = float(sz_abs)
 
-        print(f"[DEBUG] Existing position detected: side={side_open_raw!r}, "
-              f"raw_size={raw_size}, close_qty={close_qty}, entry={entry}")
+            print(f"[DEBUG] Existing position detected: side={side_open_raw!r}, "
+                  f"raw_size={raw_size}, close_qty={close_qty}, entry={entry}")
         
         else:
             if side_open == "long":
