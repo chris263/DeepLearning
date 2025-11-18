@@ -40,7 +40,7 @@
   "short_prob_threshold": 0.44999999999999996,
   "risk": {
     "sl_pct": 0.02,
-    "tp_pct": 0.06,
+    "tp_pct": 0.04,
     "fee_bps": 1.0
   }
 }
