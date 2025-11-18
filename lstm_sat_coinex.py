@@ -529,14 +529,6 @@ def get_min_amount(ex, symbol: str) -> float:
 
 
 def safe_close_amount(ex, symbol: str, position_size: float) -> float:
-    """
-    Compute a close quantity that:
-      - never exceeds the current position size; and
-      - respects amount precision if available.
-
-    This helps avoid 'amount exceed limit' errors when the on-exchange
-    position is slightly smaller than rounded values.
-    """
     sz = float(abs(position_size))
     if sz <= 0:
         return 0.0
@@ -553,15 +545,17 @@ def safe_close_amount(ex, symbol: str, position_size: float) -> float:
     if prec is not None:
         try:
             # If prec is an integer like 3 or 4, treat it as decimal places
-            if isinstance(prec, int) or (isinstance(prec, float) and prec >= 1 and float(prec).is_integer()):
+            if isinstance(prec, (int, float)) and float(prec).is_integer():
                 decimals = int(prec)
-                if 0 <= decimals <= 18:
+                # IMPORTANT: decimals must be >= 1 here; 0 means "integer size", let amount_to_precision handle it
+                if 1 <= decimals <= 18:
                     step = 10.0 ** (-decimals)
             # If prec is a small float < 1, treat it as a step size directly (common on CoinEx)
             elif isinstance(prec, float) and 0 < prec < 1:
                 step = float(prec)
         except Exception:
             step = None
+
 
     if step is not None and step > 0:
         steps = math.floor(sz / step)
@@ -581,6 +575,7 @@ def safe_close_amount(ex, symbol: str, position_size: float) -> float:
         return q if q > 0 else 0.0
     except Exception:
         return sz
+
 
 
 def get_swap_position(ex, symbol: str) -> Optional[Dict]:
@@ -803,12 +798,14 @@ def decide_and_maybe_trade(args):
         sz_abs = abs(raw_size)
         close_qty = safe_close_amount(ex, symbol, sz_abs)
 
+        if close_qty <= 0:
+            print(f"[WARN] safe_close_amount returned {close_qty} for sz_abs={sz_abs}; "
+                  "falling back to raw position size.")
+            close_qty = float(sz_abs)
+
         print(f"[DEBUG] Existing position detected: side={side_open_raw!r}, "
               f"raw_size={raw_size}, close_qty={close_qty}, entry={entry}")
-
-        if close_qty <= 0:
-            print("[WARN] Position size is below minimum tradable size after precision; cannot safely close — skipping new trades.")
-            return
+        
         else:
             if side_open == "long":
                 # LONG SL/TP prices
@@ -842,37 +839,38 @@ def decide_and_maybe_trade(args):
                         print(f"[ERROR] close LONG (SIG) failed: {e}")
                     return
 
-            elif side_open == "short":
-                # SHORT SL/TP prices
-                sl_px = entry * (1.0 + (sl_pct or 0.0)) if sl_pct is not None else None
-                tp_px = entry * (1.0 - (tp_pct or 0.0)) if tp_pct is not None else None
-                hit_sl = (sl_px is not None) and (last_high >= sl_px)
-                hit_tp = (tp_px is not None) and (last_low <= tp_px)
+                elif side_open == "short":
+                    # SHORT SL/TP prices
+                    sl_px = entry * (1.0 + (sl_pct or 0.0)) if sl_pct is not None else None
+                    tp_px = entry * (1.0 - (tp_pct or 0.0)) if tp_pct is not None else None
+                    hit_sl = (sl_px is not None) and (last_high >= sl_px)
+                    hit_tp = (tp_px is not None) and (last_low <= tp_px)
 
-                # SL/TP first
-                if hit_sl or hit_tp:
-                    reason = "SL" if hit_sl else "TP"
-                    try:
-                        ex.create_order(symbol, "market", "buy", close_qty, None, {"reduceOnly": True})
-                        print(f"{reason} hit — closing existing SHORT at ~{(sl_px if hit_sl else tp_px):.8g}")
-                        write_last_executed(guard_path, last_close_ms)
-                    except Exception as e:
-                        print(f"[ERROR] close SHORT on {reason} failed: {e}")
-                    return
+                    # SL/TP first
+                    if hit_sl or hit_tp:
+                        reason = "SL" if hit_sl else "TP"
+                        try:
+                            ex.create_order(symbol, "market", "buy", close_qty, None, {"reduceOnly": True})
+                            print(f"{reason} hit — closing existing SHORT at ~{(sl_px if hit_sl else tp_px):.8g}")
+                            write_last_executed(guard_path, last_close_ms)
+                        except Exception as e:
+                            print(f"[ERROR] close SHORT on {reason} failed: {e}")
+                        return
 
-                # Signal exit: leave SHORT zone (neutral or long)
-                if p_last > neg_thr:
-                    try:
-                        ex.create_order(symbol, "market", "buy", close_qty, None, {"reduceOnly": True})
-                        zone = "neutral" if in_neutral else "long"
-                        print(
-                            f"Signal exit — SHORT → {zone} zone: "
-                            f"p_last={p_last:.3f} > neg_thr={neg_thr:.3f}; closing SHORT at ~{last_close}"
-                        )
-                        write_last_executed(guard_path, last_close_ms)
-                    except Exception as e:
-                        print(f"[ERROR] close SHORT (SIG) failed: {e}")
-                    return
+                    # Signal exit: leave SHORT zone (neutral or long)
+                    if p_last > neg_thr:
+                        try:
+                            ex.create_order(symbol, "market", "buy", close_qty, None, {"reduceOnly": True})
+                            zone = "neutral" if in_neutral else "long"
+                            print(
+                                f"Signal exit — SHORT → {zone} zone: "
+                                f"p_last={p_last:.3f} > neg_thr={neg_thr:.3f}; closing SHORT at ~{last_close}"
+                            )
+                            write_last_executed(guard_path, last_close_ms)
+                        except Exception as e:
+                            print(f"[ERROR] close SHORT (SIG) failed: {e}")
+                        return
+
 
             else:
                 print(f"[WARN] Unknown open side {side_open_raw!r}; not opening new trades.")
