@@ -969,27 +969,26 @@ def decide_and_maybe_trade(args):
                             tp_price_logged = tp_price
                         else:
                             print(f"[WARN] TP order returned no id on {ex.id}: {tp!r}")
-
-                    # if sl_pct is not None and sl_pct > 0:
-                    #     sl_price = price_to_precision(ex, symbol, entry_price * (1.0 + sl_pct))
-                    #     sl = ex.create_order(
-                    #         symbol,
-                    #         "market",
-                    #         "buy",
-                    #         qty,
-                    #         None,
-                    #         {
-                    #             **params_common,
-                    #             "stopLossPrice": float(sl_price),
-                    #             "slTriggerBy": "LastPrice",
-                    #         },
-                    #     )
-                    #     oid = _safe_order_id(sl)
-                    #     if oid:
-                    #         sl_order_id = oid
-                    #         sl_price_logged = sl_price
-                    #     else:
-                    #         print(f"[WARN] SL order returned no id on {ex.id}: {sl!r}")
+                    if sl_pct is not None and sl_pct > 0:
+                        sl_price = price_to_precision(ex, symbol, entry_price * (1.0 + sl_pct))
+                        sl = ex.create_order(
+                            symbol,
+                            "market",
+                            "buy",
+                            qty,
+                            None,
+                            {
+                                **params_common,
+                                "stopLossPrice": float(sl_price),
+                                "slTriggerBy": "LastPrice",
+                            },
+                        )
+                        oid = _safe_order_id(sl)
+                        if oid:
+                            sl_order_id = oid
+                            sl_price_logged = sl_price
+                        else:
+                            print(f"[WARN] SL order returned no id on {ex.id}: {sl!r}")
 
             else:
                 # GENERIC / COINEX / OTHER: previous logic, but include takeProfitPrice where useful

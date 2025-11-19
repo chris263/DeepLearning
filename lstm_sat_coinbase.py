@@ -18,11 +18,22 @@ Requires: torch, ccxt, numpy, pandas
 from __future__ import annotations
 import os, sys, json, time, argparse, pathlib, tempfile, math
 from typing import List, Dict, Tuple, Optional
+from coinbase.rest import RESTClient
 
 import numpy as np
 import pandas as pd
-import torch
-import ccxt
+
+try:
+    import torch
+except Exception:
+    print("Please install torch:  pip install torch", file=sys.stderr)
+    raise
+
+try:
+    import ccxt
+except Exception:
+    print("Please install ccxt:  pip install ccxt", file=sys.stderr)
+    raise
 
 # =========================
 # Constants / timeframe helpers
@@ -51,235 +62,6 @@ def tf_ms(tf: str) -> int:
     if not v:
         raise SystemExit(f"Unsupported timeframe '{tf}' — add it to TF_TO_MS.")
     return v
-
-import time, hmac, hashlib, base64, json, uuid, subprocess, secrets, re, textwrap
-from typing import Dict, Any, Optional, Tuple, List
-import requests
-
-# ---------- small helpers ----------
-def now_s() -> str:
-    return str(int(time.time()))
-
-def get_public_ip() -> str:
-    try:
-        r = requests.get("https://ifconfig.me", timeout=4)
-        if r.ok:
-            return r.text.strip()
-    except Exception:
-        pass
-    try:
-        return subprocess.check_output(["curl", "-s", "ifconfig.me"], timeout=4).decode().strip()
-    except Exception:
-        return "unknown"
-
-def explain_http(status: int) -> str:
-    if status == 401:
-        return "HTTP 401: Unauthorized."
-    if status == 403:
-        return "HTTP 403: Forbidden."
-    if status >= 500:
-        return f"HTTP {status}: server issue."
-    return f"HTTP {status}"
-
-def check_time_skew() -> float:
-    try:
-        r = requests.get("https://api.coinbase.com/v2/time", timeout=4)
-        if r.ok:
-            server = int(r.json().get("data", {}).get("epoch", 0))
-            local = int(time.time())
-            return server - local
-    except Exception:
-        pass
-    return 0.0
-
-def map_symbol(sym: str) -> str:
-    s = (sym or "").upper()
-    if "-" in s:
-        return s
-    for q in ("USD", "USDT", "USDC", "EUR", "GBP"):
-        if s.endswith(q):
-            return s.replace(q, f"-{q}")
-    return s
-
-def map_symbol_future(sym: str, suffix: str = "PERP-INTX") -> str:
-    """
-    Heuristic mapping to a Coinbase perpetual futures product code.
-    Examples:
-      BTCUSDC -> BTC-PERP-INTX   (default)
-      ETHUSDT -> ETH-PERP-INTX
-    """
-    s = (sym or "").upper()
-    s = s.replace("-", "")
-    base = s
-    for q in ("USDT", "USDC", "USD", "EUR", "GBP"):
-        if s.endswith(q):
-            base = s[:-len(q)]
-            break
-    return f"{base}-{suffix}"
-
-# ---------- normalization ----------
-def _coinbase_normalize_key(key: str) -> str:
-    k = (key or "").strip()
-    if (k.startswith('"') and k.endswith('"')) or (k.startswith("'") and k.endswith("'")):
-        k = k[1:-1]
-    return k
-
-def _coinbase_normalize_pem(secret: str) -> bytes:
-    """
-    Accepts:
-      - Full PEM (BEGIN/END), possibly with literal '\\n' escapes
-      - Base64 body only (we wrap it)
-      - Strings with stray quotes/whitespace
-    Returns a valid PEM as bytes.
-    """
-    if secret is None:
-        raise ValueError("Empty Coinbase secret")
-    s = str(secret).strip()
-    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
-        s = s[1:-1]
-    s = s.replace("\\r", "").replace("\\n", "\n").replace("\r\n", "\n").strip()
-    if "BEGIN" in s:
-        return s.encode("utf-8")
-    body = re.sub(r"\s+", "", s)
-    wrapped = "\n".join(textwrap.wrap(body, 64))
-    pem = f"-----BEGIN EC PRIVATE KEY-----\n{wrapped}\n-----END EC PRIVATE KEY-----\n"
-    return pem.encode("utf-8")
-
-# ---------- HMAC signing (for old APIs – mostly unused here, but harmless) ----------
-def _sign_preimage(ts: str, method: str, request_path: str, body: Optional[str]) -> bytes:
-    pre = ts + method.upper() + request_path + (body or "")
-    return pre.encode("utf-8")
-
-def _hmac_b64(secret_bytes: bytes, preimage: bytes) -> str:
-    digest = hmac.new(secret_bytes, preimage, hashlib.sha256).digest()
-    return base64.b64encode(digest).decode()
-
-def _maybe_secret_bytes(secret: str, mode: str) -> Tuple[Optional[bytes], Optional[str]]:
-    if mode == "base64":
-        try:
-            return (base64.b64decode(secret), "base64")
-        except Exception:
-            return (None, None)
-    elif mode == "raw":
-        return (secret.encode("utf-8"), "raw")
-    else:
-        return (None, None)
-
-def _hmac_headers(api_key: str, secret: str, method: str, path: str, body_str: Optional[str],
-                  secret_mode: str, debug: bool=False) -> Dict[str, str]:
-    ts = now_s()
-    preimage = _sign_preimage(ts, method, path, body_str)
-    sec_bytes, _ = _maybe_secret_bytes(secret, secret_mode)
-    if sec_bytes is None:
-        raise ValueError("secret decode failed (HMAC)")
-    sign = _hmac_b64(sec_bytes, preimage)
-    if debug:
-        print(f"[debug] preimage: {preimage.decode('utf-8')}")
-        print(f"[debug] signature(Base64 HMAC-SHA256): {sign}")
-    return {
-        "CB-ACCESS-KEY": api_key,
-        "CB-ACCESS-SIGN": sign,
-        "CB-ACCESS-TIMESTAMP": ts,
-        "Content-Type": "application/json",
-    }
-
-# ---------- JWT (ES256) ----------
-def _coinbase_make_jwt(key_resource_name: str, secret_pem_bytes: bytes,
-                       method: str, host: str, path: str) -> str:
-    """
-    Build a JWT per CDP docs:
-      header: kid=<key_resource_name>, alg=ES256, nonce=random
-      payload: sub=<kid>, iss="cdp", nbf=now, exp=now+120, uri="<METHOD> <host><path>"
-    """
-    import jwt  # PyJWT
-    from cryptography.hazmat.primitives import serialization
-
-    priv = serialization.load_pem_private_key(secret_pem_bytes, password=None)
-    now = int(time.time())
-    payload = {
-        "sub": key_resource_name,
-        "iss": "cdp",
-        "nbf": now,
-        "exp": now + 120,
-        "uri": f"{method.upper()} {host}{path}",
-    }
-    headers = {"kid": key_resource_name, "nonce": secrets.token_hex()}
-    token = jwt.encode(payload, priv, algorithm="ES256", headers=headers)
-    return token if isinstance(token, str) else token.decode("utf-8")
-
-def _jwt_headers(kid: str, pem_secret: str, method: str, host: str, path: str, debug: bool=False) -> Dict[str, str]:
-    pem_bytes = _coinbase_normalize_pem(pem_secret)
-    tok = _coinbase_make_jwt(kid, pem_bytes, method, host, path)
-    if debug:
-        print(f"[debug] jwt: kid={kid} alg=ES256 host={host} path={path}")
-    return {
-        "Authorization": f"Bearer {tok}",
-        "Content-Type": "application/json",
-    }
-
-def _host_from_base(base_host: str) -> str:
-    return base_host.replace("https://", "").replace("http://", "")
-
-# ---------- request wrapper (supports HMAC or JWT) ----------
-def _request(session: requests.Session, base_host: str, method: str, path: str,
-             auth_mode: str, *, api_key: str = "", secret: str = "", secret_format: str = "auto",
-             kid: str = "", debug: bool=False, timeout: int=10,
-             json_body: Optional[dict]=None) -> Tuple[int, Any, str]:
-    """
-    Returns (status, payload, mode_used_for_secret or 'jwt').
-    """
-    assert path.startswith("/"), "path must start with '/'"
-    url = f"{base_host}{path}"
-    body_str = json.dumps(json_body, separators=(",", ":")) if json_body is not None else None
-
-    def send(headers: Dict[str, str]) -> Tuple[int, Any]:
-        if method.upper() == "GET":
-            r = session.get(url, headers=headers, timeout=timeout)
-        else:
-            r = session.post(url, headers=headers, data=body_str or "", timeout=timeout)
-        try:
-            payload = r.json()
-        except Exception:
-            payload = r.text
-        return r.status_code, payload
-
-    if auth_mode == "jwt":
-        headers = _jwt_headers(kid, secret, method, host=_host_from_base(base_host), path=path, debug=debug)
-        st, pay = send(headers)
-        return st, pay, "jwt"
-
-    # HMAC mode (old API)
-    def do(mode: str) -> Tuple[int, Any]:
-        headers = _hmac_headers(api_key, secret, method, path, body_str, mode, debug)
-        return send(headers)
-
-    if secret_format in ("base64", "raw"):
-        st, pay = do(secret_format)
-        return st, pay, secret_format
-
-    st1, pay1 = do("base64")
-    if debug:
-        print(f"[auth] try #1 mode=base64 → HTTP {st1}")
-    if st1 == 200:
-        return st1, pay1, "base64"
-    st2, pay2 = do("raw")
-    if debug:
-        print(f"[auth] try #2 mode=raw    → HTTP {st2}")
-    if st2 == 200:
-        return st2, pay2, "raw"
-    if debug:
-        print(f"[auth] both modes failed. base64 payload: {pay1!r}")
-    return st2, pay2, "raw"
-
-# ---------- API calls ----------
-def preflight(session: requests.Session, base_host: str, auth_mode: str,
-              api_key: str, secret: str, secret_format: str, kid: str,
-              debug: bool=False) -> Tuple[int, Any, str]:
-    path = "/api/v3/brokerage/accounts"
-    return _request(session, base_host, "GET", path, auth_mode,
-                    api_key=api_key, secret=secret, secret_format=secret_format,
-                    kid=kid, debug=debug, timeout=10)
-
 
 
 # =========================
@@ -641,135 +423,77 @@ def write_reversal_state(path: str, data: Dict[str, int]):
     with open(path, "w") as f:
         json.dump(data, f, separators=(",", ":"))
 
-# =========================
-# Exchange helpers (Coinbase)
-# =========================
 
+# =========================
+# Exchange helpers (coinbase)
+# =========================
 
 import os
-import ccxt
+from typing import Optional, Tuple
+from coinbase.rest import RESTClient
 
-def make_exchange(pub_key_name: Optional[str], sec_key_name: Optional[str], debug: bool = False):
+def make_exchange(pub_key_name: Optional[str],
+                  sec_key_name: Optional[str]) -> Tuple[str, str]:
     """
-    Coinbase-specific make_exchange:
-
-    - Reads key name and private key from ~/.ssh/coinbase_keys.env
-    - Normalizes them with your helper functions
-    - Runs a JWT preflight on /api/v3/brokerage/accounts to validate auth
-    - If OK, instantiates ccxt.coinbase with the same credentials
+    Load Coinbase Advanced API key + secret from ~/.ssh/coinex_keys.env
+    (same file you are already using). Returns (api_key, api_secret).
     """
+    api_key = None
+    api_secret = None
 
-    keyfile = os.path.expanduser("~/.ssh/coinex_keys.env")
-    if not (pub_key_name or sec_key_name):
-        print("[ERROR] make_exchange: pub_key_name or sec_key_name must be provided.")
-        return None
+    if pub_key_name or sec_key_name:
+        keyfile = os.path.expanduser("~/.ssh/coinex_keys.env")  # this is the right place!
+        kv = {}
+        if os.path.exists(keyfile):
+            with open(keyfile, "r") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    kv[k.strip()] = v.strip()
+        else:
+            raise SystemExit(f"[FATAL] Keyfile not found: {keyfile}")
 
-    if not os.path.exists(keyfile):
-        print(f"[ERROR] Coinbase keyfile not found: {keyfile}")
-        return None
+        api_key = kv.get(pub_key_name) if pub_key_name else None
+        api_secret = kv.get(sec_key_name) if sec_key_name else None
 
-    # ------- load raw values from env-style file -------
-    kv: Dict[str, str] = {}
-    with open(keyfile, "r") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            kv[k.strip()] = v.strip()
-
-    raw_key = kv.get(pub_key_name, "")
-    raw_sec = kv.get(sec_key_name, "")
-
-    if not raw_key or not raw_sec:
-        print(f"[ERROR] Missing Coinbase credentials for pub={pub_key_name!r} sec={sec_key_name!r} in {keyfile}")
-        return None
-
-    api_key = _coinbase_normalize_key(raw_key)
-    secret_str = raw_sec  # _coinbase_normalize_pem will handle quotes / \\n
-
-    if debug:
-        print(f"[DEBUG] Coinbase api_key={api_key}, secret_len={len(secret_str)}")
-
-    # ------- preflight JWT auth against Advanced Trade REST -------
-    session = requests.Session()
-    base_host = "https://api.coinbase.com"
-
-    # For JWT mode, _request ignores api_key/secret_format and uses kid + secret.
-    status, payload, mode_used = preflight(
-        session=session,
-        base_host=base_host,
-        auth_mode="jwt",
-        api_key="",              # ignored in jwt mode
-        secret=secret_str,       # privateKey string from JSON / env
-        secret_format="auto",    # ignored in jwt mode
-        kid=api_key,             # full "name" field
-        debug=debug,
-    )
-
-    if status != 200:
-        print(f"[ERROR] Coinbase JWT preflight failed: {explain_http(status)}")
-        print(f"[ERROR] Response payload: {payload!r}")
-        skew = check_time_skew()
-        print(f"[INFO] Coinbase time skew (server-local) ≈ {skew} seconds")
-        print(f"[INFO] Public IP seen by Coinbase likely: {get_public_ip()}")
-        return None
-
-    if debug:
-        print(f"[DEBUG] Coinbase preflight OK (status={status}, mode={mode_used})")
-
-    # ------- instantiate ccxt.coinbase with normalized PEM secret -------
-    # ccxt expects the ES256 private key as a PEM string.
-    secret_pem_bytes = _coinbase_normalize_pem(secret_str)
-    secret_pem_str = secret_pem_bytes.decode("utf-8")
-
-    ex = ccxt.coinbase({
-        "apiKey": api_key,          # full "name" from key JSON
-        "secret": secret_pem_str,   # full EC PRIVATE KEY PEM
-        "enableRateLimit": True,
-    })
-
-    try:
-        ex.load_markets()
-    except ccxt.AuthenticationError as e:
-        print(f"[ERROR] ccxt.coinbase load_markets() failed with AuthenticationError: {e}")
-        print(
-            "Your key *did* pass JWT preflight, so auth is OK, but ccxt rejected it.\n"
-            "Most likely causes:\n"
-            "  • ccxt version too old for CDP / Advanced Trade keys.\n"
-            "  • A bug in ccxt's coinbase JWT 'uri' formatting for this endpoint.\n"
+    if not api_key or not api_secret:
+        raise SystemExit(
+            "[FATAL] Missing Coinbase API key and/or secret in ~/.ssh/coinex_keys.env\n"
+            f"  pub_key_name={pub_key_name!r}, sec_key_name={sec_key_name!r}"
         )
-        return None
-    except Exception as e:
-        print(f"[ERROR] Failed to load Coinbase markets via ccxt: {e}")
-        return None
 
-    if debug:
-        print("[DEBUG] Coinbase markets loaded successfully via ccxt.")
-    return ex
+    return api_key, api_secret
 
 
+def make_coinbase_client(pub_key_name: Optional[str],
+                         sec_key_name: Optional[str]) -> RESTClient:
+    """
+    Convenience wrapper:
+      - loads key/secret from file
+      - builds RESTClient
+      - does a small get_accounts() sanity check
+    """
+    api_key, api_secret = make_exchange(pub_key_name, sec_key_name)
+    client = RESTClient(api_key=api_key, api_secret=api_secret)
 
-def resolve_symbol(ex, ticker: str) -> str:
-    ticker = ticker.upper().replace("/", "")
-    base = ticker[:-4] if ticker.endswith("USDC") else ticker
-    candidates = [s for s in ex.symbols if s.startswith(f"{base}/USDC") and (":USDC" in s)]
-    if candidates:
-        return sorted(candidates)[0]
-    for s in ex.symbols:
-        if f"{base}/" in s and ":USDC" in s:
-            return s
-    raise SystemExit(f"No swap symbol resolved for {ticker} on Coinbase")
-
-
-def fetch_usdc_balance_swap(ex) -> float:
+    # quick connection check (you already saw this pattern working)
     try:
-        bal = ex.fetch_balance(params={"type": "swap"})
-        total = bal.get("total", {}).get("USDC")
-        free = bal.get("free", {}).get("USDC")
-        return float(free if free is not None else (total or 0.0))
-    except Exception:
-        return 0.0
+        resp = client.get_accounts()
+        first = resp.accounts[0]
+        # available_balance is a dict: {'value': '123.45', 'currency': 'USDC'}
+        avail_val = first.available_balance['value']
+        avail_cur = first.available_balance['currency']
+        print(f"[OK] Coinbase connection verified. "
+              f"First account: {first.currency}, available={avail_val} {avail_cur}")
+    except Exception as e:
+        print(f"[ERROR] Coinbase get_accounts() sanity check failed: {e}")
+        raise
+
+    return client
+
+
 
 def amount_to_precision(ex, symbol: str, amount: float) -> float:
     try:
@@ -784,6 +508,10 @@ def price_to_precision(ex, symbol: str, price: float) -> float:
         return float(f"{price:.6f}")
 
 def get_min_amount(ex, symbol: str) -> float:
+    """
+    Return the exchange-reported minimum tradable amount for this symbol,
+    or 0.0 if not available.
+    """
     try:
         m = ex.markets.get(symbol) or ex.market(symbol)
         limits = m.get("limits") or {}
@@ -793,96 +521,319 @@ def get_min_amount(ex, symbol: str) -> float:
             return float(mn)
     except Exception:
         pass
-    return 0.0        
+    return 0.0
+
+def resolve_symbol(ex, ticker: str) -> str:
+    """
+    Normalize any of these:
+      - 'BTCUSDC'
+      - 'BTC/USDC'
+      - 'BTC/USDC:USDC'
+      - 'BTCUSDT' or 'BTC/USDT'  (we treat USDT as USDC on Coinbase)
+      - 'BTC-USDC' (already good)
+
+    into a Coinbase product_id like 'BTC-USDC'.
+
+    `ex` is kept only for signature compatibility, it is not used.
+    """
+    if not ticker:
+        raise SystemExit("resolve_symbol() got empty ticker")
+
+    t = ticker.upper().strip()
+
+    # If user already passed a Coinbase-style ID like 'BTC-USDC', just keep it
+    if "-" in t and len(t.split("-")) == 2:
+        return t
+
+    # Strip ccxt style junk: '/', ':' etc.  e.g. 'BTC/USDC:USDC' -> 'BTCUSDCUSDC'
+    t_clean = t.replace("/", "").replace(":", "").replace(" ", "")
+
+    # Prefer USDC; also map 'USDT' → 'USDC' for convenience
+    if t_clean.endswith("USDC"):
+        base = t_clean[:-4]
+        return f"{base}-USDC"
+    if t_clean.endswith("USDT"):
+        base = t_clean[:-4]
+        return f"{base}-USDC"   # on Coinbase we use USDC
+    if t_clean.endswith("USD"):
+        base = t_clean[:-3]
+        return f"{base}-USD"
+
+    # Fallback: assume USDC quote
+    return f"{t_clean}-USDC"
+
+def fetch_usdc_balance_swap(ex: RESTClient) -> float:
+    """
+    Coinbase version:
+      - `ex` is a RESTClient
+      - we simply sum available USDC across all accounts this key can see
+      - no swap/transfer logic at all
+    """
+    try:
+        total = 0.0
+        cursor = None
+
+        while True:
+            if cursor:
+                resp = ex.get_accounts(cursor=cursor)
+            else:
+                resp = ex.get_accounts()
+
+            accounts = getattr(resp, "accounts", []) or []
+
+            for acct in accounts:
+                # Handle both dataclass-like objects and plain dicts
+                if isinstance(acct, dict):
+                    cur = acct.get("currency")
+                    ab = acct.get("available_balance", {})
+                    val = ab.get("value")
+                else:
+                    cur = getattr(acct, "currency", None)
+                    ab = getattr(acct, "available_balance", None)
+                    if isinstance(ab, dict):
+                        val = ab.get("value")
+                    else:
+                        val = getattr(ab, "value", None) if ab is not None else None
+
+                if cur == "USDC" and val is not None:
+                    try:
+                        total += float(val)
+                    except (TypeError, ValueError):
+                        pass
+
+            has_next = getattr(resp, "has_next", False)
+            cursor = getattr(resp, "cursor", None)
+            if not has_next or not cursor:
+                break
+
+        return total
+
+    except Exception as e:
+        print(f"[WARN] Failed to fetch USDC balance from Coinbase: {e}")
+        return 0.0
+
+import os
+import math
+from typing import Dict, Any, Optional, Tuple, List
+
+# =========================
+# Coinbase-specific helpers
+# =========================
 
 def safe_close_amount(ex, symbol: str, position_size: float) -> float:
+    """
+    Coinbase version.
+
+    Compute a close quantity that:
+      - respects the product's base_increment; and
+      - never exceeds the current position size (floored to step).
+
+    This prevents 'amount exceed limit' / 'insufficient size' errors when the
+    true position is slightly smaller than a naive rounded value.
+    """
     sz = float(abs(position_size))
     if sz <= 0:
         return 0.0
 
-    # Try to derive a step from precision
-    step = None
-    try:
-        m = ex.markets.get(symbol) or ex.market(symbol)
-        prec_obj = m.get("precision") or {}
-        prec = prec_obj.get("amount", None)
-    except Exception:
-        prec = None
+    base_increment = None
 
-    if prec is not None:
+    # Try to get base_increment from Coinbase product metadata
+    try:
+        prod = ex.get_product(symbol)  # e.g. "BTC-USDC"
+        # prod can be a dict or a dataclass-like object
+        if isinstance(prod, dict):
+            base_increment = prod.get("base_increment")
+        elif hasattr(prod, "base_increment"):
+            base_increment = getattr(prod, "base_increment")
+        elif hasattr(prod, "to_dict"):
+            d = prod.to_dict()
+            base_increment = d.get("base_increment")
+    except Exception as e:
+        print(f"[WARN] safe_close_amount: failed to load product info for {symbol}: {e}")
+
+    # If we have base_increment, use it as the step size
+    if base_increment is not None:
         try:
-            # If prec is an integer like 3 or 4, treat it as decimal places
-            if isinstance(prec, int) or (isinstance(prec, float) and prec >= 1 and float(prec).is_integer()):
-                decimals = int(prec)
-                if 0 <= decimals <= 18:
-                    step = 10.0 ** (-decimals)
-            # If prec is a small float < 1, treat it as a step size directly (common on Coinbase)
-            elif isinstance(prec, float) and 0 < prec < 1:
-                step = float(prec)
-        except Exception:
-            step = None
+            step = float(base_increment)
+            if step <= 0:
+                raise ValueError("base_increment <= 0")
 
-    if step is not None and step > 0:
-        steps = math.floor(sz / step)
-        qty = steps * step
-        qty = float(f"{qty:.12f}")
-        if qty <= 0:
-            return 0.0
-        return qty
+            steps = math.floor(sz / step)
+            qty = steps * step
 
-    # Fallback: use amount_to_precision but clamp to <= position size
-    try:
-        q = float(ex.amount_to_precision(symbol, sz))
-        if q > sz:
-            eps = max(sz * 1e-6, 1e-12)
-            q = float(ex.amount_to_precision(symbol, max(0.0, sz - eps)))
-        q = float(f"{q:.12f}")
-        return q if q > 0 else 0.0
-    except Exception:
-        return sz
+            # Clamp to sz just in case
+            if qty > sz:
+                qty = sz
+
+            # Trim floating noise
+            qty = float(f"{qty:.12f}")
+            if qty <= 0:
+                print(
+                    f"[WARN] safe_close_amount: rounded quantity is zero "
+                    f"(pos={sz}, base_increment={base_increment})"
+                )
+                return 0.0
+            return qty
+        except Exception as e:
+            print(f"[WARN] safe_close_amount: could not use base_increment={base_increment!r}: {e}")
+
+    # Fallback: send "almost full" size, slightly under, without any precision info
+    eps = sz * 1e-6 or 1e-8
+    qty = max(0.0, sz - eps)
+    qty = float(f"{qty:.12f}")
+    if qty <= 0:
+        return 0.0
+    return qty
+
 
 def get_swap_position(ex, symbol: str) -> Optional[Dict]:
-    def _scan(ps):
-        if not ps:
-            return None
-        for p in ps:
-            if (p or {}).get("symbol") == symbol:
-                side = (p.get("side") or "").lower()
-                sz = float(p.get("contracts") or p.get("contractSize") or p.get("size") or 0.0)
-                entry = float(p.get("entryPrice") or 0.0)
-                if sz and side:
-                    return {"side": side, "size": abs(sz), "entry": entry}
+    """
+    Coinbase Perpetuals version of get_swap_position.
+
+    - Finds the INTX (perpetuals) portfolio:
+        * uses COINBASE_INTX_PORTFOLIO_UUID if set, otherwise
+        * calls get_portfolios() and picks the first portfolio with type "INTX".
+    - Calls /api/v3/brokerage/intx/positions/{portfolio_uuid}.
+    - Looks for a position whose product_id or symbol matches `symbol`
+      (e.g. "BTC-USDC").
+
+    Returns:
+        {"side": "long" or "short", "size": float, "entry": float}
+    or None if no open perpetuals position is found.
+    """
+
+    def _norm(s: Optional[str]) -> str:
+        return (s or "").upper()
+
+    # 1) Resolve INTX portfolio UUID
+    portfolio_uuid = os.environ.get("COINBASE_INTX_PORTFOLIO_UUID")
+
+    if not portfolio_uuid:
+        try:
+            resp = ex.get_portfolios()
+            portfolios = None
+            if hasattr(resp, "portfolios"):
+                portfolios = resp.portfolios
+            elif isinstance(resp, dict):
+                portfolios = resp.get("portfolios", [])
+            else:
+                portfolios = []
+
+            if portfolios:
+                for pf in portfolios:
+                    if isinstance(pf, dict):
+                        pf_type = pf.get("type") or ""
+                        pf_uuid = pf.get("uuid")
+                    else:
+                        pf_type = getattr(pf, "type", "") or ""
+                        pf_uuid = getattr(pf, "uuid", None)
+
+                    # INTX = International Derivatives / Perpetuals portfolio
+                    if pf_uuid and pf_type == "INTX":
+                        portfolio_uuid = pf_uuid
+                        break
+        except Exception as e:
+            print(f"[WARN] get_swap_position: failed to list portfolios: {e}")
+
+    if not portfolio_uuid:
+        print("[DEBUG] get_swap_position: no INTX (perpetuals) portfolio found; "
+              "assuming no open perpetuals positions.")
         return None
 
+    # 2) Fetch positions in that INTX portfolio
+    positions = None
     try:
-        pos = _scan(ex.fetch_positions([symbol]))
-        if pos:
-            return pos
-    except Exception:
-        pass
-    try:
-        return _scan(ex.fetch_positions())
-    except Exception:
+        # Use low-level GET because we know the path from the docs
+        resp = ex.get(f"/api/v3/brokerage/intx/positions/{portfolio_uuid}")
+        if hasattr(resp, "positions"):
+            positions = resp.positions
+        elif isinstance(resp, dict):
+            positions = resp.get("positions", [])
+        else:
+            positions = []
+    except Exception as e:
+        print(f"[WARN] get_swap_position: failed to fetch INTX positions: {e}")
+        positions = None
+
+    if not positions:
         return None
+
+    target = _norm(symbol)  # e.g. "BTC-USDC"
+
+    for p in positions:
+        if isinstance(p, dict):
+            pid = _norm(p.get("product_id"))
+            sym = _norm(p.get("symbol"))
+            net_size_str = p.get("net_size")
+            pos_side_raw = p.get("position_side")
+            entry_vwap_obj = p.get("entry_vwap")
+        else:
+            pid = _norm(getattr(p, "product_id", None))
+            sym = _norm(getattr(p, "symbol", None))
+            net_size_str = getattr(p, "net_size", None)
+            pos_side_raw = getattr(p, "position_side", None)
+            entry_vwap_obj = getattr(p, "entry_vwap", None)
+
+        if target not in (pid, sym):
+            continue
+
+        # net_size is a string in the API
+        try:
+            sz = float(net_size_str or 0.0)
+        except Exception:
+            sz = 0.0
+
+        if not sz:
+            continue
+
+        # Determine side from position_side or sign of net_size
+        side = None
+        if isinstance(pos_side_raw, str):
+            u = pos_side_raw.upper()
+            if "LONG" in u:
+                side = "long"
+            elif "SHORT" in u:
+                side = "short"
+
+        if side is None:
+            side = "long" if sz > 0 else "short"
+
+        # Entry price from entry_vwap.value
+        entry_val_raw = None
+        if entry_vwap_obj is not None:
+            if isinstance(entry_vwap_obj, dict):
+                entry_val_raw = entry_vwap_obj.get("value")
+            else:
+                entry_val_raw = getattr(entry_vwap_obj, "value", None)
+
+        try:
+            entry = float(entry_val_raw or 0.0)
+        except Exception:
+            entry = 0.0
+
+        return {"side": side, "size": abs(sz), "entry": entry}
+
+    return None
+
 
 # =========================
-# Inference helpers
+# Inference helpers (unchanged)
 # =========================
 
 def run_model(model, X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> Tuple[float, float]:
-    """
-    X shape: (2, lookback, n_features) — first is previous window, second is last window.
-    """
+    # X shape: (2, lookback, n_features) — run two independent forwards
     Xn = (X - mean) / (std + 1e-12)
 
     with torch.no_grad():
-        t_prev = torch.from_numpy(Xn[0:1]).float()
+        # prev window
+        t_prev = torch.from_numpy(Xn[0:1]).float()   # (1, L, C)
         out_prev = model(t_prev)
         if isinstance(out_prev, (list, tuple)):
             out_prev = out_prev[0]
         p_prev = float(torch.sigmoid(out_prev).reshape(-1)[-1].item())
 
-        t_last = torch.from_numpy(Xn[1:2]).float()
+        # last window
+        t_last = torch.from_numpy(Xn[1:2]).float()   # (1, L, C)
         out_last = model(t_last)
         if isinstance(out_last, (list, tuple)):
             out_last = out_last[0]
@@ -931,7 +882,7 @@ def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: floa
         return (
             f"No new SHORT: probability stayed in SHORT zone "
             f"(p_prev={fp(p_prev)} → p_last={fp(p_last)} ≤ neg_thr={fp(neg_thr)}). "
-            f"We only open a LONG when p_last < p_prev."
+            f"We only open a SHORT when p_last < p_prev."
         )
 
     # 3) Crossed but not in a valid fresh-cross configuration
@@ -940,26 +891,24 @@ def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: floa
         f"fresh-cross rules for LONG (p_prev<pos_thr≤p_last) or SHORT (p_prev>neg_thr≥p_last)."
     )
 
-
 # =========================
-# Core flow
+# Core flow (Coinbase perps, close-only reversal)
 # =========================
-
 def decide_and_maybe_trade(args):
     # 1) Load bundle
     bundle = load_bundle(args.model_dir)
-    meta = bundle["meta"]
+    meta  = bundle["meta"]
     model = bundle["model"]
     feats = bundle["feature_names"]
-    lookback = bundle["lookback"]
-    pos_thr, neg_thr = bundle["pos_thr"], bundle["neg_thr"]
-    sl_pct, tp_pct = bundle["sl_pct"], bundle["tp_pct"]
-    mean, std = bundle["mean"], bundle["std"]
-    ik = bundle["ichimoku"]
-    model_dir = bundle["paths"]["dir"]
+    lookback        = bundle["lookback"]
+    pos_thr, neg_thr= bundle["pos_thr"], bundle["neg_thr"]
+    sl_pct, tp_pct  = bundle["sl_pct"],  bundle["tp_pct"]
+    mean, std       = bundle["mean"],    bundle["std"]
+    ik              = bundle["ichimoku"]
+    model_dir       = bundle["paths"]["dir"]
 
-    # 2) Resolve ticker/timeframe
-    ticker = args.ticker or meta.get("ticker") or "BTCUSDT"
+    # 2) Resolve ticker/timeframe (model defaults)
+    ticker    = args.ticker    or meta.get("ticker")    or "BTCUSDC"
     timeframe = args.timeframe or meta.get("timeframe") or "1h"
 
     # 3) Load bars (JSON)
@@ -968,19 +917,10 @@ def decide_and_maybe_trade(args):
         print("Not enough bars to build features.")
         return
 
-    # Enforce strict time order & no duplicates
-    ts_col = "timestamp" if "timestamp" in df.columns else ("ts" if "ts" in df.columns else None)
-    if ts_col:
-        df = df.sort_values(ts_col).drop_duplicates(subset=[ts_col], keep="last").reset_index(drop=True)
-
-    # 4) Build + align features
-    cols = [c for c in ["timestamp", "ts", "open", "high", "low", "close", "volume"] if c in df.columns]
+    # Build + align features & check names
     feat_df_full = build_features(
-        df[cols].copy(),
-        ik["tenkan"],
-        ik["kijun"],
-        ik["senkou"],
-        ik["displacement"],
+        df[["timestamp", "ts", "open", "high", "low", "close", "volume"]].copy(),
+        ik["tenkan"], ik["kijun"], ik["senkou"], ik["displacement"]
     )
     feat_df_full = align_features_to_meta(feat_df_full, feats)
     for c in feats:
@@ -988,120 +928,117 @@ def decide_and_maybe_trade(args):
             raise SystemExit(f"Feature '{c}' missing in computed frame.")
     feat_df = feat_df_full.copy()
 
-    # 5) Inference windows
+    # 4) Inference (prev vs last bar) — explicit windows
     feat_mat = feat_df[feats].to_numpy(dtype=np.float32)
-    X_prev = feat_mat[-lookback - 1: -1]  # ends at t-1
-    X_last = feat_mat[-lookback:]         # ends at t
-    X = np.stack([X_prev, X_last], axis=0)
+    X_prev   = feat_mat[-lookback-1 : -1]
+    X_last   = feat_mat[-lookback   :   ]
+    X        = np.stack([X_prev, X_last], axis=0)
 
-    if args.debug:
-        closes = df["close"].to_numpy()
+    if getattr(args, "debug", False):
+        closes  = df["close"].to_numpy()
         feat_l1 = float(np.abs(X_last - X_prev).sum())
-        print(f"[DEBUG] prev_close→last_close: {closes[-2]:.4f}→{closes[-1]:.4f} | feat_L1_diff={feat_l1:.4f}")
+        print(f"[DEBUG] prev_close→last_close: {closes[-2]:.4f}→{closes[-1]:.4f} | feat_L1_diff={feat_l1:.6g}")
 
     p_prev, p_last = run_model(model, X, mean, std)
-    if args.debug:
-        print(f"[DEBUG] proba — prev={p_prev:.8f} last={p_last:.8f} Δ={p_last - p_prev:+.8f}")
+    if getattr(args, "debug", False):
+        print(f"[DEBUG] proba — prev={p_prev:.8f} last={p_last:.8f} Δ={p_last-p_prev:+.8f}")
 
-    # 6) Time gating (6-minute window after close)
-    now_ms = int(time.time() * 1000)
+    # 5) Time gating (6-minute window after close)
+    now_ms       = int(time.time() * 1000)
     ts_last_open = int(df["ts"].iloc[-1])
     last_close_ms, stamp_tag, age_ms = resolve_last_closed(now_ms, ts_last_open, timeframe)
     if args.debug:
-        print(
-            f"[DEBUG] last bar — ts_last_open={ts_last_open} tag={stamp_tag} "
-            f"age_min={(age_ms / 60000.0) if age_ms is not None else None}"
-        )
+        age_min = (age_ms / 60000.0) if age_ms is not None else None
+        print(f"[DEBUG] last bar — ts_last_open={ts_last_open} tag={stamp_tag} age_min={age_min}")
 
     if last_close_ms is None or age_ms is None or not (0 <= age_ms <= SIX_MIN_MS):
         print("Last closed bar is not within the 6-minute window — not acting.")
         return
 
-    # 7) Shared last-bar ID
+    # 6) Shared last-bar ID (cross-broker guard)
     update_shared_lastbar(ticker, timeframe, ts_last_open, last_close_ms)
     if args.debug:
         shared = read_lastbars_store().get(f"{ticker}:{timeframe}", {})
         print(f"[DEBUG] shared lastbar: {shared.get('bar_id')} last_close_ts={shared.get('last_close_ts')}")
 
-    # 8) Idempotency
-    suffix = f"coinbase_swap_{ticker}_{timeframe}"
+    # 7) Guard & reversal state
+    suffix         = f"coinbase_perp_{ticker}_{timeframe}"
     last_seen_ts, guard_path = last_executed_guard(model_dir, suffix)
     rev_state_path = reversal_state_paths(model_dir, suffix)
-    rev_state = read_reversal_state(rev_state_path)  # reserved for future use
+    rev_state      = read_reversal_state(rev_state_path)
 
     if last_seen_ts is not None and last_seen_ts == last_close_ms:
         print("Already acted on this bar for Coinbase — not acting again.")
         return
 
-    # 9) Fresh-cross trigger logic
-    take_long = (p_last >= pos_thr) and (p_prev < p_last)
-    take_short = (p_last <= neg_thr) and (p_prev > p_last)
+    # 8) Fresh-cross trigger logic (same rules)
+    take_long  = (p_last >= pos_thr) and (p_prev <  p_last)
+    take_short = (p_last <= neg_thr) and (p_prev >  p_last)
 
-    # 10) Exchange (swap only)
-    ex = make_exchange(args.pub_key, args.sec_key)
-    if ex is None:
-        print("Exchange initialization failed for Coinbase — aborting this run.")
-        return
+    # 9) Coinbase client + product_id
+    client = make_coinbase_client(args.pub_key, args.sec_key)
+    product_id = resolve_symbol(client, ticker)  # e.g. "BTC-USDC"
 
-    symbol = resolve_symbol(ex, ticker)
-
-
-    # 11) Position & SL/TP (+ signal exit on neutral)
-    pos = get_swap_position(ex, symbol)
-    last_close = float(df["close"].iloc[-1])
+    # 10) Position & SL/TP (+ signal exit on neutral)
+    pos       = get_swap_position(client, product_id)  # your Coinbase version
+    last_close= float(df["close"].iloc[-1])
     last_high = float(df["high"].iloc[-1])
-    last_low = float(df["low"].iloc[-1])
+    last_low  = float(df["low"].iloc[-1])
 
     in_neutral = (neg_thr < p_last < pos_thr)
 
+    # --- if we have an open position, we only manage/close it; no new opens this bar ---
     if pos is not None and pos.get("side"):
-        # WE HAVE AN OPEN POSITION ON EXCHANGE ----
         side_open_raw = pos.get("side")
-        side_open = str(side_open_raw).lower()  # 'long' or 'short' ideally
-        entry = float(pos.get("entry") or last_close)
+        side_open     = str(side_open_raw).lower()  # 'long' or 'short'
+        entry         = float(pos.get("entry") or last_close)
+        raw_size      = float(pos.get("size") or 0.0)
 
-        # IMPORTANT: get a safe, positive, precision-checked size that never exceeds the current position
-        raw_size = float(pos.get("size") or 0.0)
-        sz_abs = abs(raw_size)
-        close_qty = safe_close_amount(ex, symbol, sz_abs)
-
-        print(f"[DEBUG] Existing position detected: side={side_open_raw!r}, "
-              f"raw_size={raw_size}, close_qty={close_qty}, entry={entry}")
-
-        if close_qty <= 0:
-            print("[WARN] Position size is below minimum tradable size after precision; cannot safely close — skipping new trades.")
-            return
+        if raw_size <= 0:
+            print(
+                f"[WARN] Coinbase position reported with non-positive size "
+                f"({raw_size}); treating as flat."
+            )
+            pos = None
         else:
+            print(
+                f"[DEBUG] Existing position detected on Coinbase: side={side_open_raw!r}, "
+                f"size={raw_size}, entry={entry}"
+            )
+
             if side_open == "long":
                 # LONG SL/TP prices
                 sl_px = entry * (1.0 - (sl_pct or 0.0)) if sl_pct is not None else None
                 tp_px = entry * (1.0 + (tp_pct or 0.0)) if tp_pct is not None else None
-                hit_sl = (sl_px is not None) and (last_low <= sl_px)
+                hit_sl = (sl_px is not None) and (last_low  <= sl_px)
                 hit_tp = (tp_px is not None) and (last_high >= tp_px)
 
-                # SL/TP first
+                # 10a) SL/TP first (backtest parity)
                 if hit_sl or hit_tp:
                     reason = "SL" if hit_sl else "TP"
                     try:
-                        ex.create_order(symbol, "market", "sell", close_qty, None, {"reduceOnly": True})
-                        print(f"{reason} hit — closing existing LONG at ~{(sl_px if hit_sl else tp_px):.8g}")
+                        client.close_position(product_id=product_id)
+                        print(
+                            f"{reason} hit — closing existing LONG on Coinbase at "
+                            f"~{(sl_px if hit_sl else tp_px):.8g}"
+                        )
                         write_last_executed(guard_path, last_close_ms)
                     except Exception as e:
-                        print(f"[ERROR] close LONG on {reason} failed: {e}")
+                        print(f"[ERROR] close LONG on {reason} (Coinbase) failed: {e}")
                     return
 
-                # Signal exit: leave LONG zone (neutral or short)
+                # 10b) SIGNAL EXIT: leave LONG zone → neutral or short
                 if p_last < pos_thr:
                     try:
-                        ex.create_order(symbol, "market", "sell", close_qty, None, {"reduceOnly": True})
+                        client.close_position(product_id=product_id)
                         zone = "neutral" if in_neutral else "short"
                         print(
-                            f"Signal exit — LONG → {zone} zone: "
+                            f"Signal exit — LONG → {zone} zone on Coinbase: "
                             f"p_last={p_last:.3f} < pos_thr={pos_thr:.3f}; closing LONG at ~{last_close}"
                         )
                         write_last_executed(guard_path, last_close_ms)
                     except Exception as e:
-                        print(f"[ERROR] close LONG (SIG) failed: {e}")
+                        print(f"[ERROR] close LONG (SIG, Coinbase) failed: {e}")
                     return
 
             elif side_open == "short":
@@ -1109,195 +1046,164 @@ def decide_and_maybe_trade(args):
                 sl_px = entry * (1.0 + (sl_pct or 0.0)) if sl_pct is not None else None
                 tp_px = entry * (1.0 - (tp_pct or 0.0)) if tp_pct is not None else None
                 hit_sl = (sl_px is not None) and (last_high >= sl_px)
-                hit_tp = (tp_px is not None) and (last_low <= tp_px)
+                hit_tp = (tp_px is not None) and (last_low  <= tp_px)
 
-                # SL/TP first
+                # 10c) SL/TP first
                 if hit_sl or hit_tp:
                     reason = "SL" if hit_sl else "TP"
                     try:
-                        ex.create_order(symbol, "market", "buy", close_qty, None, {"reduceOnly": True})
-                        print(f"{reason} hit — closing existing SHORT at ~{(sl_px if hit_sl else tp_px):.8g}")
+                        client.close_position(product_id=product_id)
+                        print(
+                            f"{reason} hit — closing existing SHORT on Coinbase at "
+                            f"~{(sl_px if hit_sl else tp_px):.8g}"
+                        )
                         write_last_executed(guard_path, last_close_ms)
                     except Exception as e:
-                        print(f"[ERROR] close SHORT on {reason} failed: {e}")
+                        print(f"[ERROR] close SHORT on {reason} (Coinbase) failed: {e}")
                     return
 
-                # Signal exit: leave SHORT zone (neutral or long)
+                # 10d) SIGNAL EXIT: leave SHORT zone → neutral or long
                 if p_last > neg_thr:
                     try:
-                        ex.create_order(symbol, "market", "buy", close_qty, None, {"reduceOnly": True})
+                        client.close_position(product_id=product_id)
                         zone = "neutral" if in_neutral else "long"
                         print(
-                            f"Signal exit — SHORT → {zone} zone: "
+                            f"Signal exit — SHORT → {zone} zone on Coinbase: "
                             f"p_last={p_last:.3f} > neg_thr={neg_thr:.3f}; closing SHORT at ~{last_close}"
                         )
                         write_last_executed(guard_path, last_close_ms)
                     except Exception as e:
-                        print(f"[ERROR] close SHORT (SIG) failed: {e}")
+                        print(f"[ERROR] close SHORT (SIG, Coinbase) failed: {e}")
                     return
 
             else:
-                print(f"[WARN] Unknown open side {side_open_raw!r}; not opening new trades.")
+                print(f"[WARN] Unknown open side {side_open!r} on Coinbase; not opening new trades.")
                 return
 
-            # If we reach here, we decided to keep the position
+            # If we reach here, we keep the existing position and do not flip this bar
             print(
-                f"Keeping existing {side_open.upper()} open — "
+                f"Keeping existing {side_open.upper()} open on Coinbase — "
                 f"p_last={p_last:.3f}, pos_thr={pos_thr:.3f}, neg_thr={neg_thr:.3f}"
             )
             return
 
-    # 12) Flat & no fresh signal → explanation only
+    # 11) If flat and no fresh signal, do nothing
     if not (take_long or take_short):
         msg = _explain_no_open(p_prev, p_last, pos_thr, neg_thr)
         print(msg)
         return
 
-    # 13) OPEN order — balance-based sizing, now with attached TP/SL on exchange
+    # 12) No auto-transfer on Coinbase (user manages collateral manually)
+    # (nothing here by design)
+
+    # 13) OPEN order — balance-based sizing (USDC), using Coinbase market orders
     try:
-        quote_bal_swap = fetch_usdt_balance_swap(ex)
-        side = "buy" if take_long else "sell"
-        usd_to_use = (quote_bal_swap * (0.95 if take_long else 0.80)) if quote_bal_swap > 0 else 0.0
+        # your Coinbase-adapted balance helper (USDC in perps / trading account)
+        quote_bal_usdc = fetch_usdc_balance_swap(client)
+
+        # LONG ~97% of free balance, SHORT ~77%
+        risk_long  = 0.97
+        risk_short = 0.77
+
+        usd_to_use = (
+            quote_bal_usdc * (risk_long if take_long else risk_short)
+            if quote_bal_usdc > 0
+            else 0.0
+        )
         if usd_to_use <= 0:
-            print("No USDT balance available in SWAP.")
+            print("No USDC balance available on Coinbase.")
             return
+
+        # For debug / logging, approximate base quantity
         qty_approx = usd_to_use / max(1e-12, last_close)
-        qty = amount_to_precision(ex, symbol, qty_approx)
 
-        min_amt = get_min_amount(ex, symbol)
-        if min_amt > 0 and qty < min_amt:
-            print(f"Calculated order size {qty} is below exchange minimum {min_amt} for {symbol}; skipping trade.")
-            return
-
-        if qty <= 0:
-            print("Calculated order size is zero after precision rounding.")
-            return
+        # Get quote increment from product, to floor quote_size (e.g. 0.01 USDC)
         try:
-            ex.set_leverage(1, symbol)
+            product = client.get_product(product_id)
+            quote_inc = float(product.get("quote_increment") or 0.01)
         except Exception:
-            pass
-        px = price_to_precision(ex, symbol, last_close)
-        print(f"Opening {('LONG' if side=='buy' else 'SHORT')} (futures/swap) — "
-              f"MARKET {side.upper()} {symbol} qty={qty} (px≈{px})")
+            quote_inc = 0.01
 
-        # Entry order
-        order = ex.create_order(symbol, "market", side, qty, None, {"reduceOnly": False})
-        oid = order.get("id") or order.get("orderId") or order
-        print(f"Order placed: {oid}")
+        def _floor_to_increment(value: float, inc: float) -> float:
+            if inc <= 0:
+                return float(value)
+            steps = math.floor(value / inc)
+            return float(f"{steps * inc:.12f}")
 
-        # Attach TP/SL as reduce-only orders
-        try:
-            entry_price = float(order.get("average") or order.get("price") or last_close)
+        quote_size = _floor_to_increment(usd_to_use, quote_inc)
 
-            tp_order_id = None
-            sl_order_id = None
+        if quote_size <= 0:
+            print("Calculated quote_size is zero after rounding; skipping trade.")
+            return
 
-            if side == "buy":
-                # LONG: TP above, SL below
-                if tp_pct is not None and tp_pct > 0:
-                    tp_price = price_to_precision(ex, symbol, entry_price * (1.0 + tp_pct))
-                    tp = ex.create_order(
-                        symbol,
-                        "limit",
-                        "sell",
-                        qty,
-                        tp_price,
-                        {
-                            "reduceOnly": True,
-                            "takeProfitPrice": float(tp_price),
-                        },
-                    )
-                    tp_order_id = tp.get("id") or tp.get("orderId") or tp
+        print(
+            f"[DEBUG] CB_USDC_bal={quote_bal_usdc:.4f} usd_to_use={usd_to_use:.4f} "
+            f"qty≈{qty_approx:.6f} notional≈{quote_size:.4f}"
+        )
 
-                # if sl_pct is not None and sl_pct > 0:
-                #     sl_price = price_to_precision(ex, symbol, entry_price * (1.0 - sl_pct))
-                #     sl = ex.create_order(
-                #         symbol,
-                #         "market",
-                #         "sell",
-                #         qty,
-                #         None,
-                #         {
-                #             "reduceOnly": True,
-                #             "stopLossPrice": float(sl_price),
-                #         },
-                #     )
-                #     sl_order_id = sl.get("id") or sl.get("orderId") or sl
+        client_order_id = str(uuid.uuid4())
+        side_str = "BUY" if take_long else "SELL"
 
-            else:
-                # SHORT: TP below, SL above
-                if tp_pct is not None and tp_pct > 0:
-                    tp_price = price_to_precision(ex, symbol, entry_price * (1.0 - tp_pct))
-                    tp = ex.create_order(
-                        symbol,
-                        "limit",
-                        "buy",
-                        qty,
-                        tp_price,
-                        {
-                            "reduceOnly": True,
-                            "takeProfitPrice": float(tp_price),
-                        },
-                    )
-                    tp_order_id = tp.get("id") or tp.get("orderId") or tp
+        if take_long:
+            print(
+                f"Opening LONG (Coinbase perps) — MARKET BUY {product_id} "
+                f"quote_size={quote_size:.2f} (px≈{last_close:.2f})"
+            )
+            order = client.market_order_buy(
+                client_order_id=client_order_id,
+                product_id=product_id,
+                quote_size=str(quote_size)
+            )
+        else:
+            print(
+                f"Opening SHORT (Coinbase perps) — MARKET SELL {product_id} "
+                f"quote_size={quote_size:.2f} (px≈{last_close:.2f})"
+            )
+            order = client.market_order_sell(
+                client_order_id=client_order_id,
+                product_id=product_id,
+                quote_size=str(quote_size)
+            )
 
-                # if sl_pct is not None and sl_pct > 0:
-                #     sl_price = price_to_precision(ex, symbol, entry_price * (1.0 + sl_pct))
-                #     sl = ex.create_order(
-                #         symbol,
-                #         "market",
-                #         "buy",
-                #         qty,
-                #         None,
-                #         {
-                #             "reduceOnly": True,
-                #             "stopLossPrice": float(sl_price),
-                #         },
-                #     )
-                #     sl_order_id = sl.get("id") or sl.get("orderId") or sl
-
-            if tp_order_id or sl_order_id:
-                parts = []
-                if tp_order_id:
-                    parts.append(f"TP[id={tp_order_id!r}, px={tp_price}]")
-                if sl_order_id:
-                    parts.append(f"SL[id={sl_order_id!r}, px={sl_price}]")
-                print("Attached TP/SL orders — " + ", ".join(parts))
-
-        except Exception as e:
-            print(f"[WARN] failed to attach TP/SL orders: {e}")
-
-        # Guard file: one action per bar across brokers
-        write_last_executed(guard_path, last_close_ms)
+        # Coinbase SDK returns dict with 'success' / 'success_response' / 'error_response'
+        if isinstance(order, dict) and order.get("success"):
+            oid = (order.get("success_response") or {}).get("order_id")
+            print(f"Coinbase order placed: {oid or order}")
+            # NOTE: TP/SL are handled by the script logic above; we are not
+            # attaching exchange-side brackets here yet.
+            write_last_executed(guard_path, last_close_ms)
+        else:
+            print(f"[ERROR] Coinbase order response: {order!r}")
 
     except Exception as e:
-        print(f"[ERROR] order failed: {e}")
+        print(f"[ERROR] Coinbase order failed: {e}")
 
+# =========================
+# CLI
+# =========================
 def parse_args():
     ap = argparse.ArgumentParser(
-        description=(
-            "Run LSTM bundle; Coinbase FUTURES (swap) orders on fresh signal within "
-            "6 minutes — bars read from a JSON file."
-        )
+        description="Run LSTM bundle; Bybit FUTURES (swap, unified) orders on fresh signal within 6 minutes — bars read from a JSON file."
     )
     ap.add_argument("--model-dir", required=True, help="Folder with model.pt, preprocess.json, meta.json")
     ap.add_argument("--bars-json", required=True, help="Path to JSON file containing OHLCV bars (closed bars)")
     ap.add_argument("--ticker", default=None, help="Override ticker (otherwise meta.json or BTCUSDT)")
     ap.add_argument("--timeframe", default=None, help="Override timeframe (otherwise meta.json or 1h)")
-    ap.add_argument("--auto-transfer", action="store_true", help="Auto-transfer USDT spot→swap before opening futures")
-    ap.add_argument("--transfer-buffer", type=float,  default=0.01,   help="Extra fraction to transfer (e.g., 0.01=+1%)")
-    ap.add_argument("--reversal",  choices=["close", "flip", "cooldown"],     default="close",     help="How to react on opposite signal: close (default), flip, cooldown" )
-    ap.add_argument("--cooldown-seconds",    type=int, default=0,   help="Cooldown duration when --reversal=cooldown")
+    ap.add_argument("--auto-transfer", action="store_true", help="Try to top up USDT margin for swap if balance is low")
+    ap.add_argument("--transfer-buffer", type=float, default=0.01, help="Extra fraction to transfer (e.g., 0.01=+1%)")
+    ap.add_argument("--reversal", choices=["close","flip","cooldown"], default="close",
+                    help="How to react on opposite signal: close (default), flip, cooldown")
+    ap.add_argument("--cooldown-seconds", type=int, default=0, help="Cooldown duration when --reversal=cooldown")
     ap.add_argument("--debug", action="store_true", help="Verbose debug logs")
-    ap.add_argument("--pub_key", default=None, help="Name of the API key variable in ~/.ssh/coinex_keys.env" )
-    ap.add_argument("--sec_key", default=None,  help="Name of the API secret variable in ~/.ssh/coinex_keys.env")
-    return ap.parse_args()
 
+    ap.add_argument("--pub_key", default=None, help="Name of API key var (e.g., API_KEY_BYBIT)")
+    ap.add_argument("--sec_key", default=None, help="Name of API secret var (e.g., API_SECRET_BYBIT)")
+    ap.add_argument("--keys-file", default=None, help="Env file path with KEY=VALUE pairs (default ~/.ssh/coinex_keys.env)")
+    return ap.parse_args()
 
 def main():
     args = parse_args()
     decide_and_maybe_trade(args)
-
 
 if __name__ == "__main__":
     main()
