@@ -13,9 +13,9 @@ echo "==============================================="
 cd "$WORKDIR"
 
 # Always update 30m files
-python3 update_bybit_json.py --json-file /home/production/tmp/ETHUSDT_30m_2y.json --symbol ETH/USDT:USDT --timeframe 30m
-python3 update_bybit_json.py --json-file /home/production/tmp/ETHUSDC_30m_2y.json --symbol ETH/USDC:USDC --timeframe 30m
-python3 update_bybit_json.py --json-file /home/production/tmp/BTCUSDT_30m_2y.json --symbol BTC/USDT:USDT --timeframe 30m
+python3 update_bybit_json.py --json-file /home/production/tmp/ETHUSDT_30m_6m.json --symbol ETH/USDT:USDT --timeframe 30m
+python3 update_bybit_json.py --json-file /home/production/tmp/ETHUSDC_30m_6m.json --symbol ETH/USDC:USDC --timeframe 30m
+python3 update_bybit_json.py --json-file /home/production/tmp/BTCUSDT_30m_6m.json --symbol BTC/USDT:USDT --timeframe 30m
 
 # Run 1h updates only near full hour
 MINUTE=$(date +%M)
@@ -23,8 +23,8 @@ echo "Current minute: $MINUTE"
 
 if [ "$MINUTE" -le 2 ]; then
     echo "Top of hour detected — running 1h updates."
-    python3 update_bybit_json.py --json-file /home/production/tmp/ETHUSDT_1h_2y.json --symbol ETH/USDT:USDT --timeframe 1h
-    python3 update_bybit_json.py --json-file /home/production/tmp/BTCUSDT_1h_2y.json --symbol BTC/USDT:USDT --timeframe 1h
+    python3 update_bybit_json.py --json-file /home/production/tmp/ETHUSDT_1h_6m.json --symbol ETH/USDT:USDT --timeframe 1h
+    python3 update_bybit_json.py --json-file /home/production/tmp/BTCUSDT_1h_6m.json --symbol BTC/USDT:USDT --timeframe 1h
 else
     echo "Not top of hour — skipping 1h updates."
 fi
@@ -39,25 +39,25 @@ echo "log file  : $LOG_FILE"
 echo "==============================================="
 
 echo "Coinex ETH 30m script"
-python3 $WORKDIR/lstm_sat_coinex.py  --model-dir "$WORKDIR/lstm/eth_lstm_30m_2025/"   --bars-json "/home/production/tmp/ETHUSDT_30m_2y.json" --ticker ETHUSDT --timeframe 30m --pub_key API_KEY_ETH --sec_key API_SECRET_ETH --debug
+python3 $WORKDIR/lstm_sat_coinex.py  --model-dir "$WORKDIR/lstm/eth_lstm_30m_2025/"   --bars-json "/home/production/tmp/ETHUSDT_30m_6m.json" --ticker ETHUSDT --timeframe 30m --pub_key API_KEY_ETH --sec_key API_SECRET_ETH --debug
 
 echo
 echo "Bybit SAT BTC 30M"
-python3 $WORKDIR/lstm_sat_bybit.py  --model-dir "$WORKDIR/lstm/btc_lstm_30m_2025/"  --bars-json "/home/production/tmp/BTCUSDT_30m_2y.json" --ticker BTCUSDT --timeframe 30m  --pub_key API_BYBIT_SAT --sec_key API_BYBIT_SECRET_SAT --debug
+python3 $WORKDIR/lstm_sat_bybit.py  --model-dir "$WORKDIR/lstm/btc_lstm_30m_2025/"  --bars-json "/home/production/tmp/BTCUSDT_30m_6m.json" --ticker BTCUSDT --timeframe 30m  --pub_key API_BYBIT_SAT --sec_key API_BYBIT_SECRET_SAT --debug
 
-echo
-echo "COINBASE SAT ETH 30M"
-python3 $WORKDIR/lstm_sat_coinbase.py  --model-dir "$WORKDIR/lstm/ethusdc_lstm_30m/"  --bars-json "/home/production/tmp/ETHUSDC_30m_2y.json" --ticker ETHUSDC --timeframe 30m  --pub_key API_COINBASE_SAT --sec_key API_COINBASE_SECRET_SAT --debug
+#echo
+#echo "COINBASE SAT ETH 30M"
+#python3 $WORKDIR/lstm_sat_coinbase.py  --model-dir "$WORKDIR/lstm/ethusdc_lstm_30m/"  --bars-json "/home/production/tmp/ETHUSDC_30m_6m.json" --ticker ETHUSDC --timeframe 30m  --pub_key API_COINBASE_SAT --sec_key API_COINBASE_SECRET_SAT --debug
 
 
 if [ "$MINUTE" -le 2 ]; then
 	echo 
 	echo "Coinex BTC 1h script"
-	python3 $WORKDIR/lstm_sat_coinex.py  --model-dir "$WORKDIR/lstm/btc_lstm_1h_2025/"   --bars-json "/home/production/tmp/BTCUSDT_1h_2y.json" --ticker BTCUSDT --timeframe 1h  --pub_key API_KEY --sec_key API_SECRET --debug
+	python3 $WORKDIR/lstm_sat_coinex.py  --model-dir "$WORKDIR/lstm/btc_lstm_1h_2025/"   --bars-json "/home/production/tmp/BTCUSDT_1h_6m.json" --ticker BTCUSDT --timeframe 1h  --pub_key API_KEY --sec_key API_SECRET --debug
 
 	echo
 	echo "Bybit ETH 1h - Conta: BTC 4h"
-	python3 $WORKDIR/lstm_sat_bybit.py  --model-dir "$WORKDIR/lstm/eth_lstm_1h_2025/"  --bars-json "/home/production/tmp/ETHUSDT_1h_2y.json" --ticker ETHUSDT --timeframe 1h  --pub_key API_BYBIT_BTC --sec_key API_BYBIT_SECRET_BTC --debug
+	python3 $WORKDIR/lstm_sat_bybit.py  --model-dir "$WORKDIR/lstm/eth_lstm_1h_2025/"  --bars-json "/home/production/tmp/ETHUSDT_1h_6m.json" --ticker ETHUSDT --timeframe 1h  --pub_key API_BYBIT_BTC --sec_key API_BYBIT_SECRET_BTC --debug
 else
     echo "Not running 1 hour scripts."
 fi
