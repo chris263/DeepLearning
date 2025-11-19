@@ -57,9 +57,9 @@ if [ "$MINUTE" -le 2 ]; then
 	echo "Bybit ETH 1h - Conta: BTC 4h"
 	python3 $WORKDIR/lstm_sat_bybit.py  --model-dir "$WORKDIR/lstm/eth_lstm_1h_2025/"  --bars-json "/home/production/tmp/ETHUSDT_1h_6m.json" --ticker ETHUSDT --timeframe 1h  --pub_key API_BYBIT_BTC --sec_key API_BYBIT_SECRET_BTC --debug
     
-    #echo
+    echo
     echo "COINBASE SAT BTCUSDC 1h"
-    python3 $WORKDIR/lstm_sat_coinbase.py  --model-dir "$WORKDIR/lstm/btcusdc_lstm_1h/"  --bars-json "/home/production/tmp/BTCUSDC_1h_6m.json" --ticker BTCUSDC --timeframe 1h --pub_key API_COINBASE_SAT --sec_key API_COINBASE_SECRET_SAT --debug
+    python3 $WORKDIR/lstm_sat_coinbase.py  --model-dir "$WORKDIR/lstm/btc_lstm_1h_2025/"  --bars-json "/home/production/tmp/BTCUSDT_1h_6m.json" --ticker BTCUSDC --timeframe 1h --pub_key API_COINBASE_SAT --sec_key API_COINBASE_SECRET_SAT --debug
 
 else
     echo "Not running 1 hour scripts."

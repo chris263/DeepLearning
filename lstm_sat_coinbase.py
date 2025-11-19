@@ -466,32 +466,39 @@ def make_exchange(pub_key_name: Optional[str],
 
     return api_key, api_secret
 
-
-def make_coinbase_client(pub_key_name: Optional[str],
-                         sec_key_name: Optional[str]) -> RESTClient:
-    """
-    Convenience wrapper:
-      - loads key/secret from file
-      - builds RESTClient
-      - does a small get_accounts() sanity check
-    """
+def make_coinbase_client(pub_key_name: str, sec_key_name: str) -> RESTClient:
     api_key, api_secret = make_exchange(pub_key_name, sec_key_name)
     client = RESTClient(api_key=api_key, api_secret=api_secret)
 
-    # quick connection check (you already saw this pattern working)
+    # --- NEW: verify connection using CFM balance_summary (futures) ---
     try:
-        resp = client.get_accounts()
-        first = resp.accounts[0]
-        # available_balance is a dict: {'value': '123.45', 'currency': 'USDC'}
-        avail_val = first.available_balance['value']
-        avail_cur = first.available_balance['currency']
-        print(f"[OK] Coinbase connection verified. "
-              f"First account: {first.currency}, available={avail_val} {avail_cur}")
+        raw = client.get("/api/v3/brokerage/cfm/balance_summary")
+
+        # normalize to dict
+        if hasattr(raw, "to_dict"):
+            data = raw.to_dict()
+        elif isinstance(raw, dict):
+            data = raw
+        else:
+            data = {}
+
+        bs = data.get("balance_summary") or {}
+        fb = bs.get("futures_buying_power") or {}
+        am = bs.get("available_margin") or {}
+
+        val = fb.get("value") or am.get("value") or "0"
+        cur = fb.get("currency") or am.get("currency") or "USD"
+
+        print(
+            "[OK] Coinbase connection verified. "
+            f"Futures buying power (CFM) = {val} {cur}"
+        )
     except Exception as e:
-        print(f"[ERROR] Coinbase get_accounts() sanity check failed: {e}")
+        print(f"[ERROR] Coinbase CFM balance_summary sanity check failed: {e}")
         raise
 
     return client
+
 
 
 
