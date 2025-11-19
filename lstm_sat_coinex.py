@@ -814,7 +814,7 @@ def decide_and_maybe_trade(args):
     # 9) Fresh-cross trigger logic
     if timeframe == '30m':
         take_long = (p_last >= pos_thr) and (p_prev < p_last) and (p_prev <= pos_thr)  ## Including fresh cross
-        take_short = (p_last <= neg_thr) and (p_prev > p_last) and (p_pre >= neg_thr)
+        take_short = (p_last <= neg_thr) and (p_prev > p_last) and (p_prev >= neg_thr)
     else:
         take_long = (p_last >= pos_thr) and (p_prev < p_last)
         take_short = (p_last <= neg_thr) and (p_prev > p_last)
