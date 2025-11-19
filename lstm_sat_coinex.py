@@ -678,6 +678,46 @@ def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: floa
         f"fresh-cross rules for LONG (p_prev<pos_thr≤p_last) or SHORT (p_prev>neg_thr≥p_last)."
     )
 
+## SL Protection
+def _sl_guard_file(guard_path: str) -> str:
+    # store per-script SL info right next to the normal guard file
+    return guard_path + ".sl_guard.json"
+
+def load_sl_guard(guard_path: str) -> dict:
+    path = _sl_guard_file(guard_path)
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+            if not isinstance(data, dict):
+                return {"active": False, "neutral_seen": False}
+            return {
+                "active": bool(data.get("active", False)),
+                "neutral_seen": bool(data.get("neutral_seen", False)),
+                "sl_ts": data.get("sl_ts"),
+                "sl_side": data.get("sl_side"),
+            }
+    except Exception:
+        return {"active": False, "neutral_seen": False}
+
+def save_sl_guard(guard_path: str, data: dict) -> None:
+    path = _sl_guard_file(guard_path)
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"[WARN] Could not write SL guard file {path}: {e}")
+
+def activate_sl_guard(guard_path: str, sl_ts: int, sl_side: str) -> None:
+    data = {
+        "active": True,
+        "neutral_seen": False,  # will be set True once we see neutral zone
+        "sl_ts": int(sl_ts),
+        "sl_side": str(sl_side),
+    }
+    save_sl_guard(guard_path, data)
+    print(f"[SL-GUARD] Activated after SL: side={sl_side}, sl_ts={sl_ts}")
+
+
 
 # =========================
 # Core flow
@@ -787,6 +827,22 @@ def decide_and_maybe_trade(args):
 
     in_neutral = (neg_thr < p_last < pos_thr)
 
+    # --- SL GUARD: block immediate re-entry after a Stop Loss ---
+    sl_guard = load_sl_guard(guard_path)
+    sl_active = bool(sl_guard.get("active"))
+    sl_neutral_seen = bool(sl_guard.get("neutral_seen"))
+
+    # If we already took an SL and now the probabilities are in the neutral band,
+    # mark that as "neutral crossed" and allow future entries.
+    if sl_active and in_neutral and not sl_neutral_seen:
+        sl_guard["neutral_seen"] = True
+        sl_neutral_seen = True
+        save_sl_guard(guard_path, sl_guard)
+        print("[SL-GUARD] Neutral zone touched after last SL — "
+              "new trades will be allowed on the next fresh-cross.")
+
+
+
     if pos is not None and pos.get("side"):
         # WE HAVE AN OPEN POSITION ON EXCHANGE ----
         side_open_raw = pos.get("side")
@@ -821,9 +877,15 @@ def decide_and_maybe_trade(args):
                         ex.create_order(symbol, "market", "sell", close_qty, None, {"reduceOnly": True})
                         print(f"{reason} hit — closing existing LONG at ~{(sl_px if hit_sl else tp_px):.8g}")
                         write_last_executed(guard_path, last_close_ms)
+
+                        # >>> NEW: if this was a Stop Loss, activate the SL guard
+                        if reason == "SL":
+                            activate_sl_guard(guard_path, last_close_ms, side_open="long")
+
                     except Exception as e:
                         print(f"[ERROR] close LONG on {reason} failed: {e}")
                     return
+
 
                 # Signal exit: leave LONG zone (neutral or short)
                 if p_last < pos_thr:
@@ -838,6 +900,7 @@ def decide_and_maybe_trade(args):
                     except Exception as e:
                         print(f"[ERROR] close LONG (SIG) failed: {e}")
                     return
+
             elif side_open == "short":
                 # SHORT SL/TP prices
                 sl_px = entry * (1.0 + (sl_pct or 0.0)) if sl_pct is not None else None
@@ -852,6 +915,11 @@ def decide_and_maybe_trade(args):
                         ex.create_order(symbol, "market", "buy", close_qty, None, {"reduceOnly": True})
                         print(f"{reason} hit — closing existing SHORT at ~{(sl_px if hit_sl else tp_px):.8g}")
                         write_last_executed(guard_path, last_close_ms)
+
+                        # >>> NEW: activate SL guard on Stop Loss
+                        if reason == "SL":
+                            activate_sl_guard(guard_path, last_close_ms, side_open="short")
+
                     except Exception as e:
                         print(f"[ERROR] close SHORT on {reason} failed: {e}")
                     return
@@ -880,11 +948,28 @@ def decide_and_maybe_trade(args):
             )
             return
 
-    # 12) Flat & no fresh signal → explanation only
+    # 12) Flat logic (+ SL guard after Stop Loss)
+    # If an SL just happened and we have NOT yet seen the neutral zone,
+    # we block any fresh-cross entry (both long and short).
+    if sl_active and not sl_neutral_seen:
+        if take_long or take_short:
+            print(
+                "[SL-GUARD] Fresh signal blocked after SL — waiting for probabilities "
+                "to pass through the neutral band (neg_thr < p < pos_thr). "
+                f"p_prev={p_prev:.3f}, p_last={p_last:.3f}, "
+                f"pos_thr={pos_thr:.3f}, neg_thr={neg_thr:.3f}"
+            )
+        else:
+            msg = _explain_no_open(p_prev, p_last, pos_thr, neg_thr)
+            print(msg)
+        return
+
+    # If we get here, either no SL guard is active or we've already seen neutral.
     if not (take_long or take_short):
         msg = _explain_no_open(p_prev, p_last, pos_thr, neg_thr)
         print(msg)
         return
+
 
     # 13) OPEN order — balance-based sizing, now with attached TP/SL on exchange
     try:
@@ -917,6 +1002,11 @@ def decide_and_maybe_trade(args):
         order = ex.create_order(symbol, "market", side, qty, None, {"reduceOnly": False})
         oid = order.get("id") or order.get("orderId") or order
         print(f"Order placed: {oid}")
+
+        # Reset SL guard because we are taking a new trade
+        if sl_active:
+            save_sl_guard(guard_path, {"active": False, "neutral_seen": False})
+            print("[SL-GUARD] Reset after new position opening.")
 
         # Attach TP/SL as reduce-only orders
         try:
