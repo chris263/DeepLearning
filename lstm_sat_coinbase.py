@@ -562,57 +562,76 @@ def resolve_symbol(ex, ticker: str) -> str:
     # Fallback: assume USDC quote
     return f"{t_clean}-USDC"
 
-def fetch_usdc_balance_swap(ex: RESTClient) -> float:
+def fetch_usdc_balance_swap(ex) -> float:
     """
-    Coinbase version:
-      - `ex` is a RESTClient
-      - we simply sum available USDC across all accounts this key can see
-      - no swap/transfer logic at all
+    Coinbase Perpetuals balance:
+
+    - Find the INTX (perpetuals) portfolio UUID.
+    - Call /api/v3/brokerage/intx/portfolio/{portfolio_uuid}.
+    - Use the portfolio's total_balance or collateral as the USDC-equivalent equity
+      to size positions.
+
+    Returns a float in USDC.
     """
     try:
-        total = 0.0
-        cursor = None
+        portfolio_uuid = _get_intx_portfolio_uuid(ex)
+        if not portfolio_uuid:
+            print("[WARN] No INTX (perpetuals) portfolio found; returning 0 balance.")
+            return 0.0
 
-        while True:
-            if cursor:
-                resp = ex.get_accounts(cursor=cursor)
-            else:
-                resp = ex.get_accounts()
+        # Per docs: GET /api/v3/brokerage/intx/portfolio/{portfolio_uuid}
+        resp = ex.get(f"/api/v3/brokerage/intx/portfolio/{portfolio_uuid}")
 
-            accounts = getattr(resp, "accounts", []) or []
+        # Normalize to dict
+        if not isinstance(resp, dict) and hasattr(resp, "to_dict"):
+            data = resp.to_dict()
+        elif isinstance(resp, dict):
+            data = resp
+        else:
+            data = {}
 
-            for acct in accounts:
-                # Handle both dataclass-like objects and plain dicts
-                if isinstance(acct, dict):
-                    cur = acct.get("currency")
-                    ab = acct.get("available_balance", {})
-                    val = ab.get("value")
-                else:
-                    cur = getattr(acct, "currency", None)
-                    ab = getattr(acct, "available_balance", None)
-                    if isinstance(ab, dict):
-                        val = ab.get("value")
+        # Prefer summary.total_balance.value (overall equity in USDC)
+        summary = data.get("summary") or {}
+        tb = summary.get("total_balance") or {}
+        val = tb.get("value")
+
+        # Fallback: first portfolio.collateral or portfolio.total_balance.value
+        if val is None:
+            portfolios = data.get("portfolios") or []
+            if portfolios:
+                pf0 = portfolios[0]
+                if isinstance(pf0, dict):
+                    collateral = pf0.get("collateral")
+                    if collateral is not None:
+                        val = collateral
                     else:
-                        val = getattr(ab, "value", None) if ab is not None else None
+                        tb0 = pf0.get("total_balance") or {}
+                        val = tb0.get("value")
+                else:
+                    collateral = getattr(pf0, "collateral", None)
+                    if collateral is not None:
+                        val = collateral
+                    else:
+                        tb0 = getattr(pf0, "total_balance", None)
+                        if isinstance(tb0, dict):
+                            val = tb0.get("value")
+                        elif tb0 is not None:
+                            val = getattr(tb0, "value", None)
 
-                if cur == "USDC" and val is not None:
-                    try:
-                        total += float(val)
-                    except (TypeError, ValueError):
-                        pass
+        if val is None:
+            print("[WARN] fetch_usdc_balance_swap: no usable balance field found in INTX summary.")
+            return 0.0
 
-            has_next = getattr(resp, "has_next", False)
-            cursor = getattr(resp, "cursor", None)
-            if not has_next or not cursor:
-                break
-
-        return total
+        bal = float(val)
+        if bal < 0:
+            bal = 0.0
+        return bal
 
     except Exception as e:
-        print(f"[WARN] Failed to fetch USDC balance from Coinbase: {e}")
+        print(f"[WARN] Failed to fetch INTX (perpetuals) USDC balance from Coinbase: {e}")
         return 0.0
 
-import os
+
 import math
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -684,6 +703,47 @@ def safe_close_amount(ex, symbol: str, position_size: float) -> float:
     if qty <= 0:
         return 0.0
     return qty
+
+def _get_intx_portfolio_uuid(ex) -> Optional[str]:
+    """
+    Resolve the INTX (perpetuals) portfolio UUID for this key.
+
+    Priority:
+      1) COINBASE_INTX_PORTFOLIO_UUID env var (if you set it manually)
+      2) Scan get_portfolios() for type == 'INTX'
+    """
+    portfolio_uuid = os.environ.get("COINBASE_INTX_PORTFOLIO_UUID")
+    if portfolio_uuid:
+        return portfolio_uuid
+
+    try:
+        resp = ex.get_portfolios()
+        portfolios = None
+        if hasattr(resp, "portfolios"):
+            portfolios = resp.portfolios
+        elif isinstance(resp, dict):
+            portfolios = resp.get("portfolios", [])
+        else:
+            portfolios = []
+
+        if not portfolios:
+            return None
+
+        for pf in portfolios:
+            if isinstance(pf, dict):
+                pf_type = pf.get("type") or ""
+                pf_uuid = pf.get("uuid")
+            else:
+                pf_type = getattr(pf, "type", "") or ""
+                pf_uuid = getattr(pf, "uuid", None)
+
+            if pf_uuid and pf_type == "INTX":
+                return pf_uuid
+
+    except Exception as e:
+        print(f"[WARN] _get_intx_portfolio_uuid: failed to list portfolios: {e}")
+
+    return None
 
 
 def get_swap_position(ex, symbol: str) -> Optional[Dict]:
@@ -1103,7 +1163,7 @@ def decide_and_maybe_trade(args):
 
         # LONG ~97% of free balance, SHORT ~77%
         risk_long  = 0.97
-        risk_short = 0.77
+        risk_short = 0.80
 
         usd_to_use = (
             quote_bal_usdc * (risk_long if take_long else risk_short)
@@ -1183,7 +1243,7 @@ def decide_and_maybe_trade(args):
 # =========================
 def parse_args():
     ap = argparse.ArgumentParser(
-        description="Run LSTM bundle; Bybit FUTURES (swap, unified) orders on fresh signal within 6 minutes — bars read from a JSON file."
+        description="Run LSTM bundle; Coinbase FUTURES (swap, unified) orders on fresh signal within 6 minutes — bars read from a JSON file."
     )
     ap.add_argument("--model-dir", required=True, help="Folder with model.pt, preprocess.json, meta.json")
     ap.add_argument("--bars-json", required=True, help="Path to JSON file containing OHLCV bars (closed bars)")

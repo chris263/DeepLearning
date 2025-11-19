@@ -14,7 +14,7 @@ cd "$WORKDIR"
 
 # Always update 30m files
 python3 update_bybit_json.py --json-file /home/production/tmp/ETHUSDT_30m_6m.json --symbol ETH/USDT:USDT --timeframe 30m
-python3 update_bybit_json.py --json-file /home/production/tmp/ETHUSDC_30m_6m.json --symbol ETH/USDC:USDC --timeframe 30m
+# python3 update_bybit_json.py --json-file /home/production/tmp/ETHUSDC_30m_6m.json --symbol ETH/USDC:USDC --timeframe 30m
 python3 update_bybit_json.py --json-file /home/production/tmp/BTCUSDT_30m_6m.json --symbol BTC/USDT:USDT --timeframe 30m
 
 # Run 1h updates only near full hour
@@ -25,6 +25,7 @@ if [ "$MINUTE" -le 2 ]; then
     echo "Top of hour detected — running 1h updates."
     python3 update_bybit_json.py --json-file /home/production/tmp/ETHUSDT_1h_6m.json --symbol ETH/USDT:USDT --timeframe 1h
     python3 update_bybit_json.py --json-file /home/production/tmp/BTCUSDT_1h_6m.json --symbol BTC/USDT:USDT --timeframe 1h
+    python3 update_bybit_json.py --json-file /home/production/tmp/BTCUSDC_1h_6m.json --symbol ETH/USDC:USDC --timeframe 1h
 else
     echo "Not top of hour — skipping 1h updates."
 fi
