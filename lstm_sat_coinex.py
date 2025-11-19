@@ -265,7 +265,7 @@ def load_bundle(model_dir: str):
     feature_names = meta.get("features") or meta.get("feature_names")
     if not feature_names:
         raise SystemExit("meta.json missing 'features' list")
-
+    
     lookback = int(meta.get("lookback") or meta.get("window") or 64)
     pos_thr = float(meta.get("pos_thr", 0.55))
     neg_thr = float(meta.get("neg_thr", 0.45))
@@ -812,8 +812,12 @@ def decide_and_maybe_trade(args):
         return
 
     # 9) Fresh-cross trigger logic
-    take_long = (p_last >= pos_thr) and (p_prev < p_last)
-    take_short = (p_last <= neg_thr) and (p_prev > p_last)
+    if timeframe == '30m':
+        take_long = (p_last >= pos_thr) and (p_prev < p_last) and (p_prev <= pos_thr)  ## Including fresh cross
+        take_short = (p_last <= neg_thr) and (p_prev > p_last) and (p_pre >= neg_thr)
+    else:
+        take_long = (p_last >= pos_thr) and (p_prev < p_last)
+        take_short = (p_last <= neg_thr) and (p_prev > p_last)
 
     # 10) Exchange (swap only)
     ex = make_exchange(args.pub_key, args.sec_key)
@@ -867,8 +871,9 @@ def decide_and_maybe_trade(args):
                 # LONG SL/TP prices
                 sl_px = entry * (1.0 - (sl_pct or 0.0)) if sl_pct is not None else None
                 tp_px = entry * (1.0 + (tp_pct or 0.0)) if tp_pct is not None else None
-                hit_sl = (sl_px is not None) and (last_low <= sl_px)
-                hit_tp = (tp_px is not None) and (last_high >= tp_px)
+                hit_sl = (sl_px is not None) and (last_close <= sl_px)
+                hit_tp = (tp_px is not None) and (last_close >= tp_px)
+
 
                 # SL/TP first
                 if hit_sl or hit_tp:
@@ -905,8 +910,8 @@ def decide_and_maybe_trade(args):
                 # SHORT SL/TP prices
                 sl_px = entry * (1.0 + (sl_pct or 0.0)) if sl_pct is not None else None
                 tp_px = entry * (1.0 - (tp_pct or 0.0)) if tp_pct is not None else None
-                hit_sl = (sl_px is not None) and (last_high >= sl_px)
-                hit_tp = (tp_px is not None) and (last_low <= tp_px)
+                hit_sl = (sl_px is not None) and (last_close >= sl_px)
+                hit_tp = (tp_px is not None) and (last_close <= tp_px)
 
                 # SL/TP first
                 if hit_sl or hit_tp:
@@ -1014,6 +1019,7 @@ def decide_and_maybe_trade(args):
 
             tp_order_id = None
             sl_order_id = None
+            sl_pct_broker = 0.03 ## 3% broker
 
             if side == "buy":
                 # LONG: TP above, SL below
@@ -1032,8 +1038,8 @@ def decide_and_maybe_trade(args):
                     )
                     tp_order_id = tp.get("id") or tp.get("orderId") or tp
 
-                if sl_pct is not None and sl_pct > 0:
-                    sl_price = price_to_precision(ex, symbol, entry_price * (1.0 - sl_pct))
+                if sl_pct_broker is not None and sl_pct_broker > 0:
+                    sl_price = price_to_precision(ex, symbol, entry_price * (1.0 - sl_pct_broker))
                     sl = ex.create_order(
                         symbol,
                         "market",
@@ -1064,8 +1070,8 @@ def decide_and_maybe_trade(args):
                     )
                     tp_order_id = tp.get("id") or tp.get("orderId") or tp
 
-                if sl_pct is not None and sl_pct > 0:
-                    sl_price = price_to_precision(ex, symbol, entry_price * (1.0 + sl_pct))
+                if sl_pct_broker is not None and sl_pct_broker > 0:
+                    sl_price = price_to_precision(ex, symbol, entry_price * (1.0 + sl_pct_broker))
                     sl = ex.create_order(
                         symbol,
                         "market",
