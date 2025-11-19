@@ -958,6 +958,17 @@ def decide_and_maybe_trade(args):
     client = make_coinbase_client(args.pub_key, args.sec_key)
     product_id = resolve_symbol(client, ticker)  # e.g. "BTC-USDC"
 
+    print(f"[INFO] Resolved ticker {TICKER} -> product_id={product_id}")
+
+    bal = fetch_usdc_balance_swap(client)
+    print(f"[INFO] Perps/futures balance used for sizing: {bal}")
+
+    pos = get_swap_position(client, product_id)
+    print(f"[INFO] Current position for {product_id}: {pos}")
+
+    print("No orders were sent. If balance > 0 and this didn’t error, "
+          "your Coinbase/CFM connection is working.")
+
     # 10) Position & SL/TP (+ signal exit on neutral)
     pos       = get_swap_position(client, product_id)  # your Coinbase version
     last_close= float(df["close"].iloc[-1])
