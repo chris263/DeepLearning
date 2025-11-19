@@ -20,6 +20,7 @@ import os, sys, json, time, argparse, pathlib, tempfile, math
 from typing import List, Dict, Tuple, Optional
 from coinbase.rest import RESTClient
 
+import uuid
 import numpy as np
 import pandas as pd
 
