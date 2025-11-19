@@ -885,7 +885,7 @@ def decide_and_maybe_trade(args):
 
                         # >>> NEW: if this was a Stop Loss, activate the SL guard
                         if reason == "SL":
-                            activate_sl_guard(guard_path, last_close_ms, side_open="long")
+                            activate_sl_guard(guard_path, last_close_ms, sl_side="long")
 
                     except Exception as e:
                         print(f"[ERROR] close LONG on {reason} failed: {e}")
@@ -923,7 +923,7 @@ def decide_and_maybe_trade(args):
 
                         # >>> NEW: activate SL guard on Stop Loss
                         if reason == "SL":
-                            activate_sl_guard(guard_path, last_close_ms, side_open="short")
+                            activate_sl_guard(guard_path, last_close_ms, sl_side="short")
 
                     except Exception as e:
                         print(f"[ERROR] close SHORT on {reason} failed: {e}")
