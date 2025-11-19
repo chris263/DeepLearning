@@ -799,68 +799,71 @@ def _get_cfm_balance_summary(ex) -> dict:
 
 
 def get_swap_position(ex, product_id: str) -> Optional[Dict]:
-    """
-    Coinbase US Derivatives (CFM) open position lookup.
-
-    We scan /api/v3/brokerage/cfm/positions and match on product_id.
-    `product_id` should be the futures product, e.g. 'BTC-USD' or
-    whatever you're actually trading.
-
-    Returns:
-        {"side": "long"/"short", "size": float_contracts, "entry": avg_entry_price}
-        or None if no open position.
-    """
-    # Normalize product ids: handle BTC-USDC vs BTC-USD aliases
-    targets = {product_id}
-    if product_id.endswith("-USDC"):
-        targets.add(product_id.replace("-USDC", "-USD"))
-    if product_id.endswith("-USD"):
-        targets.add(product_id.replace("-USD", "-USDC"))
-
-    try:
-        raw = ex.get("/api/v3/brokerage/cfm/positions")
-    except Exception as e:
-        print(f"[DEBUG] get_swap_position: CFM positions request failed: {e}")
-        return None
-
-    if hasattr(raw, "to_dict"):
-        raw = raw.to_dict()
-    if not isinstance(raw, dict):
-        print(f"[DEBUG] get_swap_position: unexpected positions payload {type(raw)}")
-        return None
-
-    positions = raw.get("positions") or []
-    if not positions:
-        print("[DEBUG] get_swap_position: no CFM futures positions returned.")
-        return None
+    raw = ex.get("/api/v3/brokerage/cfm/positions")
+    data = raw.to_dict() if hasattr(raw, "to_dict") else raw
+    positions = data.get("positions") or []
 
     for p in positions:
-        pid = p.get("product_id")
-        if pid not in targets:
+        if p.get("product_id") != product_id:
             continue
-
-        side_raw = (p.get("side") or "").lower()  # "long"/"short"
-        side = "long" if side_raw.startswith("long") else (
-               "short" if side_raw.startswith("short") else "")
-
-        try:
-            contracts = float(p.get("number_of_contracts") or 0.0)
-        except Exception:
-            contracts = 0.0
-
-        try:
-            entry = float(p.get("avg_entry_price") or 0.0)
-        except Exception:
-            entry = 0.0
-
+        side_raw = (p.get("side") or "").lower()
+        side = "long" if "long" in side_raw else ("short" if "short" in side_raw else "")
+        contracts = float(p.get("number_of_contracts") or 0.0)
+        entry = float(p.get("avg_entry_price") or 0.0)
         if contracts > 0 and side:
-            print(f"[DEBUG] get_swap_position: found CFM position pid={pid}, "
-                  f"side={side}, contracts={contracts}, entry={entry}")
             return {"side": side, "size": contracts, "entry": entry}
-
-    print(f"[DEBUG] get_swap_position: no CFM futures position found for {product_id}")
     return None
 
+
+def resolve_coinbase_perp_product_id(client, base: str = "BTC") -> str:
+    """
+    Resolve the Coinbase perpetual FUTURE product_id for a given base, e.g. 'BTC'.
+
+    Uses:
+      - product_type = FUTURE
+      - future_product_details.contract_expiry_type = PERPETUAL
+
+    Prefers product_venue == 'INTX' when multiple matches exist.
+    """
+    base_u = base.upper()
+
+    resp = client.get(
+        "/api/v3/brokerage/products",
+        params={
+            "product_type": "FUTURE",
+            "contract_expiry_type": "PERPETUAL",
+            "limit": 250,
+        },
+    )
+    products = resp.get("products", []) or []
+
+    candidates = []
+    for p in products:
+        fpd = p.get("future_product_details") or {}
+        contract_code = (fpd.get("contract_code") or "").upper()
+        root_unit     = (fpd.get("contract_root_unit") or "").upper()
+        base_id       = (p.get("base_currency_id") or "").upper()
+        disp_name     = (p.get("display_name") or "").upper()
+
+        # Match BTC by contract_code, root_unit, base_id or display_name prefix
+        if base_u not in {contract_code, root_unit, base_id} and not disp_name.startswith(base_u + " "):
+            continue
+
+        candidates.append(p)
+
+    if not candidates:
+        raise SystemExit(f"No perpetual FUTURE product found for base={base_u}")
+
+    # Prefer INTX venue if present
+    intx = [p for p in candidates if p.get("product_venue") == "INTX"]
+    chosen = intx[0] if intx else candidates[0]
+
+    pid = chosen["product_id"]
+    print(
+        f"[DEBUG] Resolved Coinbase perp product for base={base_u} -> "
+        f"{pid} (venue={chosen.get('product_venue')}, display_name={chosen.get('display_name')})"
+    )
+    return pid
 
 
 # =========================
@@ -1024,7 +1027,19 @@ def decide_and_maybe_trade(args):
 
     # 9) Coinbase client + product_id
     client = make_coinbase_client(args.pub_key, args.sec_key)
-    product_id = resolve_symbol(client, ticker)  # e.g. "BTC-USDC"
+
+    # Derive base symbol from model ticker (BTCUSDC, BTC/USDC, etc.)
+    raw_ticker = (ticker or "").upper()
+    base = raw_ticker.replace("/", "").replace(":", "")
+    for suf in ("USDC", "USDT", "USD"):
+        if base.endswith(suf):
+            base = base[: -len(suf)]
+            break
+    if not base:
+        base = "BTC"  # safe fallback
+
+    product_id = resolve_coinbase_perp_product_id(client, base=base)
+
 
     # 10) Position & SL/TP (+ signal exit on neutral)
     pos       = get_swap_position(client, product_id)  # your Coinbase version
@@ -1145,128 +1160,68 @@ def decide_and_maybe_trade(args):
 
     # 13) OPEN order — Coinbase futures/perps (CFM), balance-based sizing
     try:
-        cb_usdc_bal = fetch_usdc_balance_swap(client)  # this is using CFM futures_buying_power
+        # 13a) Get futures buying power (CFM)
+        cb_usdc_bal = fetch_usdc_balance_swap(client)  # uses /cfm/balance_summary
         if cb_usdc_bal <= 0:
             print("No USDC balance available on Coinbase futures/perps.")
             return
 
-        # --- sizing already done above ---
-        cb_usdc_bal = cb_futures_bal  # your futures_buying_power
-        usd_to_use = cb_usdc_bal * (risk_long if take_long else risk_short)
-        base_size = usd_to_use / max(1e-12, last_close)
-
-        print(
-            f"[DEBUG] CB_USDC_bal={cb_usdc_bal:.4f} "
-            f"usd_to_use={usd_to_use:.4f} "
-            f"base_size={base_size:.6f} "
-            f"notional≈{base_size * last_close:.4f}"
-        )
-
-        if base_size <= 0:
-            print("Calculated base size is zero; skipping Coinbase trade.")
-            return
-
-        side = "BUY" if take_long else "SELL"
-
-        print(
-            f"Opening {'LONG' if side=='BUY' else 'SHORT'} (Coinbase perps) — "
-            f"MARKET {side} {product_id} base_size={base_size:.6f} (px≈{last_close:.2f})"
-        )
-
-        try:
-            place_coinbase_perp_order(
-                client=client,
-                product_id=product_id,
-                side=side,
-                base_size=base_size,
-                last_close=last_close,
-            )
-            write_last_executed(guard_path, last_close_ms)
-        except Exception as e:
-            print(f"[ERROR] Coinbase order failed: {e}")
-        
-        # --- sizing already done above ---
-
-        # Same risk idea as before (you can tune)
+        # Risk fraction of buying power
         risk_long  = 0.80
         risk_short = 0.80
-
         usd_to_use = cb_usdc_bal * (risk_long if take_long else risk_short)
         if usd_to_use <= 0:
             print("Calculated usd_to_use is zero or negative; skipping trade.")
             return
 
+        # 13b) Price of last bar
         last_close = float(df["close"].iloc[-1])
 
-        # Optional: estimate base size from notional for logging
-        qty_approx = usd_to_use / max(1e-12, last_close)
-
-        if take_long:
-            # LONG: Coinbase lets us BUY using quote_size in USDC
-            # Round quote_size to 2 decimals (USDC has 2dp)
-            quote_size = math.floor(usd_to_use * 100.0) / 100.0
-            if quote_size <= 0:
-                print("Calculated quote_size is zero after rounding; skipping LONG.")
-                return
-
-            print(
-                f"[DEBUG] CB_USDC_bal={cb_usdc_bal:.4f} usd_to_use={usd_to_use:.4f} "
-                f"qty≈{qty_approx:.6f} notional≈{quote_size:.4f}"
-            )
-            print(
-                f"Opening LONG (Coinbase perps) — MARKET BUY {product_id} "
-                f"quote_size={quote_size:.2f} (px≈{last_close:.2f})"
-            )
-
-            client_order_id = f"sat-long-{int(time.time() * 1000)}"
-            order = client.market_order_buy(
-                client_order_id=client_order_id,
-                product_id=product_id,
-                quote_size=f"{quote_size:.2f}",
-                # leverage / margin_type are optional; you can set them if needed:
-                # leverage="1",
-                # margin_type="CROSS",
-            )
-
-        else:
-            # SHORT: Coinbase's market_order_sell() REQUIRES base_size (BTC), not quote_size.
-            # Convert USD notional -> BTC size and floor to 6 decimals.
-            base_size_raw = usd_to_use / max(1e-12, last_close)
-            steps = math.floor(base_size_raw * 1e6)  # 6 decimal places
-            base_size = steps / 1e6
-            if base_size <= 0:
-                print(
-                    f"Calculated base_size={base_size} is zero after rounding; "
-                    "skipping SHORT."
-                )
-                return
-
-            notional = base_size * last_close
-
-            print(
-                f"[DEBUG] CB_USDC_bal={cb_usdc_bal:.4f} usd_to_use={usd_to_use:.4f} "
-                f"base_size={base_size:.6f} notional≈{notional:.4f}"
-            )
-            print(
-                f"Opening SHORT (Coinbase perps) — MARKET SELL {product_id} "
-                f"base_size={base_size:.6f} (px≈{last_close:.2f})"
-            )
-
-            client_order_id = f"sat-short-{int(time.time() * 1000)}"
-            order = client.market_order_sell(
-                client_order_id=client_order_id,
-                product_id=product_id,
-                base_size=f"{base_size:.6f}",
-                # leverage="1",
-                # margin_type="CROSS",
-            )
-
-        # Basic success logging – you can adapt to the response object you're seeing
+        # 13c) Get product increments (base_increment, base_min_size)
         try:
-            oid = getattr(order, "order_id", None) or getattr(order, "success", None) or order
-        except Exception:
-            oid = order
-        print(f"Coinbase order placed: {oid!r}")
+            prod_raw = client.get_product(product_id)
+            prod = prod_raw.to_dict() if hasattr(prod_raw, "to_dict") else prod_raw
+            base_inc = float(prod.get("base_increment") or "0.0001")
+            base_min = float(prod.get("base_min_size") or "0.0001")
+        except Exception as e:
+            print(f"[WARN] Failed to load product increments, using defaults: {e}")
+            base_inc = 0.0001
+            base_min = 0.0001
+
+        # 13d) Convert USD notional -> base size and floor to base_increment
+        base_size_raw = usd_to_use / max(1e-12, last_close)
+        steps = math.floor(base_size_raw / base_inc)
+        base_size = steps * base_inc
+
+        if base_size < base_min:
+            print(
+                f"Calculated base_size={base_size:.8f} below base_min_size={base_min:.8f}; "
+                "skipping Coinbase trade."
+            )
+            return
+
+        print(
+            f"[DEBUG] CB_USDC_bal={cb_usdc_bal:.4f} "
+            f"usd_to_use={usd_to_use:.4f} "
+            f"base_size_raw={base_size_raw:.8f} "
+            f"base_size={base_size:.8f} "
+            f"notional≈{base_size * last_close:.4f}"
+        )
+
+        # 13e) Place the perp order
+        side = "BUY" if take_long else "SELL"
+        print(
+            f"Opening {'LONG' if side=='BUY' else 'SHORT'} (Coinbase perps) — "
+            f"MARKET {side} {product_id} base_size={base_size:.8f} (px≈{last_close:.2f})"
+        )
+
+        place_coinbase_perp_order(
+            client=client,
+            product_id=product_id,
+            side=side,
+            base_size=base_size,
+            last_close=last_close,
+        )
 
         # Guard: one action per bar
         write_last_executed(guard_path, last_close_ms)
