@@ -838,40 +838,37 @@ def decide_and_maybe_trade(args):
                     except Exception as e:
                         print(f"[ERROR] close LONG (SIG) failed: {e}")
                     return
+            elif side_open == "short":
+                # SHORT SL/TP prices
+                sl_px = entry * (1.0 + (sl_pct or 0.0)) if sl_pct is not None else None
+                tp_px = entry * (1.0 - (tp_pct or 0.0)) if tp_pct is not None else None
+                hit_sl = (sl_px is not None) and (last_high >= sl_px)
+                hit_tp = (tp_px is not None) and (last_low <= tp_px)
 
-                elif side_open == "short":
-                    # SHORT SL/TP prices
-                    sl_px = entry * (1.0 + (sl_pct or 0.0)) if sl_pct is not None else None
-                    tp_px = entry * (1.0 - (tp_pct or 0.0)) if tp_pct is not None else None
-                    hit_sl = (sl_px is not None) and (last_high >= sl_px)
-                    hit_tp = (tp_px is not None) and (last_low <= tp_px)
+                # SL/TP first
+                if hit_sl or hit_tp:
+                    reason = "SL" if hit_sl else "TP"
+                    try:
+                        ex.create_order(symbol, "market", "buy", close_qty, None, {"reduceOnly": True})
+                        print(f"{reason} hit — closing existing SHORT at ~{(sl_px if hit_sl else tp_px):.8g}")
+                        write_last_executed(guard_path, last_close_ms)
+                    except Exception as e:
+                        print(f"[ERROR] close SHORT on {reason} failed: {e}")
+                    return
 
-                    # SL/TP first
-                    if hit_sl or hit_tp:
-                        reason = "SL" if hit_sl else "TP"
-                        try:
-                            ex.create_order(symbol, "market", "buy", close_qty, None, {"reduceOnly": True})
-                            print(f"{reason} hit — closing existing SHORT at ~{(sl_px if hit_sl else tp_px):.8g}")
-                            write_last_executed(guard_path, last_close_ms)
-                        except Exception as e:
-                            print(f"[ERROR] close SHORT on {reason} failed: {e}")
-                        return
-
-                    # Signal exit: leave SHORT zone (neutral or long)
-                    if p_last > neg_thr:
-                        try:
-                            ex.create_order(symbol, "market", "buy", close_qty, None, {"reduceOnly": True})
-                            zone = "neutral" if in_neutral else "long"
-                            print(
-                                f"Signal exit — SHORT → {zone} zone: "
-                                f"p_last={p_last:.3f} > neg_thr={neg_thr:.3f}; closing SHORT at ~{last_close}"
-                            )
-                            write_last_executed(guard_path, last_close_ms)
-                        except Exception as e:
-                            print(f"[ERROR] close SHORT (SIG) failed: {e}")
-                        return
-
-
+                # Signal exit: leave SHORT zone (neutral or long)
+                if p_last > neg_thr:
+                    try:
+                        ex.create_order(symbol, "market", "buy", close_qty, None, {"reduceOnly": True})
+                        zone = "neutral" if in_neutral else "long"
+                        print(
+                            f"Signal exit — SHORT → {zone} zone: "
+                            f"p_last={p_last:.3f} > neg_thr={neg_thr:.3f}; closing SHORT at ~{last_close}"
+                        )
+                        write_last_executed(guard_path, last_close_ms)
+                    except Exception as e:
+                        print(f"[ERROR] close SHORT (SIG) failed: {e}")
+                    return
             else:
                 print(f"[WARN] Unknown open side {side_open_raw!r}; not opening new trades.")
                 return
