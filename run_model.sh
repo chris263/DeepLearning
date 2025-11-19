@@ -25,7 +25,7 @@ if [ "$MINUTE" -le 2 ]; then
     echo "Top of hour detected — running 1h updates."
     python3 update_bybit_json.py --json-file /home/production/tmp/ETHUSDT_1h_6m.json --symbol ETH/USDT:USDT --timeframe 1h
     python3 update_bybit_json.py --json-file /home/production/tmp/BTCUSDT_1h_6m.json --symbol BTC/USDT:USDT --timeframe 1h
-    python3 update_bybit_json.py --json-file /home/production/tmp/BTCUSDC_1h_6m.json --symbol ETH/USDC:USDC --timeframe 1h
+    python3 update_bybit_json.py --json-file /home/production/tmp/BTCUSDC_1h_6m.json --symbol BTC/USDC:USDC --timeframe 1h
 else
     echo "Not top of hour — skipping 1h updates."
 fi
