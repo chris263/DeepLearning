@@ -429,6 +429,66 @@ def write_reversal_state(path: str, data: Dict[str, int]):
 # Exchange helpers (coinbase)
 # =========================
 
+from requests import HTTPError
+
+def place_coinbase_perp_order(
+    client,
+    product_id: str,
+    side: str,              # "BUY" or "SELL"
+    base_size: float,       # BTC size
+    last_close: float
+):
+    """
+    Place a MARKET IOC order on Coinbase Advanced (spot / futures).
+    For futures, Coinbase will use your buying power in USD and convert USDC if needed.
+    """
+    side = side.upper()
+    base_str = f"{base_size:.8f}"  # Coinbase likes strings
+
+    payload = {
+        "client_order_id": str(uuid.uuid4()),
+        "product_id": product_id,  # e.g. "BTC-USDC" (or "BTC-USD" if you change it)
+        "side": side,              # "BUY" or "SELL"
+        "order_configuration": {
+            "market_market_ioc": {
+                "base_size": base_str
+                # If you want to experiment with quote_size instead:
+                # "quote_size": f"{usd_to_use:.2f}"
+            }
+        },
+    }
+
+    print(
+        f"Submitting Coinbase MARKET {side}:\n"
+        f"  product_id = {product_id}\n"
+        f"  base_size  = {base_str} BTC\n"
+        f"  est notional ≈ {base_size * last_close:.2f}"
+    )
+    print(f"[DEBUG] Coinbase order payload: {payload}")
+
+    try:
+        resp = client.post(
+            "/api/v3/brokerage/orders",
+            data=payload,
+        )
+        # If using the SDK's convenience method instead, you can do:
+        # resp = client.market_order_buy(**payload) or market_order_sell(**payload)
+    except HTTPError as e:
+        # Show full Coinbase error body
+        try:
+            body = e.response.text
+        except Exception:
+            body = "<no body>"
+        print(f"[ERROR] Coinbase HTTPError: {e} | body={body}")
+        raise
+    except Exception as e:
+        print(f"[ERROR] Generic error placing Coinbase order: {e}")
+        raise
+
+    print(f"[OK] Coinbase order response: {resp}")
+    return resp
+
+
 import os
 from typing import Optional, Tuple
 from coinbase.rest import RESTClient
@@ -1089,6 +1149,43 @@ def decide_and_maybe_trade(args):
         if cb_usdc_bal <= 0:
             print("No USDC balance available on Coinbase futures/perps.")
             return
+
+        # --- sizing already done above ---
+        cb_usdc_bal = cb_futures_bal  # your futures_buying_power
+        usd_to_use = cb_usdc_bal * (risk_long if take_long else risk_short)
+        base_size = usd_to_use / max(1e-12, last_close)
+
+        print(
+            f"[DEBUG] CB_USDC_bal={cb_usdc_bal:.4f} "
+            f"usd_to_use={usd_to_use:.4f} "
+            f"base_size={base_size:.6f} "
+            f"notional≈{base_size * last_close:.4f}"
+        )
+
+        if base_size <= 0:
+            print("Calculated base size is zero; skipping Coinbase trade.")
+            return
+
+        side = "BUY" if take_long else "SELL"
+
+        print(
+            f"Opening {'LONG' if side=='BUY' else 'SHORT'} (Coinbase perps) — "
+            f"MARKET {side} {product_id} base_size={base_size:.6f} (px≈{last_close:.2f})"
+        )
+
+        try:
+            place_coinbase_perp_order(
+                client=client,
+                product_id=product_id,
+                side=side,
+                base_size=base_size,
+                last_close=last_close,
+            )
+            write_last_executed(guard_path, last_close_ms)
+        except Exception as e:
+            print(f"[ERROR] Coinbase order failed: {e}")
+        
+        # --- sizing already done above ---
 
         # Same risk idea as before (you can tune)
         risk_long  = 0.80
