@@ -1083,87 +1083,100 @@ def decide_and_maybe_trade(args):
     # 12) No auto-transfer on Coinbase (user manages collateral manually)
     # (nothing here by design)
 
-    # 13) OPEN order — balance-based sizing (USDC), using Coinbase market orders
+    # 13) OPEN order — Coinbase futures/perps (CFM), balance-based sizing
     try:
-        # your Coinbase-adapted balance helper (USDC in perps / trading account)
-        quote_bal_usdc = fetch_usdc_balance_swap(client)
+        cb_usdc_bal = fetch_usdc_balance_swap(client)  # this is using CFM futures_buying_power
+        if cb_usdc_bal <= 0:
+            print("No USDC balance available on Coinbase futures/perps.")
+            return
 
-        # LONG ~97% of free balance, SHORT ~77%
-        risk_long  = 0.97
+        # Same risk idea as before (you can tune)
+        risk_long  = 0.80
         risk_short = 0.80
 
-        usd_to_use = (
-            quote_bal_usdc * (risk_long if take_long else risk_short)
-            if quote_bal_usdc > 0
-            else 0.0
-        )
+        usd_to_use = cb_usdc_bal * (risk_long if take_long else risk_short)
         if usd_to_use <= 0:
-            print("No USDC balance available on Coinbase.")
+            print("Calculated usd_to_use is zero or negative; skipping trade.")
             return
 
-        # For debug / logging, approximate base quantity
+        last_close = float(df["close"].iloc[-1])
+
+        # Optional: estimate base size from notional for logging
         qty_approx = usd_to_use / max(1e-12, last_close)
 
-        # Get quote increment from product, to floor quote_size (e.g. 0.01 USDC)
-        try:
-            product = client.get_product(product_id)
-            quote_inc = float(product.get("quote_increment") or 0.01)
-        except Exception:
-            quote_inc = 0.01
-
-        def _floor_to_increment(value: float, inc: float) -> float:
-            if inc <= 0:
-                return float(value)
-            steps = math.floor(value / inc)
-            return float(f"{steps * inc:.12f}")
-
-        quote_size = _floor_to_increment(usd_to_use, quote_inc)
-
-        if quote_size <= 0:
-            print("Calculated quote_size is zero after rounding; skipping trade.")
-            return
-
-        print(
-            f"[DEBUG] CB_USDC_bal={quote_bal_usdc:.4f} usd_to_use={usd_to_use:.4f} "
-            f"qty≈{qty_approx:.6f} notional≈{quote_size:.4f}"
-        )
-
-        client_order_id = str(uuid.uuid4())
-        side_str = "BUY" if take_long else "SELL"
-
         if take_long:
+            # LONG: Coinbase lets us BUY using quote_size in USDC
+            # Round quote_size to 2 decimals (USDC has 2dp)
+            quote_size = math.floor(usd_to_use * 100.0) / 100.0
+            if quote_size <= 0:
+                print("Calculated quote_size is zero after rounding; skipping LONG.")
+                return
+
+            print(
+                f"[DEBUG] CB_USDC_bal={cb_usdc_bal:.4f} usd_to_use={usd_to_use:.4f} "
+                f"qty≈{qty_approx:.6f} notional≈{quote_size:.4f}"
+            )
             print(
                 f"Opening LONG (Coinbase perps) — MARKET BUY {product_id} "
                 f"quote_size={quote_size:.2f} (px≈{last_close:.2f})"
             )
+
+            client_order_id = f"sat-long-{int(time.time() * 1000)}"
             order = client.market_order_buy(
                 client_order_id=client_order_id,
                 product_id=product_id,
-                quote_size=str(quote_size)
+                quote_size=f"{quote_size:.2f}",
+                # leverage / margin_type are optional; you can set them if needed:
+                # leverage="1",
+                # margin_type="CROSS",
             )
+
         else:
+            # SHORT: Coinbase's market_order_sell() REQUIRES base_size (BTC), not quote_size.
+            # Convert USD notional -> BTC size and floor to 6 decimals.
+            base_size_raw = usd_to_use / max(1e-12, last_close)
+            steps = math.floor(base_size_raw * 1e6)  # 6 decimal places
+            base_size = steps / 1e6
+            if base_size <= 0:
+                print(
+                    f"Calculated base_size={base_size} is zero after rounding; "
+                    "skipping SHORT."
+                )
+                return
+
+            notional = base_size * last_close
+
+            print(
+                f"[DEBUG] CB_USDC_bal={cb_usdc_bal:.4f} usd_to_use={usd_to_use:.4f} "
+                f"base_size={base_size:.6f} notional≈{notional:.4f}"
+            )
             print(
                 f"Opening SHORT (Coinbase perps) — MARKET SELL {product_id} "
-                f"quote_size={quote_size:.2f} (px≈{last_close:.2f})"
+                f"base_size={base_size:.6f} (px≈{last_close:.2f})"
             )
+
+            client_order_id = f"sat-short-{int(time.time() * 1000)}"
             order = client.market_order_sell(
                 client_order_id=client_order_id,
                 product_id=product_id,
-                quote_size=str(quote_size)
+                base_size=f"{base_size:.6f}",
+                # leverage="1",
+                # margin_type="CROSS",
             )
 
-        # Coinbase SDK returns dict with 'success' / 'success_response' / 'error_response'
-        if isinstance(order, dict) and order.get("success"):
-            oid = (order.get("success_response") or {}).get("order_id")
-            print(f"Coinbase order placed: {oid or order}")
-            # NOTE: TP/SL are handled by the script logic above; we are not
-            # attaching exchange-side brackets here yet.
-            write_last_executed(guard_path, last_close_ms)
-        else:
-            print(f"[ERROR] Coinbase order response: {order!r}")
+        # Basic success logging – you can adapt to the response object you're seeing
+        try:
+            oid = getattr(order, "order_id", None) or getattr(order, "success", None) or order
+        except Exception:
+            oid = order
+        print(f"Coinbase order placed: {oid!r}")
+
+        # Guard: one action per bar
+        write_last_executed(guard_path, last_close_ms)
 
     except Exception as e:
         print(f"[ERROR] Coinbase order failed: {e}")
+
 
 # =========================
 # CLI
