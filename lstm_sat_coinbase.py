@@ -564,72 +564,34 @@ def resolve_symbol(ex, ticker: str) -> str:
 
 def fetch_usdc_balance_swap(ex) -> float:
     """
-    Coinbase Perpetuals balance:
+    For Coinbase US Derivatives:
+      - read the CFM futures balance summary
+      - use futures_buying_power (in USD) as our 'swap balance'.
 
-    - Find the INTX (perpetuals) portfolio UUID.
-    - Call /api/v3/brokerage/intx/portfolio/{portfolio_uuid}.
-    - Use the portfolio's total_balance or collateral as the USDC-equivalent equity
-      to size positions.
-
-    Returns a float in USDC.
+    This corresponds to the 'Available to trade derivatives' number you see
+    in the UI.
     """
-    try:
-        portfolio_uuid = _get_intx_portfolio_uuid(ex)
-        if not portfolio_uuid:
-            print("[WARN] No INTX (perpetuals) portfolio found; returning 0 balance.")
-            return 0.0
-
-        # Per docs: GET /api/v3/brokerage/intx/portfolio/{portfolio_uuid}
-        resp = ex.get(f"/api/v3/brokerage/intx/portfolio/{portfolio_uuid}")
-
-        # Normalize to dict
-        if not isinstance(resp, dict) and hasattr(resp, "to_dict"):
-            data = resp.to_dict()
-        elif isinstance(resp, dict):
-            data = resp
-        else:
-            data = {}
-
-        # Prefer summary.total_balance.value (overall equity in USDC)
-        summary = data.get("summary") or {}
-        tb = summary.get("total_balance") or {}
-        val = tb.get("value")
-
-        # Fallback: first portfolio.collateral or portfolio.total_balance.value
-        if val is None:
-            portfolios = data.get("portfolios") or []
-            if portfolios:
-                pf0 = portfolios[0]
-                if isinstance(pf0, dict):
-                    collateral = pf0.get("collateral")
-                    if collateral is not None:
-                        val = collateral
-                    else:
-                        tb0 = pf0.get("total_balance") or {}
-                        val = tb0.get("value")
-                else:
-                    collateral = getattr(pf0, "collateral", None)
-                    if collateral is not None:
-                        val = collateral
-                    else:
-                        tb0 = getattr(pf0, "total_balance", None)
-                        if isinstance(tb0, dict):
-                            val = tb0.get("value")
-                        elif tb0 is not None:
-                            val = getattr(tb0, "value", None)
-
-        if val is None:
-            print("[WARN] fetch_usdc_balance_swap: no usable balance field found in INTX summary.")
-            return 0.0
-
-        bal = float(val)
-        if bal < 0:
-            bal = 0.0
-        return bal
-
-    except Exception as e:
-        print(f"[WARN] Failed to fetch INTX (perpetuals) USDC balance from Coinbase: {e}")
+    bs = _get_cfm_balance_summary(ex)
+    if not bs:
+        print("[WARN] No CFM balance_summary returned; using 0 balance.")
         return 0.0
+
+    fb = bs.get("futures_buying_power") or {}
+    am = bs.get("available_margin") or {}
+
+    # Prefer futures_buying_power; fall back to available_margin
+    val_str = fb.get("value") or am.get("value")
+    cur = fb.get("currency") or am.get("currency") or "USD"
+
+    try:
+        bal = float(val_str or 0.0)
+    except Exception:
+        bal = 0.0
+
+    print(f"[DEBUG] CFM balance: futures_buying_power={fb.get('value')} {fb.get('currency')}, "
+          f"available_margin={am.get('value')} {am.get('currency')}")
+    print(f"[INFO] Using {bal} {cur} as 'swap' balance for sizing Coinbase futures positions.")
+    return bal
 
 
 import math
@@ -745,135 +707,92 @@ def _get_intx_portfolio_uuid(ex) -> Optional[str]:
 
     return None
 
-
-def get_swap_position(ex, symbol: str) -> Optional[Dict]:
+def _get_cfm_balance_summary(ex) -> dict:
     """
-    Coinbase Perpetuals version of get_swap_position.
+    Coinbase US Derivatives (CFM) balance summary.
+    Uses /api/v3/brokerage/cfm/balance_summary.
+    """
+    try:
+        raw = ex.get("/api/v3/brokerage/cfm/balance_summary")
+    except Exception as e:
+        print(f"[WARN] CFM balance_summary request failed: {e}")
+        return {}
 
-    - Finds the INTX (perpetuals) portfolio:
-        * uses COINBASE_INTX_PORTFOLIO_UUID if set, otherwise
-        * calls get_portfolios() and picks the first portfolio with type "INTX".
-    - Calls /api/v3/brokerage/intx/positions/{portfolio_uuid}.
-    - Looks for a position whose product_id or symbol matches `symbol`
-      (e.g. "BTC-USDC").
+    # RESTClient objects usually have .to_dict()
+    if hasattr(raw, "to_dict"):
+        raw = raw.to_dict()
+
+    if not isinstance(raw, dict):
+        print(f"[WARN] Unexpected CFM balance_summary payload type: {type(raw)}")
+        return {}
+
+    bs = raw.get("balance_summary") or {}
+    return bs
+
+
+def get_swap_position(ex, product_id: str) -> Optional[Dict]:
+    """
+    Coinbase US Derivatives (CFM) open position lookup.
+
+    We scan /api/v3/brokerage/cfm/positions and match on product_id.
+    `product_id` should be the futures product, e.g. 'BTC-USD' or
+    whatever you're actually trading.
 
     Returns:
-        {"side": "long" or "short", "size": float, "entry": float}
-    or None if no open perpetuals position is found.
+        {"side": "long"/"short", "size": float_contracts, "entry": avg_entry_price}
+        or None if no open position.
     """
+    # Normalize product ids: handle BTC-USDC vs BTC-USD aliases
+    targets = {product_id}
+    if product_id.endswith("-USDC"):
+        targets.add(product_id.replace("-USDC", "-USD"))
+    if product_id.endswith("-USD"):
+        targets.add(product_id.replace("-USD", "-USDC"))
 
-    def _norm(s: Optional[str]) -> str:
-        return (s or "").upper()
-
-    # 1) Resolve INTX portfolio UUID
-    portfolio_uuid = os.environ.get("COINBASE_INTX_PORTFOLIO_UUID")
-
-    if not portfolio_uuid:
-        try:
-            resp = ex.get_portfolios()
-            portfolios = None
-            if hasattr(resp, "portfolios"):
-                portfolios = resp.portfolios
-            elif isinstance(resp, dict):
-                portfolios = resp.get("portfolios", [])
-            else:
-                portfolios = []
-
-            if portfolios:
-                for pf in portfolios:
-                    if isinstance(pf, dict):
-                        pf_type = pf.get("type") or ""
-                        pf_uuid = pf.get("uuid")
-                    else:
-                        pf_type = getattr(pf, "type", "") or ""
-                        pf_uuid = getattr(pf, "uuid", None)
-
-                    # INTX = International Derivatives / Perpetuals portfolio
-                    if pf_uuid and pf_type == "INTX":
-                        portfolio_uuid = pf_uuid
-                        break
-        except Exception as e:
-            print(f"[WARN] get_swap_position: failed to list portfolios: {e}")
-
-    if not portfolio_uuid:
-        print("[DEBUG] get_swap_position: no INTX (perpetuals) portfolio found; "
-              "assuming no open perpetuals positions.")
-        return None
-
-    # 2) Fetch positions in that INTX portfolio
-    positions = None
     try:
-        # Use low-level GET because we know the path from the docs
-        resp = ex.get(f"/api/v3/brokerage/intx/positions/{portfolio_uuid}")
-        if hasattr(resp, "positions"):
-            positions = resp.positions
-        elif isinstance(resp, dict):
-            positions = resp.get("positions", [])
-        else:
-            positions = []
+        raw = ex.get("/api/v3/brokerage/cfm/positions")
     except Exception as e:
-        print(f"[WARN] get_swap_position: failed to fetch INTX positions: {e}")
-        positions = None
-
-    if not positions:
+        print(f"[DEBUG] get_swap_position: CFM positions request failed: {e}")
         return None
 
-    target = _norm(symbol)  # e.g. "BTC-USDC"
+    if hasattr(raw, "to_dict"):
+        raw = raw.to_dict()
+    if not isinstance(raw, dict):
+        print(f"[DEBUG] get_swap_position: unexpected positions payload {type(raw)}")
+        return None
+
+    positions = raw.get("positions") or []
+    if not positions:
+        print("[DEBUG] get_swap_position: no CFM futures positions returned.")
+        return None
 
     for p in positions:
-        if isinstance(p, dict):
-            pid = _norm(p.get("product_id"))
-            sym = _norm(p.get("symbol"))
-            net_size_str = p.get("net_size")
-            pos_side_raw = p.get("position_side")
-            entry_vwap_obj = p.get("entry_vwap")
-        else:
-            pid = _norm(getattr(p, "product_id", None))
-            sym = _norm(getattr(p, "symbol", None))
-            net_size_str = getattr(p, "net_size", None)
-            pos_side_raw = getattr(p, "position_side", None)
-            entry_vwap_obj = getattr(p, "entry_vwap", None)
-
-        if target not in (pid, sym):
+        pid = p.get("product_id")
+        if pid not in targets:
             continue
 
-        # net_size is a string in the API
+        side_raw = (p.get("side") or "").lower()  # "long"/"short"
+        side = "long" if side_raw.startswith("long") else (
+               "short" if side_raw.startswith("short") else "")
+
         try:
-            sz = float(net_size_str or 0.0)
+            contracts = float(p.get("number_of_contracts") or 0.0)
         except Exception:
-            sz = 0.0
-
-        if not sz:
-            continue
-
-        # Determine side from position_side or sign of net_size
-        side = None
-        if isinstance(pos_side_raw, str):
-            u = pos_side_raw.upper()
-            if "LONG" in u:
-                side = "long"
-            elif "SHORT" in u:
-                side = "short"
-
-        if side is None:
-            side = "long" if sz > 0 else "short"
-
-        # Entry price from entry_vwap.value
-        entry_val_raw = None
-        if entry_vwap_obj is not None:
-            if isinstance(entry_vwap_obj, dict):
-                entry_val_raw = entry_vwap_obj.get("value")
-            else:
-                entry_val_raw = getattr(entry_vwap_obj, "value", None)
+            contracts = 0.0
 
         try:
-            entry = float(entry_val_raw or 0.0)
+            entry = float(p.get("avg_entry_price") or 0.0)
         except Exception:
             entry = 0.0
 
-        return {"side": side, "size": abs(sz), "entry": entry}
+        if contracts > 0 and side:
+            print(f"[DEBUG] get_swap_position: found CFM position pid={pid}, "
+                  f"side={side}, contracts={contracts}, entry={entry}")
+            return {"side": side, "size": contracts, "entry": entry}
 
+    print(f"[DEBUG] get_swap_position: no CFM futures position found for {product_id}")
     return None
+
 
 
 # =========================
