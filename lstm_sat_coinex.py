@@ -325,6 +325,113 @@ def resolve_last_closed(now_ms: int, last_bar_open_ms: int, timeframe: str) -> T
     c, tag, age = min(valid, key=lambda x: x[2])
     return c, tag, age
 
+# =========================
+# Daily profit goal 2%
+# =========================
+import datetime
+
+DAILY_PROFIT_TARGET_PCT = float(os.getenv("DAILY_PROFIT_TARGET_PCT", "0.02"))  # 2% default
+
+def _save_json_atomic(path: str, payload: Dict[str, Any]) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, path)
+
+def load_daily_profit_state(path: str, today: str, equity_now: float) -> Dict[str, Any]:
+    """
+    Load or (if new day) reset the daily profit state.
+    equity_now is the current account equity in quote currency (e.g., USDT/USDC).
+    """
+    st: Dict[str, Any] = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                st = json.load(f)
+        except Exception:
+            st = {}
+
+    if not st or st.get("date") != today:
+        # new trading day → reset
+        st = {
+            "date": today,
+            "equity_start": float(equity_now),
+            "realized_pnl": 0.0,
+            "daily_pct": 0.0,
+            "hit_target": False,
+        }
+        _save_json_atomic(path, st)
+
+    return st
+
+def log_daily_status(state: Dict[str, Any], target_pct: float) -> None:
+    eq0 = float(state.get("equity_start", 0.0)) or 1.0
+    realized = float(state.get("realized_pnl", 0.0))
+    pct = realized / eq0
+    date = state.get("date", "?")
+    hit = bool(state.get("hit_target"))
+
+    print(
+        f"[DAILY PROFIT STATUS] date={date} | "
+        f"start_equity={eq0:.2f} | realized={realized:.2f} "
+        f"({pct*100:.2f}%) | target={target_pct*100:.2f}% | hit_target={hit}"
+    )
+
+def record_realized_pnl(path: str, state: Dict[str, Any], pnl_quote: float, target_pct: float) -> Dict[str, Any]:
+    """
+    Update the daily realized PnL after a trade is closed.
+
+    pnl_quote: realized profit/loss in quote currency (e.g. USDT).
+               >0 = profit, <0 = loss.
+    """
+    # Previous values
+    prev_realized = float(state.get("realized_pnl", 0.0))
+    eq0 = float(state.get("equity_start", 0.0)) or 1.0
+    prev_pct = prev_realized / eq0
+
+    # New values
+    new_realized = prev_realized + float(pnl_quote)
+    daily_pct = new_realized / eq0
+
+    state["realized_pnl"] = new_realized
+    state["daily_pct"] = daily_pct
+
+    hit_before = bool(state.get("hit_target"))
+    hit_after = daily_pct >= target_pct
+    state["hit_target"] = hit_after
+
+    _save_json_atomic(path, state)
+
+    # Main status line
+    print(
+        "[DAILY PROFIT] "
+        f"P&LΔ={pnl_quote:+.2f} | realized={prev_realized:.2f}→{new_realized:.2f} "
+        f"({prev_pct*100:.2f}%→{daily_pct*100:.2f}%) | "
+        f"target={target_pct*100:.2f}% | hit_target={hit_after}"
+    )
+
+    # One-time banner when target is crossed
+    if (not hit_before) and hit_after:
+        print("=" * 72)
+        print(
+            f"[DAILY PROFIT GUARD] 🎯 Daily target reached! +{daily_pct*100:.2f}% "
+            f"(target={target_pct*100:.2f}%)."
+        )
+        print("[DAILY PROFIT GUARD] No NEW positions will be opened for the rest of this day.")
+        print("=" * 72)
+
+    return state
+
+
+def daily_guard_blocks_new_trades(state: Dict[str, Any], target_pct: float) -> bool:
+    """
+    Returns True if we must NOT open new positions today.
+    """
+    if state.get("hit_target"):
+        return True
+    # (Optional: could also block if daily_pct <= -max_loss_pct)
+    return False
+
 
 # =========================
 # Shared last-bar ID
@@ -717,8 +824,6 @@ def activate_sl_guard(guard_path: str, sl_ts: int, sl_side: str) -> None:
     save_sl_guard(guard_path, data)
     print(f"[SL-GUARD] Activated after SL: side={sl_side}, sl_ts={sl_ts}")
 
-
-
 # =========================
 # Core flow
 # =========================
@@ -735,6 +840,28 @@ def decide_and_maybe_trade(args):
     mean, std = bundle["mean"], bundle["std"]
     ik = bundle["ichimoku"]
     model_dir = bundle["paths"]["dir"]
+
+    # equity_now should be your current equity / buying power in quote currency
+    equity_now = float(futures_bp)  # make sure futures_bp is defined before this call
+
+    # --- DAILY PROFIT GUARD INIT ---
+    today_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+    guard_dir = "/home/production/guards"
+    os.makedirs(guard_dir, exist_ok=True)
+    daily_guard_path = os.path.join(guard_dir, "coinex_daily_profit.json")
+
+    daily_state = load_daily_profit_state(daily_guard_path, today_str, equity_now)
+
+    # Log current day status at the beginning of the run
+    log_daily_status(daily_state, DAILY_PROFIT_TARGET_PCT)
+
+    if daily_guard_blocks_new_trades(daily_state, DAILY_PROFIT_TARGET_PCT):
+        print(
+            f"[DAILY PROFIT GUARD] Target {DAILY_PROFIT_TARGET_PCT*100:.2f}% "
+            f"already reached today ({daily_state.get('daily_pct', 0.0)*100:.2f}%). "
+            f"No NEW positions will be opened today."
+        )
+
 
     # 2) Resolve ticker/timeframe
     ticker = args.ticker or meta.get("ticker") or "BTCUSDT"
@@ -811,7 +938,7 @@ def decide_and_maybe_trade(args):
         print("Already acted on this bar for CoinEx — not acting again.")
         return
 
-    # 9) Fresh-cross trigger logic
+    # 9) Fresh-cross trigger logic  (ALWAYS DEFINE THESE!)
     take_long = (p_last >= pos_thr) and (p_prev < p_last)
     take_short = (p_last <= neg_thr) and (p_prev > p_last)
 
@@ -841,8 +968,6 @@ def decide_and_maybe_trade(args):
         print("[SL-GUARD] Neutral zone touched after last SL — "
               "new trades will be allowed on the next fresh-cross.")
 
-
-
     if pos is not None and pos.get("side"):
         # WE HAVE AN OPEN POSITION ON EXCHANGE ----
         side_open_raw = pos.get("side")
@@ -870,7 +995,6 @@ def decide_and_maybe_trade(args):
                 hit_sl = (sl_px is not None) and (last_close <= sl_px)
                 hit_tp = (tp_px is not None) and (last_close >= tp_px)
 
-
                 # SL/TP first
                 if hit_sl or hit_tp:
                     reason = "SL" if hit_sl else "TP"
@@ -883,10 +1007,19 @@ def decide_and_maybe_trade(args):
                         if reason == "SL":
                             activate_sl_guard(guard_path, last_close_ms, sl_side="long")
 
+                        # >>> NEW: record realized PnL for LONG close
+                        exit_px = last_close
+                        pnl_quote = (exit_px - entry) * close_qty
+                        daily_state = record_realized_pnl(
+                            daily_guard_path,
+                            daily_state,
+                            pnl_quote=pnl_quote,
+                            target_pct=DAILY_PROFIT_TARGET_PCT,
+                        )
+
                     except Exception as e:
                         print(f"[ERROR] close LONG on {reason} failed: {e}")
                     return
-
 
                 # Signal exit: leave LONG zone (neutral or short)
                 if p_last < pos_thr:
@@ -898,6 +1031,17 @@ def decide_and_maybe_trade(args):
                             f"p_last={p_last:.3f} < pos_thr={pos_thr:.3f}; closing LONG at ~{last_close}"
                         )
                         write_last_executed(guard_path, last_close_ms)
+
+                        # >>> NEW: record realized PnL for LONG signal exit
+                        exit_px = last_close
+                        pnl_quote = (exit_px - entry) * close_qty
+                        daily_state = record_realized_pnl(
+                            daily_guard_path,
+                            daily_state,
+                            pnl_quote=pnl_quote,
+                            target_pct=DAILY_PROFIT_TARGET_PCT,
+                        )
+
                     except Exception as e:
                         print(f"[ERROR] close LONG (SIG) failed: {e}")
                     return
@@ -921,6 +1065,16 @@ def decide_and_maybe_trade(args):
                         if reason == "SL":
                             activate_sl_guard(guard_path, last_close_ms, sl_side="short")
 
+                        # >>> NEW: record realized PnL for SHORT close
+                        exit_px = last_close
+                        pnl_quote = (entry - exit_px) * close_qty
+                        daily_state = record_realized_pnl(
+                            daily_guard_path,
+                            daily_state,
+                            pnl_quote=pnl_quote,
+                            target_pct=DAILY_PROFIT_TARGET_PCT,
+                        )
+
                     except Exception as e:
                         print(f"[ERROR] close SHORT on {reason} failed: {e}")
                     return
@@ -935,6 +1089,17 @@ def decide_and_maybe_trade(args):
                             f"p_last={p_last:.3f} > neg_thr={neg_thr:.3f}; closing SHORT at ~{last_close}"
                         )
                         write_last_executed(guard_path, last_close_ms)
+
+                        # >>> NEW: record realized PnL for SHORT signal exit
+                        exit_px = last_close
+                        pnl_quote = (entry - exit_px) * close_qty
+                        daily_state = record_realized_pnl(
+                            daily_guard_path,
+                            daily_state,
+                            pnl_quote=pnl_quote,
+                            target_pct=DAILY_PROFIT_TARGET_PCT,
+                        )
+
                     except Exception as e:
                         print(f"[ERROR] close SHORT (SIG) failed: {e}")
                     return
@@ -971,6 +1136,15 @@ def decide_and_maybe_trade(args):
         print(msg)
         return
 
+    # --- DAILY PROFIT GUARD IN FLAT STATE ---
+    # At this point we have a valid fresh-cross signal (LONG or SHORT) and are flat.
+    if daily_guard_blocks_new_trades(daily_state, DAILY_PROFIT_TARGET_PCT):
+        print(
+            "[DAILY PROFIT GUARD] Fresh signal detected but daily profit target "
+            f"{DAILY_PROFIT_TARGET_PCT*100:.2f}% already reached "
+            f"({daily_state.get('daily_pct', 0.0)*100:.2f}%) — skipping new entry."
+        )
+        return
 
     # 13) OPEN order — balance-based sizing, now with attached TP/SL on exchange
     try:
@@ -1015,7 +1189,7 @@ def decide_and_maybe_trade(args):
 
             tp_order_id = None
             sl_order_id = None
-            sl_pct_broker = 0.03 ## 3% broker
+            sl_pct_broker = 0.03  # 3% broker-level SL
 
             if side == "buy":
                 # LONG: TP above, SL below
