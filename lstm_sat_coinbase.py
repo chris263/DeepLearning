@@ -815,42 +815,19 @@ def get_swap_position(ex, product_id: str) -> Optional[Dict]:
     return None
 
 
-def resolve_perp_product(client, base: str) -> tuple[str, str]:
-    prods = client.get_products().products
-    candidates = []
-
+def resolve_perp_product(client, base: str) -> str:
+    prods = client.get_products(product_type="FUTURE").products
     for p in prods:
-        details = getattr(p, "future_product_details", {}) or {}
-        underlying = details.get("underlying_asset") or p.base_currency
-        contract_type = details.get("contract_type")
-
-        # only perpetual futures on that underlying
-        if underlying != base:
+        details = p.future_product_details or {}
+        if details.get("contract_expiry_type") != "perpetual":
             continue
-        if contract_type != "PERPETUAL":
-            continue
+        # e.g. BTC-PERP, ETH-PERP, COIN50-PERP, etc.
+        if p.base_currency == base and p.quote_currency == "USD":
+            return p.product_id
+    raise RuntimeError(f"No perp product found for base={base}")
 
-        candidates.append(p)
-
-    if not candidates:
-        raise RuntimeError(f"No perp products found for base={base}")
-
-    # Prefer non-INTX venues (CFM for US)
-    chosen = None
-    for p in candidates:
-        venue = (p.future_product_details or {}).get("venue")
-        if venue != "INTX":        # US CFM perps
-            chosen = p
-            break
-
-    if chosen is None:
-        chosen = candidates[0]
-
-    pid   = chosen.product_id      # e.g. "BTC-PERP"
-    venue = (chosen.future_product_details or {}).get("venue")
-    print(f"[DEBUG] Resolved Coinbase perp product for base={base} -> {pid} (venue={venue}, display_name={chosen.display_name})")
-    return pid, venue
-
+base = "BTC"
+product_id = resolve_perp_product(client, base)
 
 # =========================
 # Inference helpers (unchanged)
@@ -1024,7 +1001,8 @@ def decide_and_maybe_trade(args):
     if not base:
         base = "BTC"  # safe fallback
 
-    product_id, venue = resolve_perp_product(client, base)
+    base = "BTC"
+    product_id = resolve_perp_product(client, base)
 
     # 10) Position & SL/TP (+ signal exit on neutral)
     pos       = get_swap_position(client, product_id)  # your Coinbase version
