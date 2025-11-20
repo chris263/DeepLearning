@@ -286,6 +286,113 @@ def resolve_last_closed(now_ms: int, last_bar_open_ms: int, timeframe: str) -> T
     c, tag, age = min(valid, key=lambda x: x[2])
     return c, tag, age
 
+# =========================
+# Daily profit goal 2%
+# =========================
+import datetime
+
+DAILY_PROFIT_TARGET_PCT = float(os.getenv("DAILY_PROFIT_TARGET_PCT", "0.02"))  # 2% default
+
+def _save_json_atomic(path: str, payload: Dict[str, Any]) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, path)
+
+def load_daily_profit_state(path: str, today: str, equity_now: float) -> Dict[str, Any]:
+    """
+    Load or (if new day) reset the daily profit state.
+    equity_now is the current account equity in quote currency (e.g., USDT/USDC).
+    """
+    st: Dict[str, Any] = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                st = json.load(f)
+        except Exception:
+            st = {}
+
+    if not st or st.get("date") != today:
+        # new trading day → reset
+        st = {
+            "date": today,
+            "equity_start": float(equity_now),
+            "realized_pnl": 0.0,
+            "daily_pct": 0.0,
+            "hit_target": False,
+        }
+        _save_json_atomic(path, st)
+
+    return st
+
+def log_daily_status(state: Dict[str, Any], target_pct: float) -> None:
+    eq0 = float(state.get("equity_start", 0.0)) or 1.0
+    realized = float(state.get("realized_pnl", 0.0))
+    pct = realized / eq0
+    date = state.get("date", "?")
+    hit = bool(state.get("hit_target"))
+
+    print(
+        f"[DAILY PROFIT STATUS] date={date} | "
+        f"start_equity={eq0:.2f} | realized={realized:.2f} "
+        f"({pct*100:.2f}%) | target={target_pct*100:.2f}% | hit_target={hit}"
+    )
+
+def record_realized_pnl(path: str, state: Dict[str, Any], pnl_quote: float, target_pct: float) -> Dict[str, Any]:
+    """
+    Update the daily realized PnL after a trade is closed.
+
+    pnl_quote: realized profit/loss in quote currency (e.g. USDT).
+               >0 = profit, <0 = loss.
+    """
+    # Previous values
+    prev_realized = float(state.get("realized_pnl", 0.0))
+    eq0 = float(state.get("equity_start", 0.0)) or 1.0
+    prev_pct = prev_realized / eq0
+
+    # New values
+    new_realized = prev_realized + float(pnl_quote)
+    daily_pct = new_realized / eq0
+
+    state["realized_pnl"] = new_realized
+    state["daily_pct"] = daily_pct
+
+    hit_before = bool(state.get("hit_target"))
+    hit_after = daily_pct >= target_pct
+    state["hit_target"] = hit_after
+
+    _save_json_atomic(path, state)
+
+    # Main status line
+    print(
+        "[DAILY PROFIT] "
+        f"P&LΔ={pnl_quote:+.2f} | realized={prev_realized:.2f}→{new_realized:.2f} "
+        f"({prev_pct*100:.2f}%→{daily_pct*100:.2f}%) | "
+        f"target={target_pct*100:.2f}% | hit_target={hit_after}"
+    )
+
+    # One-time banner when target is crossed
+    if (not hit_before) and hit_after:
+        print("=" * 72)
+        print(
+            f"[DAILY PROFIT GUARD] 🎯 Daily target reached! +{daily_pct*100:.2f}% "
+            f"(target={target_pct*100:.2f}%)."
+        )
+        print("[DAILY PROFIT GUARD] No NEW positions will be opened for the rest of this day.")
+        print("=" * 72)
+
+    return state
+
+
+def daily_guard_blocks_new_trades(state: Dict[str, Any], target_pct: float) -> bool:
+    """
+    Returns True if we must NOT open new positions today.
+    """
+    if state.get("hit_target"):
+        return True
+    # (Optional: could also block if daily_pct <= -max_loss_pct)
+    return False
+
 
 # =========================
 # Shared last-bar ID (cross-broker)

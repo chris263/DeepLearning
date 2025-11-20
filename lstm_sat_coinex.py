@@ -841,28 +841,6 @@ def decide_and_maybe_trade(args):
     ik = bundle["ichimoku"]
     model_dir = bundle["paths"]["dir"]
 
-    # equity_now should be your current equity / buying power in quote currency
-    equity_now = float(futures_bp)  # make sure futures_bp is defined before this call
-
-    # --- DAILY PROFIT GUARD INIT ---
-    today_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
-    guard_dir = "/home/production/guards"
-    os.makedirs(guard_dir, exist_ok=True)
-    daily_guard_path = os.path.join(guard_dir, "coinex_daily_profit.json")
-
-    daily_state = load_daily_profit_state(daily_guard_path, today_str, equity_now)
-
-    # Log current day status at the beginning of the run
-    log_daily_status(daily_state, DAILY_PROFIT_TARGET_PCT)
-
-    if daily_guard_blocks_new_trades(daily_state, DAILY_PROFIT_TARGET_PCT):
-        print(
-            f"[DAILY PROFIT GUARD] Target {DAILY_PROFIT_TARGET_PCT*100:.2f}% "
-            f"already reached today ({daily_state.get('daily_pct', 0.0)*100:.2f}%). "
-            f"No NEW positions will be opened today."
-        )
-
-
     # 2) Resolve ticker/timeframe
     ticker = args.ticker or meta.get("ticker") or "BTCUSDT"
     timeframe = args.timeframe or meta.get("timeframe") or "1h"
@@ -938,7 +916,7 @@ def decide_and_maybe_trade(args):
         print("Already acted on this bar for CoinEx — not acting again.")
         return
 
-    # 9) Fresh-cross trigger logic  (ALWAYS DEFINE THESE!)
+    # 9) Fresh-cross trigger logic
     take_long = (p_last >= pos_thr) and (p_prev < p_last)
     take_short = (p_last <= neg_thr) and (p_prev > p_last)
 
@@ -946,8 +924,32 @@ def decide_and_maybe_trade(args):
     ex = make_exchange(args.pub_key, args.sec_key)
     symbol = resolve_symbol(ex, ticker)
 
+    # --- DAILY PROFIT GUARD INIT (after we can read equity from the exchange) ---
+    try:
+        # Use your swap USDT balance as "equity" baseline for the day
+        equity_now = float(fetch_usdt_balance_swap(ex))
+    except Exception as e:
+        print(f"[WARN] failed to fetch swap balance for daily guard, defaulting equity_now=0: {e}")
+        equity_now = 0.0
+
+    today_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+    guard_dir = "/home/production/guards"
+    os.makedirs(guard_dir, exist_ok=True)
+    daily_guard_path = os.path.join(guard_dir, "coinex_daily_profit.json")
+
+    daily_state = load_daily_profit_state(daily_guard_path, today_str, equity_now)
+    log_daily_status(daily_state, DAILY_PROFIT_TARGET_PCT)
+
+    if daily_guard_blocks_new_trades(daily_state, DAILY_PROFIT_TARGET_PCT):
+        print(
+            f"[DAILY PROFIT GUARD] Target {DAILY_PROFIT_TARGET_PCT*100:.2f}% "
+            f"already reached today ({daily_state.get('daily_pct', 0.0)*100:.2f}%). "
+            f"No NEW positions will be opened today."
+        )
+
     # 11) Position & SL/TP (+ signal exit on neutral)
     pos = get_swap_position(ex, symbol)
+
     last_close = float(df["close"].iloc[-1])
     last_high = float(df["high"].iloc[-1])
     last_low = float(df["low"].iloc[-1])
