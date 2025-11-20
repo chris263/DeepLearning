@@ -332,34 +332,34 @@ import datetime
 
 DAILY_PROFIT_TARGET_PCT = float(os.getenv("DAILY_PROFIT_TARGET_PCT", "0.02"))  # 2% default
 
-def get_equity_for_daily_guard(ex) -> float:
+def get_equity_for_daily_guard_coinex(ex) -> float:
     """
-    Try to get a realistic account equity in USDT to use as the
-    baseline for daily % PnL. Prefer total USDT balance; fall back
-    to swap-only free balance if needed.
+    For CoinEx, use the SWAP account USDT balance as the daily equity baseline.
+    Spot USDT (from fetch_balance) does NOT include futures margin.
     """
-    # 1) Prefer total account USDT (ccxt-style)
-    try:
-        bal = ex.fetch_balance()
-        for code in ("USDT", "USDC"):
-            acc = bal.get(code)
-            if isinstance(acc, dict):
-                v = acc.get("total") or acc.get("free") or acc.get("used")
-                if v is not None:
-                    eq = float(v)
-                    print(f"[DAILY PROFIT] Using {code} total={eq:.2f} as equity baseline.")
-                    return eq
-    except Exception as e:
-        print(f"[WARN] fetch_balance() failed for daily guard, falling back to swap-only: {e}")
-
-    # 2) Fallback: swap-only free balance (what we used before)
+    # 1) Prefer swap/futures USDT balance (what you already use for sizing)
     try:
         eq = float(fetch_usdt_balance_swap(ex))
-        print(f"[DAILY PROFIT] Using swap-only balance={eq:.2f} as equity baseline (fallback).")
+        print(f"[DAILY PROFIT] CoinEx: using SWAP balance={eq:.2f} as equity baseline.")
         return eq
     except Exception as e:
-        print(f"[WARN] fetch_usdt_balance_swap() failed for daily guard, equity_now=0: {e}")
-        return 0.0
+        print(f"[WARN] CoinEx swap balance failed for daily guard, trying generic USDT total: {e}")
+
+    # 2) Fallback: generic USDT total from fetch_balance (spot)
+    try:
+        bal = ex.fetch_balance()
+        acc = bal.get("USDT") or {}
+        v = acc.get("total") or acc.get("free") or acc.get("used")
+        if v is not None:
+            eq = float(v)
+            print(f"[DAILY PROFIT] CoinEx fallback: using USDT total={eq:.2f} as equity baseline.")
+            return eq
+    except Exception as e2:
+        print(f"[WARN] CoinEx generic equity fallback failed: {e2}")
+
+    print("[WARN] CoinEx: could not determine equity; using 0.0 for daily guard baseline.")
+    return 0.0
+
 
 
 def _save_json_atomic(path: str, payload: Dict[str, Any]) -> None:
@@ -960,7 +960,7 @@ def decide_and_maybe_trade(args):
     symbol = resolve_symbol(ex, ticker)
 
     # --- DAILY PROFIT GUARD INIT (after we can read equity from the exchange) ---
-    equity_now = get_equity_for_daily_guard(ex)
+    equity_now = get_equity_for_daily_guard_coinex(ex)
 
     today_str = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d")
     guard_dir = "/home/production/guards"
