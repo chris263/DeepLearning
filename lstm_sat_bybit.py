@@ -22,18 +22,12 @@ from typing import List, Dict, Tuple, Optional
 
 import numpy as np
 import pandas as pd
+import datetime
 
-try:
-    import torch
-except Exception:
-    print("Please install torch:  pip install torch", file=sys.stderr)
-    raise
+import torch
+import ccxt
 
-try:
-    import ccxt
-except Exception:
-    print("Please install ccxt:  pip install ccxt", file=sys.stderr)
-    raise
+
 
 
 # =========================
@@ -289,17 +283,21 @@ def resolve_last_closed(now_ms: int, last_bar_open_ms: int, timeframe: str) -> T
 # =========================
 # Daily profit goal 2%
 # =========================
-import datetime
+
 
 DAILY_PROFIT_TARGET_PCT = float(os.getenv("DAILY_PROFIT_TARGET_PCT", "0.02"))  # 2% default
 
 def get_equity_for_daily_guard(ex) -> float:
     """
-    Try to get a realistic account equity in USDT to use as the
+    Try to get a realistic account equity in USDT/USDC to use as the
     baseline for daily % PnL. Prefer total USDT balance; fall back
     to swap-only free balance if needed.
+
+    IMPORTANT:
+    - This value is only used when creating a NEW day state.
+      On the same day, equity_start will NOT be changed.
     """
-    # 1) Prefer total account USDT (ccxt-style)
+    # 1) Prefer total account USDT/USDC (ccxt-style)
     try:
         bal = ex.fetch_balance()
         for code in ("USDT", "USDC"):
@@ -322,50 +320,95 @@ def get_equity_for_daily_guard(ex) -> float:
         print(f"[WARN] fetch_usdt_balance_swap() failed for daily guard, equity_now=0: {e}")
         return 0.0
 
+
 def _save_json_atomic(path: str, payload: Dict[str, Any]) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(payload, f, indent=2)
     os.replace(tmp, path)
 
+
 def load_daily_profit_state(path: str, today: str, equity_now: float) -> Dict[str, Any]:
     """
-    Load or (if new day) reset the daily profit state.
-    equity_now is the current account equity in quote currency (e.g., USDT/USDC).
+    Load or (if new day) initialize the daily profit state.
+
+    equity_now: current account equity in quote currency (e.g. USDT/USDC).
+                Used ONLY when creating a NEW day state.
     """
     st: Dict[str, Any] = {}
+
     if os.path.exists(path):
         try:
             with open(path, "r") as f:
                 st = json.load(f)
-        except Exception:
+        except Exception as e:
+            print(f"[DAILY PROFIT] failed to read {path}: {e}; resetting state.")
             st = {}
 
+    # 1) New or different day → reset with new equity_start
     if not st or st.get("date") != today:
-        # new trading day → reset
+        eq0 = float(equity_now or 0.0)
         st = {
             "date": today,
-            "equity_start": float(equity_now),
-            "realized_pnl": 0.0,
+            "equity_start": eq0,          # FIXED for the whole day
+            "current_balance": eq0,       # realized balance after last closed trade
+            "realized_pnl": 0.0,          # derived from current_balance - equity_start
             "daily_pct": 0.0,
             "hit_target": False,
         }
         _save_json_atomic(path, st)
+        print(
+            f"[DAILY PROFIT] Initialized daily state (Bybit): "
+            f"date={today}, equity_start={eq0:.2f}"
+        )
+        return st
 
+    # 2) Same day: DO NOT change equity_start
+    eq0 = float(st.get("equity_start", 0.0) or 1.0)
+
+    # Ensure current_balance exists
+    if "current_balance" not in st:
+        # If missing (old file), infer from equity_now if provided, else from equity_start
+        if equity_now is not None:
+            st["current_balance"] = float(equity_now)
+        else:
+            st["current_balance"] = eq0
+
+    cur_bal = float(st.get("current_balance", eq0))
+
+    # Realized PnL derived from current_balance - equity_start
+    realized = cur_bal - eq0
+    st["realized_pnl"] = realized
+    st["daily_pct"] = realized / eq0 if eq0 > 0 else 0.0
+
+    st.setdefault("hit_target", False)
+    st.setdefault("date", today)
+
+    _save_json_atomic(path, st)
     return st
 
+
 def log_daily_status(state: Dict[str, Any], target_pct: float) -> None:
-    eq0 = float(state.get("equity_start", 0.0)) or 1.0
-    realized = float(state.get("realized_pnl", 0.0))
-    pct = realized / eq0
+    """
+    Log daily status based purely on realized data:
+      realized_pnl = current_balance - equity_start
+    """
+    eq0 = float(state.get("equity_start", 0.0) or 1.0)
+    cur_bal = float(state.get("current_balance", eq0))
+    realized = cur_bal - eq0
+    pct = realized / eq0 if eq0 > 0 else 0.0
     date = state.get("date", "?")
     hit = bool(state.get("hit_target"))
 
     print(
         f"[DAILY PROFIT STATUS] date={date} | "
-        f"start_equity={eq0:.2f} | realized={realized:.2f} "
-        f"({pct*100:.2f}%) | target={target_pct*100:.2f}% | hit_target={hit}"
+        f"equity_start={eq0:.2f} | "
+        f"current_balance={cur_bal:.2f} | "
+        f"realized={realized:.2f} ({pct*100:.2f}%) | "
+        f"target={target_pct*100:.2f}% | hit_target={hit} | "
+        f"[GUARD uses REALIZED PnL derived from (current_balance - equity_start)]"
     )
+
 
 def record_realized_pnl(path: str, state: Dict[str, Any], pnl_quote: float, target_pct: float) -> Dict[str, Any]:
     """
@@ -373,16 +416,24 @@ def record_realized_pnl(path: str, state: Dict[str, Any], pnl_quote: float, targ
 
     pnl_quote: realized profit/loss in quote currency (e.g. USDT).
                >0 = profit, <0 = loss.
+
+    All PnL is derived from:
+        current_balance = previous_current_balance + pnl_quote
+        realized_pnl    = current_balance - equity_start
     """
-    # Previous values
-    prev_realized = float(state.get("realized_pnl", 0.0))
     eq0 = float(state.get("equity_start", 0.0)) or 1.0
-    prev_pct = prev_realized / eq0
 
-    # New values
-    new_realized = prev_realized + float(pnl_quote)
-    daily_pct = new_realized / eq0
+    # Previous derived values
+    cur_bal_prev = float(state.get("current_balance", eq0))
+    prev_realized = cur_bal_prev - eq0
+    prev_pct = prev_realized / eq0 if eq0 > 0 else 0.0
 
+    # New balance and derived PnL
+    cur_bal_new = cur_bal_prev + float(pnl_quote)
+    new_realized = cur_bal_new - eq0
+    daily_pct = new_realized / eq0 if eq0 > 0 else 0.0
+
+    state["current_balance"] = cur_bal_new
     state["realized_pnl"] = new_realized
     state["daily_pct"] = daily_pct
 
@@ -395,8 +446,10 @@ def record_realized_pnl(path: str, state: Dict[str, Any], pnl_quote: float, targ
     # Main status line
     print(
         "[DAILY PROFIT] "
-        f"P&LΔ={pnl_quote:+.2f} | realized={prev_realized:.2f}→{new_realized:.2f} "
+        f"P&LΔ={pnl_quote:+.2f} | "
+        f"realized={prev_realized:.2f}→{new_realized:.2f} "
         f"({prev_pct*100:.2f}%→{daily_pct*100:.2f}%) | "
+        f"current_balance={cur_bal_prev:.2f}→{cur_bal_new:.2f} | "
         f"target={target_pct*100:.2f}% | hit_target={hit_after}"
     )
 
@@ -416,9 +469,22 @@ def record_realized_pnl(path: str, state: Dict[str, Any], pnl_quote: float, targ
 def daily_guard_blocks_new_trades(state: Dict[str, Any], target_pct: float) -> bool:
     """
     Returns True if we must NOT open new positions today.
+
+    HARD RULE:
+      - If daily_pct >= target_pct OR hit_target is True → BLOCK new trades.
     """
+    eq0 = float(state.get("equity_start", 0.0) or 1.0)
+    cur_bal = float(state.get("current_balance", eq0))
+
+    daily_pct = (cur_bal - eq0) / eq0 if eq0 > 0 else 0.0
+    state["daily_pct"] = daily_pct  # keep in sync in memory
+
+    if daily_pct >= target_pct:
+        return True
+
     if state.get("hit_target"):
         return True
+
     # (Optional: could also block if daily_pct <= -max_loss_pct)
     return False
 
@@ -894,14 +960,6 @@ def decide_and_maybe_trade(args):
     daily_state = load_daily_profit_state(daily_guard_path, today_str, equity_now)
     log_daily_status(daily_state, DAILY_PROFIT_TARGET_PCT)
 
-    if daily_guard_blocks_new_trades(daily_state, DAILY_PROFIT_TARGET_PCT):
-        print(
-            f"[DAILY PROFIT GUARD] Target {DAILY_PROFIT_TARGET_PCT*100:.2f}% "
-            f"already reached today ({daily_state.get('daily_pct', 0.0)*100:.2f}%). "
-            f"No NEW positions will be opened today."
-        )
-        return
-
     # 10) Position & SL/TP (+ signal exit on neutral)
     pos = get_swap_position(ex, symbol)
     last_close = float(df["close"].iloc[-1])
@@ -1097,12 +1155,12 @@ def decide_and_maybe_trade(args):
         print(msg)
         return
 
-    # DAILY PROFIT GUARD: block new entries once daily target reached
+    # === DAILY PROFIT GUARD: block NEW trades once target hit ===
     if daily_guard_blocks_new_trades(daily_state, DAILY_PROFIT_TARGET_PCT):
         print(
-            "[DAILY PROFIT GUARD] Fresh signal detected but daily profit target "
-            f"{DAILY_PROFIT_TARGET_PCT*100:.2f}% already reached "
-            f"({daily_state.get('daily_pct', 0.0)*100:.2f}%) — skipping new entry."
+            f"[DAILY PROFIT GUARD] Blocking NEW trade: "
+            f"🎯 target {DAILY_PROFIT_TARGET_PCT*100:.2f}% already reached "
+            f"({daily_state.get('daily_pct', 0.0)*100:.2f}%)."
         )
         return
 

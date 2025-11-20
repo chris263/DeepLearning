@@ -1040,14 +1040,7 @@ def decide_and_maybe_trade(args):
 
     daily_state = load_daily_profit_state(daily_guard_path, today_str, equity_now)
     log_daily_status(daily_state, DAILY_PROFIT_TARGET_PCT)
-
-    if daily_guard_blocks_new_trades(daily_state, DAILY_PROFIT_TARGET_PCT):
-        print(
-            f"[DAILY PROFIT GUARD] Target {DAILY_PROFIT_TARGET_PCT*100:.2f}% "
-            f"already reached today ({daily_state.get('daily_pct', 0.0)*100:.2f}%). "
-            f"No NEW positions will be opened today."
-        )
-        return
+    # IMPORTANT: do NOT block here, we still need to be able to CLOSE positions.
 
     # 11) Position & SL/TP (+ signal exit on neutral)
     pos = get_swap_position(ex, symbol)
@@ -1084,139 +1077,142 @@ def decide_and_maybe_trade(args):
         close_qty = safe_close_amount(ex, symbol, sz_abs)
 
         if close_qty <= 0:
-            print(f"[WARN] safe_close_amount returned {close_qty} for sz_abs={sz_abs}; "
-                  "falling back to raw position size.")
+            print(
+                f"[WARN] safe_close_amount returned {close_qty} for sz_abs={sz_abs}; "
+                "falling back to raw position size."
+            )
             close_qty = float(sz_abs)
 
-            print(f"[DEBUG] Existing position detected: side={side_open_raw!r}, "
-                  f"raw_size={raw_size}, close_qty={close_qty}, entry={entry}")
-        
-        else:
-            if side_open == "long":
-                # LONG SL/TP prices
-                sl_px = entry * (1.0 - (sl_pct or 0.0)) if sl_pct is not None else None
-                tp_px = entry * (1.0 + (tp_pct or 0.0)) if tp_pct is not None else None
-                hit_sl = (sl_px is not None) and (last_close <= sl_px)
-                hit_tp = (tp_px is not None) and (last_close >= tp_px)
+        print(
+            f"[DEBUG] Existing position detected: side={side_open_raw!r}, "
+            f"raw_size={raw_size}, close_qty={close_qty}, entry={entry}"
+        )
 
-                # SL/TP first
-                if hit_sl or hit_tp:
-                    reason = "SL" if hit_sl else "TP"
-                    try:
-                        ex.create_order(symbol, "market", "sell", close_qty, None, {"reduceOnly": True})
-                        print(f"{reason} hit — closing existing LONG at ~{(sl_px if hit_sl else tp_px):.8g}")
-                        write_last_executed(guard_path, last_close_ms)
+        if side_open == "long":
+            # LONG SL/TP prices
+            sl_px = entry * (1.0 - (sl_pct or 0.0)) if sl_pct is not None else None
+            tp_px = entry * (1.0 + (tp_pct or 0.0)) if tp_pct is not None else None
+            hit_sl = (sl_px is not None) and (last_close <= sl_px)
+            hit_tp = (tp_px is not None) and (last_close >= tp_px)
 
-                        # >>> NEW: if this was a Stop Loss, activate the SL guard
-                        if reason == "SL":
-                            activate_sl_guard(guard_path, last_close_ms, sl_side="long")
+            # SL/TP first
+            if hit_sl or hit_tp:
+                reason = "SL" if hit_sl else "TP"
+                try:
+                    ex.create_order(symbol, "market", "sell", close_qty, None, {"reduceOnly": True})
+                    print(f"{reason} hit — closing existing LONG at ~{(sl_px if hit_sl else tp_px):.8g}")
+                    write_last_executed(guard_path, last_close_ms)
 
-                        # >>> NEW: record realized PnL for LONG close
-                        exit_px = last_close
-                        pnl_quote = (exit_px - entry) * close_qty
-                        daily_state = record_realized_pnl(
-                            daily_guard_path,
-                            daily_state,
-                            pnl_quote=pnl_quote,
-                            target_pct=DAILY_PROFIT_TARGET_PCT,
-                        )
+                    # >>> SL guard on Stop Loss
+                    if reason == "SL":
+                        activate_sl_guard(guard_path, last_close_ms, sl_side="long")
 
-                    except Exception as e:
-                        print(f"[ERROR] close LONG on {reason} failed: {e}")
-                    return
+                    # >>> record realized PnL for LONG close
+                    exit_px = last_close
+                    pnl_quote = (exit_px - entry) * close_qty
+                    daily_state = record_realized_pnL(
+                        daily_guard_path,
+                        daily_state,
+                        pnl_quote=pnl_quote,
+                        target_pct=DAILY_PROFIT_TARGET_PCT,
+                    )
 
-                # Signal exit: leave LONG zone (neutral or short)
-                if p_last < pos_thr:
-                    try:
-                        ex.create_order(symbol, "market", "sell", close_qty, None, {"reduceOnly": True})
-                        zone = "neutral" if in_neutral else "short"
-                        print(
-                            f"Signal exit — LONG → {zone} zone: "
-                            f"p_last={p_last:.3f} < pos_thr={pos_thr:.3f}; closing LONG at ~{last_close}"
-                        )
-                        write_last_executed(guard_path, last_close_ms)
-
-                        # >>> NEW: record realized PnL for LONG signal exit
-                        exit_px = last_close
-                        pnl_quote = (exit_px - entry) * close_qty
-                        daily_state = record_realized_pnl(
-                            daily_guard_path,
-                            daily_state,
-                            pnl_quote=pnl_quote,
-                            target_pct=DAILY_PROFIT_TARGET_PCT,
-                        )
-
-                    except Exception as e:
-                        print(f"[ERROR] close LONG (SIG) failed: {e}")
-                    return
-
-            elif side_open == "short":
-                # SHORT SL/TP prices
-                sl_px = entry * (1.0 + (sl_pct or 0.0)) if sl_pct is not None else None
-                tp_px = entry * (1.0 - (tp_pct or 0.0)) if tp_pct is not None else None
-                hit_sl = (sl_px is not None) and (last_close >= sl_px)
-                hit_tp = (tp_px is not None) and (last_close <= tp_px)
-
-                # SL/TP first
-                if hit_sl or hit_tp:
-                    reason = "SL" if hit_sl else "TP"
-                    try:
-                        ex.create_order(symbol, "market", "buy", close_qty, None, {"reduceOnly": True})
-                        print(f"{reason} hit — closing existing SHORT at ~{(sl_px if hit_sl else tp_px):.8g}")
-                        write_last_executed(guard_path, last_close_ms)
-
-                        # >>> NEW: activate SL guard on Stop Loss
-                        if reason == "SL":
-                            activate_sl_guard(guard_path, last_close_ms, sl_side="short")
-
-                        # >>> NEW: record realized PnL for SHORT close
-                        exit_px = last_close
-                        pnl_quote = (entry - exit_px) * close_qty
-                        daily_state = record_realized_pnl(
-                            daily_guard_path,
-                            daily_state,
-                            pnl_quote=pnl_quote,
-                            target_pct=DAILY_PROFIT_TARGET_PCT,
-                        )
-
-                    except Exception as e:
-                        print(f"[ERROR] close SHORT on {reason} failed: {e}")
-                    return
-
-                # Signal exit: leave SHORT zone (neutral or long)
-                if p_last > neg_thr:
-                    try:
-                        ex.create_order(symbol, "market", "buy", close_qty, None, {"reduceOnly": True})
-                        zone = "neutral" if in_neutral else "long"
-                        print(
-                            f"Signal exit — SHORT → {zone} zone: "
-                            f"p_last={p_last:.3f} > neg_thr={neg_thr:.3f}; closing SHORT at ~{last_close}"
-                        )
-                        write_last_executed(guard_path, last_close_ms)
-
-                        # >>> NEW: record realized PnL for SHORT signal exit
-                        exit_px = last_close
-                        pnl_quote = (entry - exit_px) * close_qty
-                        daily_state = record_realized_pnl(
-                            daily_guard_path,
-                            daily_state,
-                            pnl_quote=pnl_quote,
-                            target_pct=DAILY_PROFIT_TARGET_PCT,
-                        )
-
-                    except Exception as e:
-                        print(f"[ERROR] close SHORT (SIG) failed: {e}")
-                    return
-            else:
-                print(f"[WARN] Unknown open side {side_open_raw!r}; not opening new trades.")
+                except Exception as e:
+                    print(f"[ERROR] close LONG on {reason} failed: {e}")
                 return
 
-            # If we reach here, we decided to keep the position
-            print(
-                f"Keeping existing {side_open.upper()} open — "
-                f"p_last={p_last:.3f}, pos_thr={pos_thr:.3f}, neg_thr={neg_thr:.3f}"
-            )
+            # Signal exit: leave LONG zone (neutral or short)
+            if p_last < pos_thr:
+                try:
+                    ex.create_order(symbol, "market", "sell", close_qty, None, {"reduceOnly": True})
+                    zone = "neutral" if in_neutral else "short"
+                    print(
+                        f"Signal exit — LONG → {zone} zone: "
+                        f"p_last={p_last:.3f} < pos_thr={pos_thr:.3f}; closing LONG at ~{last_close}"
+                    )
+                    write_last_executed(guard_path, last_close_ms)
+
+                    # >>> record realized PnL for LONG signal exit
+                    exit_px = last_close
+                    pnl_quote = (exit_px - entry) * close_qty
+                    daily_state = record_realized_pnL(
+                        daily_guard_path,
+                        daily_state,
+                        pnl_quote=pnl_quote,
+                        target_pct=DAILY_PROFIT_TARGET_PCT,
+                    )
+
+                except Exception as e:
+                    print(f"[ERROR] close LONG (SIG) failed: {e}")
+                return
+
+        elif side_open == "short":
+            # SHORT SL/TP prices
+            sl_px = entry * (1.0 + (sl_pct or 0.0)) if sl_pct is not None else None
+            tp_px = entry * (1.0 - (tp_pct or 0.0)) if tp_pct is not None else None
+            hit_sl = (sl_px is not None) and (last_close >= sl_px)
+            hit_tp = (tp_px is not None) and (last_close <= tp_px)
+
+            # SL/TP first
+            if hit_sl or hit_tp:
+                reason = "SL" if hit_sl else "TP"
+                try:
+                    ex.create_order(symbol, "market", "buy", close_qty, None, {"reduceOnly": True})
+                    print(f"{reason} hit — closing existing SHORT at ~{(sl_px if hit_sl else tp_px):.8g}")
+                    write_last_executed(guard_path, last_close_ms)
+
+                    # >>> activate SL guard on Stop Loss
+                    if reason == "SL":
+                        activate_sl_guard(guard_path, last_close_ms, sl_side="short")
+
+                    # >>> record realized PnL for SHORT close
+                    exit_px = last_close
+                    pnl_quote = (entry - exit_px) * close_qty
+                    daily_state = record_realized_pnL(
+                        daily_guard_path,
+                        daily_state,
+                        pnl_quote=pnl_quote,
+                        target_pct=DAILY_PROFIT_TARGET_PCT,
+                    )
+
+                except Exception as e:
+                    print(f"[ERROR] close SHORT on {reason} failed: {e}")
+                return
+
+            # Signal exit: leave SHORT zone (neutral or long)
+            if p_last > neg_thr:
+                try:
+                    ex.create_order(symbol, "market", "buy", close_qty, None, {"reduceOnly": True})
+                    zone = "neutral" if in_neutral else "long"
+                    print(
+                        f"Signal exit — SHORT → {zone} zone: "
+                        f"p_last={p_last:.3f} > neg_thr={neg_thr:.3f}; closing SHORT at ~{last_close}"
+                    )
+                    write_last_executed(guard_path, last_close_ms)
+
+                    # >>> record realized PnL for SHORT signal exit
+                    exit_px = last_close
+                    pnl_quote = (entry - exit_px) * close_qty
+                    daily_state = record_realized_pnL(
+                        daily_guard_path,
+                        daily_state,
+                        pnl_quote=pnl_quote,
+                        target_pct=DAILY_PROFIT_TARGET_PCT,
+                    )
+
+                except Exception as e:
+                    print(f"[ERROR] close SHORT (SIG) failed: {e}")
+                return
+        else:
+            print(f"[WARN] Unknown open side {side_open_raw!r}; not opening new trades.")
             return
+
+        # If we reach here, we decided to keep the position
+        print(
+            f"Keeping existing {side_open.upper()} open — "
+            f"p_last={p_last:.3f}, pos_thr={pos_thr:.3f}, neg_thr={neg_thr:.3f}"
+        )
+        return
 
     # 12) Flat logic (+ SL guard after Stop Loss)
     # If an SL just happened and we have NOT yet seen the neutral zone,
@@ -1240,13 +1236,13 @@ def decide_and_maybe_trade(args):
         print(msg)
         return
 
-    # --- DAILY PROFIT GUARD IN FLAT STATE ---
-    # At this point we have a valid fresh-cross signal (LONG or SHORT) and are flat.
+    # === DAILY PROFIT GUARD: block NEW trades once target hit ===
     if daily_guard_blocks_new_trades(daily_state, DAILY_PROFIT_TARGET_PCT):
         print(
-            "[DAILY PROFIT GUARD] Fresh signal detected but daily profit target "
-            f"{DAILY_PROFIT_TARGET_PCT*100:.2f}% already reached "
-            f"({daily_state.get('daily_pct', 0.0)*100:.2f}%) — skipping new entry."
+            f"[DAILY PROFIT GUARD] Blocking NEW CoinEx trade: "
+            f"🎯 target {DAILY_PROFIT_TARGET_PCT*100:.2f}% already reached "
+            f"({daily_state.get('daily_pct', 0.0)*100:.2f}%). "
+            "No NEW positions will be opened today."
         )
         return
 
