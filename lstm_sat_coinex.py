@@ -362,6 +362,7 @@ def get_equity_for_daily_guard_coinex(ex) -> float:
 
 
 
+
 def _save_json_atomic(path: str, payload: Dict[str, Any]) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
