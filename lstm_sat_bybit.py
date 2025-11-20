@@ -900,6 +900,7 @@ def decide_and_maybe_trade(args):
             f"already reached today ({daily_state.get('daily_pct', 0.0)*100:.2f}%). "
             f"No NEW positions will be opened today."
         )
+        return
 
     # 10) Position & SL/TP (+ signal exit on neutral)
     pos = get_swap_position(ex, symbol)
