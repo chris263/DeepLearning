@@ -17,7 +17,7 @@ Requires: torch, ccxt, numpy, pandas
 """
 
 from __future__ import annotations
-import os, sys, json, time, argparse, pathlib, tempfile, math
+import os, re, sys, json, time, argparse, pathlib, tempfile, math
 from typing import List, Dict, Tuple, Optional
 
 import numpy as np
@@ -805,6 +805,10 @@ def decide_and_maybe_trade(args):
     mean, std = bundle["mean"], bundle["std"]
     ik = bundle["ichimoku"]; model_dir = bundle["paths"]["dir"]
 
+    # Derive a per-strategy identifier from the model directory
+    strategy_id = os.path.basename(os.path.normpath(model_dir))
+    safe_strategy_id = re.sub(r'[^A-Za-z0-9_.-]', '_', strategy_id)
+
     # 2) Resolve ticker/timeframe
     ticker = args.ticker or meta.get("ticker") or "BTCUSDT"
     timeframe = args.timeframe or meta.get("timeframe") or "1h"
@@ -883,7 +887,9 @@ def decide_and_maybe_trade(args):
     today_str = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d")
     guard_dir = "/home/production/guards"
     os.makedirs(guard_dir, exist_ok=True)
-    daily_guard_path = os.path.join(guard_dir, "bybit_daily_profit.json")
+
+    daily_guard_filename = f"coinex_daily_profit_{safe_strategy_id}.json"
+    daily_guard_path = os.path.join(guard_dir, daily_guard_filename)
 
     daily_state = load_daily_profit_state(daily_guard_path, today_str, equity_now)
     log_daily_status(daily_state, DAILY_PROFIT_TARGET_PCT)
