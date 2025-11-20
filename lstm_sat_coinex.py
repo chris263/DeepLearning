@@ -370,29 +370,68 @@ def _save_json_atomic(path: str, payload: Dict[str, Any]) -> None:
 
 def load_daily_profit_state(path: str, today: str, equity_now: float) -> Dict[str, Any]:
     """
-    Load or (if new day) reset the daily profit state.
-    equity_now is the current account equity in quote currency (e.g., USDT/USDC).
+    Load or (if new day / big equity mismatch) reset the daily profit state.
+
+    equity_now: current account equity (e.g. CoinEx SWAP balance or Bybit total USDT).
     """
     st: Dict[str, Any] = {}
+    eq_now = float(equity_now or 0.0)
+
+    # Try to load existing
     if os.path.exists(path):
         try:
             with open(path, "r") as f:
                 st = json.load(f)
-        except Exception:
+        except Exception as e:
+            print(f"[DAILY PROFIT] failed to read {path}: {e}; resetting state.")
             st = {}
 
+    # 1) If no state or different day → start fresh
     if not st or st.get("date") != today:
-        # new trading day → reset
         st = {
             "date": today,
-            "equity_start": float(equity_now),
+            "equity_start": eq_now,
             "realized_pnl": 0.0,
             "daily_pct": 0.0,
             "hit_target": False,
         }
         _save_json_atomic(path, st)
+        print(
+            f"[DAILY PROFIT] Initialized new daily state: "
+            f"date={today}, equity_start={eq_now:.2f}"
+        )
+        return st
+
+    # 2) Same date: optionally adjust equity_start if it looks bogus
+    eq_old = float(st.get("equity_start", 0.0) or 0.0)
+    realized = float(st.get("realized_pnl", 0.0) or 0.0)
+
+    # If previous equity_start was 0 or negative but we now have a valid equity, fix it
+    if eq_now > 0 and eq_old <= 0:
+        st["equity_start"] = eq_now
+        st["daily_pct"] = realized / eq_now
+        _save_json_atomic(path, st)
+        print(
+            f"[DAILY PROFIT] Adjusted equity_start from {eq_old:.2f} to {eq_now:.2f} "
+            f"(was <= 0)."
+        )
+        return st
+
+    # If both > 0 but very different (e.g. from previous wrong baseline),
+    # and the difference is > 50% of current equity, update baseline.
+    if eq_now > 0 and eq_old > 0:
+        rel_diff = abs(eq_now - eq_old) / eq_now
+        if rel_diff > 0.5:  # 50% threshold – tweak if you want
+            st["equity_start"] = eq_now
+            st["daily_pct"] = realized / eq_now
+            _save_json_atomic(path, st)
+            print(
+                "[DAILY PROFIT] NOTE: equity_start adjusted for today — "
+                f"old={eq_old:.2f}, new={eq_now:.2f}, diff={rel_diff*100:.1f}%."
+            )
 
     return st
+
 
 def log_daily_status(state: Dict[str, Any], target_pct: float) -> None:
     eq0 = float(state.get("equity_start", 0.0)) or 1.0
@@ -402,8 +441,8 @@ def log_daily_status(state: Dict[str, Any], target_pct: float) -> None:
     hit = bool(state.get("hit_target"))
 
     print(
-        f"[DAILY PROFIT STATUS] date={date} | "
-        f"start_equity={eq0:.2f} | realized={realized:.2f} "
+        f"[DAILY PROFIT STATUS] date={date} | \n"
+        f"start_equity={eq0:.2f} | realized={realized:.2f} \n"
         f"({pct*100:.2f}%) | target={target_pct*100:.2f}% | hit_target={hit}"
     )
 
