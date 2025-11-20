@@ -888,7 +888,7 @@ def decide_and_maybe_trade(args):
     guard_dir = "/home/production/guards"
     os.makedirs(guard_dir, exist_ok=True)
 
-    daily_guard_filename = f"coinex_daily_profit_{safe_strategy_id}.json"
+    daily_guard_filename = f"bybit_daily_profit_{safe_strategy_id}.json"
     daily_guard_path = os.path.join(guard_dir, daily_guard_filename)
 
     daily_state = load_daily_profit_state(daily_guard_path, today_str, equity_now)
