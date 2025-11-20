@@ -332,6 +332,36 @@ import datetime
 
 DAILY_PROFIT_TARGET_PCT = float(os.getenv("DAILY_PROFIT_TARGET_PCT", "0.02"))  # 2% default
 
+def get_equity_for_daily_guard(ex) -> float:
+    """
+    Try to get a realistic account equity in USDT to use as the
+    baseline for daily % PnL. Prefer total USDT balance; fall back
+    to swap-only free balance if needed.
+    """
+    # 1) Prefer total account USDT (ccxt-style)
+    try:
+        bal = ex.fetch_balance()
+        for code in ("USDT", "USDC"):
+            acc = bal.get(code)
+            if isinstance(acc, dict):
+                v = acc.get("total") or acc.get("free") or acc.get("used")
+                if v is not None:
+                    eq = float(v)
+                    print(f"[DAILY PROFIT] Using {code} total={eq:.2f} as equity baseline.")
+                    return eq
+    except Exception as e:
+        print(f"[WARN] fetch_balance() failed for daily guard, falling back to swap-only: {e}")
+
+    # 2) Fallback: swap-only free balance (what we used before)
+    try:
+        eq = float(fetch_usdt_balance_swap(ex))
+        print(f"[DAILY PROFIT] Using swap-only balance={eq:.2f} as equity baseline (fallback).")
+        return eq
+    except Exception as e:
+        print(f"[WARN] fetch_usdt_balance_swap() failed for daily guard, equity_now=0: {e}")
+        return 0.0
+
+
 def _save_json_atomic(path: str, payload: Dict[str, Any]) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
@@ -925,12 +955,7 @@ def decide_and_maybe_trade(args):
     symbol = resolve_symbol(ex, ticker)
 
     # --- DAILY PROFIT GUARD INIT (after we can read equity from the exchange) ---
-    try:
-        # Use your swap USDT balance as "equity" baseline for the day
-        equity_now = float(fetch_usdt_balance_swap(ex))
-    except Exception as e:
-        print(f"[WARN] failed to fetch swap balance for daily guard, defaulting equity_now=0: {e}")
-        equity_now = 0.0
+    equity_now = get_equity_for_daily_guard(ex)
 
     today_str = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d")
     guard_dir = "/home/production/guards"
