@@ -732,12 +732,8 @@ def decide_and_maybe_trade(args):
         return
 
     # 8) Fresh-cross trigger logic
-    if timeframe == '30m':
-        take_long = (p_last >= pos_thr) and (p_prev < p_last) and (p_prev <= pos_thr)  ## Including fresh cross
-        take_short = (p_last <= neg_thr) and (p_prev > p_last) and (p_prev >= neg_thr)
-    else:
-        take_long = (p_last >= pos_thr) and (p_prev < p_last)
-        take_short = (p_last <= neg_thr) and (p_prev > p_last)
+    take_long = (p_last >= pos_thr) and (p_prev < p_last)
+    take_short = (p_last <= neg_thr) and (p_prev > p_last)
 
     # 9) Exchange (unified swap)
     ex = make_exchange(args.pub_key, args.sec_key, keys_file=args.keys_file)
@@ -751,6 +747,20 @@ def decide_and_maybe_trade(args):
 
     # Neutral band helper
     in_neutral = (neg_thr < p_last < pos_thr)
+
+    # --- SL GUARD: block immediate re-entry after a Stop Loss ---
+    sl_guard = load_sl_guard(guard_path)
+    sl_active = bool(sl_guard.get("active"))
+    sl_neutral_seen = bool(sl_guard.get("neutral_seen"))
+
+    # If we already took an SL and now the probabilities are in the neutral band,
+    # mark that as "neutral crossed" and allow future entries.
+    if sl_active and in_neutral and not sl_neutral_seen:
+        sl_guard["neutral_seen"] = True
+        sl_neutral_seen = True
+        save_sl_guard(guard_path, sl_guard)
+        print("[SL-GUARD] Neutral zone touched after last SL — "
+              "new trades will be allowed on the next fresh-cross.")
 
     if pos is not None and pos.get("side"):
         # There is an open position on the exchange
