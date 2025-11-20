@@ -932,7 +932,7 @@ def decide_and_maybe_trade(args):
         print(f"[WARN] failed to fetch swap balance for daily guard, defaulting equity_now=0: {e}")
         equity_now = 0.0
 
-    today_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+    today_str = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d")
     guard_dir = "/home/production/guards"
     os.makedirs(guard_dir, exist_ok=True)
     daily_guard_path = os.path.join(guard_dir, "coinex_daily_profit.json")

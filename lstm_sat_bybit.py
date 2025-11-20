@@ -797,11 +797,10 @@ def decide_and_maybe_trade(args):
             raise SystemExit(f"Feature '{c}' missing in computed frame.")
     feat_df = feat_df_full.copy()
 
-    # 4) Inference (prev vs last bar) — explicit windows (no helper)
+    # 4) Inference (prev vs last bar)
     feat_mat = feat_df[feats].to_numpy(dtype=np.float32)
- 
-    X_prev = feat_mat[-lookback-1 : -1] 
-    X_last = feat_mat[-lookback   :   ] 
+    X_prev = feat_mat[-lookback-1 : -1]
+    X_last = feat_mat[-lookback   :   ]
     X = np.stack([X_prev, X_last], axis=0)
 
     if getattr(args, "debug", False):
@@ -812,13 +811,16 @@ def decide_and_maybe_trade(args):
     p_prev, p_last = run_model(model, X, mean, std)
     if getattr(args, "debug", False):
         print(f"[DEBUG] proba — prev={p_prev:.8f} last={p_last:.8f} Δ={p_last-p_prev:+.8f}")
- 
+
     # 5) Time gating (6-minute window after close)
     now_ms = int(time.time() * 1000)
     ts_last_open = int(df["ts"].iloc[-1])
     last_close_ms, stamp_tag, age_ms = resolve_last_closed(now_ms, ts_last_open, timeframe)
     if args.debug:
-        print(f"[DEBUG] last bar — ts_last_open={ts_last_open} tag={stamp_tag} age_min={(age_ms/60000.0) if age_ms is not None else None}")
+        print(
+            f"[DEBUG] last bar — ts_last_open={ts_last_open} tag={stamp_tag} "
+            f"age_min={(age_ms/60000.0) if age_ms is not None else None}"
+        )
     if last_close_ms is None or not (0 <= age_ms <= SIX_MIN_MS):
         print("Last closed bar is not within the 6-minute window — not acting.")
         return
@@ -829,7 +831,7 @@ def decide_and_maybe_trade(args):
         shared = read_lastbars_store().get(f"{ticker}:{timeframe}", {})
         print(f"[DEBUG] shared lastbar: {shared.get('bar_id')} last_close_ts={shared.get('last_close_ts')}")
 
-    # 7) Guard & reversal state
+    # 7) Guard & reversal state (per-bar)
     suffix = f"bybit_swap_{ticker}_{timeframe}"
     last_seen_ts, guard_path = last_executed_guard(model_dir, suffix)
     rev_state_path = reversal_state_paths(model_dir, suffix)
@@ -845,6 +847,28 @@ def decide_and_maybe_trade(args):
     # 9) Exchange (unified swap)
     ex = make_exchange(args.pub_key, args.sec_key, keys_file=args.keys_file)
     symbol = resolve_symbol(ex, ticker)
+
+    # --- DAILY PROFIT GUARD INIT (after we can read equity from Bybit) ---
+    try:
+        equity_now = float(fetch_usdt_balance_swap(ex))
+    except Exception as e:
+        print(f"[WARN] failed to fetch swap balance for daily guard, defaulting equity_now=0: {e}")
+        equity_now = 0.0
+
+    today_str = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d")
+    guard_dir = "/home/production/guards"
+    os.makedirs(guard_dir, exist_ok=True)
+    daily_guard_path = os.path.join(guard_dir, "bybit_daily_profit.json")
+
+    daily_state = load_daily_profit_state(daily_guard_path, today_str, equity_now)
+    log_daily_status(daily_state, DAILY_PROFIT_TARGET_PCT)
+
+    if daily_guard_blocks_new_trades(daily_state, DAILY_PROFIT_TARGET_PCT):
+        print(
+            f"[DAILY PROFIT GUARD] Target {DAILY_PROFIT_TARGET_PCT*100:.2f}% "
+            f"already reached today ({daily_state.get('daily_pct', 0.0)*100:.2f}%). "
+            f"No NEW positions will be opened today."
+        )
 
     # 10) Position & SL/TP (+ signal exit on neutral)
     pos = get_swap_position(ex, symbol)
@@ -869,6 +893,7 @@ def decide_and_maybe_trade(args):
         print("[SL-GUARD] Neutral zone touched after last SL — "
               "new trades will be allowed on the next fresh-cross.")
 
+    # ===== OPEN POSITION HANDLING =====
     if pos is not None and pos.get("side"):
         # There is an open position on the exchange
         side_open_raw = pos.get("side")
@@ -906,17 +931,26 @@ def decide_and_maybe_trade(args):
                     ex.create_order(symbol, "market", "sell", close_qty, None, {"reduceOnly": True})
                     print(f"{reason} hit — closing existing LONG at ~{(sl_px if hit_sl else tp_px):.8g}")
                     write_last_executed(guard_path, last_close_ms)
-                    
-                    # >>> NEW: if this was a Stop Loss, activate the SL guard
+
+                    # NEW: SL guard on Stop Loss
                     if reason == "SL":
                         activate_sl_guard(guard_path, last_close_ms, sl_side="long")
+
+                    # NEW: record realized PnL for LONG close
+                    exit_px = last_close
+                    pnl_quote = (exit_px - entry) * close_qty
+                    daily_state = record_realized_pnl(
+                        daily_guard_path,
+                        daily_state,
+                        pnl_quote=pnl_quote,
+                        target_pct=DAILY_PROFIT_TARGET_PCT,
+                    )
 
                 except Exception as e:
                     print(f"[ERROR] close LONG on {reason} failed: {e}")
                 return
 
-            # 10b) SIGNAL EXIT: close LONG when we leave LONG zone
-            #     (i.e. probability drops below pos_thr → neutral or short zone)
+            # 10b) SIGNAL EXIT: close LONG when leaving LONG zone
             if p_last < pos_thr:
                 try:
                     ex.create_order(symbol, "market", "sell", close_qty, None, {"reduceOnly": True})
@@ -926,6 +960,17 @@ def decide_and_maybe_trade(args):
                         f"p_last={p_last:.3f} < pos_thr={pos_thr:.3f}; closing LONG at ~{last_close}"
                     )
                     write_last_executed(guard_path, last_close_ms)
+
+                    # NEW: record realized PnL for LONG signal exit
+                    exit_px = last_close
+                    pnl_quote = (exit_px - entry) * close_qty
+                    daily_state = record_realized_pnl(
+                        daily_guard_path,
+                        daily_state,
+                        pnl_quote=pnl_quote,
+                        target_pct=DAILY_PROFIT_TARGET_PCT,
+                    )
+
                 except Exception as e:
                     print(f"[ERROR] close LONG (SIG) failed: {e}")
                 return
@@ -945,16 +990,25 @@ def decide_and_maybe_trade(args):
                     print(f"{reason} hit — closing existing SHORT at ~{(sl_px if hit_sl else tp_px):.8g}")
                     write_last_executed(guard_path, last_close_ms)
 
-                    # >>> NEW: if this was a Stop Loss, activate the SL guard
+                    # NEW: SL guard on Stop Loss
                     if reason == "SL":
                         activate_sl_guard(guard_path, last_close_ms, sl_side="short")
+
+                    # NEW: record realized PnL for SHORT close
+                    exit_px = last_close
+                    pnl_quote = (entry - exit_px) * close_qty
+                    daily_state = record_realized_pnl(
+                        daily_guard_path,
+                        daily_state,
+                        pnl_quote=pnl_quote,
+                        target_pct=DAILY_PROFIT_TARGET_PCT,
+                    )
 
                 except Exception as e:
                     print(f"[ERROR] close SHORT on {reason} failed: {e}")
                 return
 
-            # 10d) SIGNAL EXIT: close SHORT when we leave SHORT zone
-            #     (i.e. probability rises above neg_thr → neutral or long zone)
+            # 10d) SIGNAL EXIT: close SHORT when leaving SHORT zone
             if p_last > neg_thr:
                 try:
                     ex.create_order(symbol, "market", "buy", close_qty, None, {"reduceOnly": True})
@@ -964,40 +1018,72 @@ def decide_and_maybe_trade(args):
                         f"p_last={p_last:.3f} > neg_thr={neg_thr:.3f}; closing SHORT at ~{last_close}"
                     )
                     write_last_executed(guard_path, last_close_ms)
+
+                    # NEW: record realized PnL for SHORT signal exit
+                    exit_px = last_close
+                    pnl_quote = (entry - exit_px) * close_qty
+                    daily_state = record_realized_pnl(
+                        daily_guard_path,
+                        daily_state,
+                        pnl_quote=pnl_quote,
+                        target_pct=DAILY_PROFIT_TARGET_PCT,
+                    )
+
                 except Exception as e:
                     print(f"[ERROR] close SHORT (SIG) failed: {e}")
                 return
         else:
-            # Unknown side string: be safe and do not open anything new
             print(f"[WARN] Unknown open side {side_open!r}; keeping position and not opening new trades.")
             return
 
-        # If we still have a position and no SL/TP or signal-exit, we **keep** it and
-        # do not allow any new opens this bar (no flip, no pyramiding).
+        # If we still have a position and no SL/TP or signal-exit, we keep it
         print(
             f"Keeping existing {side_open.upper()} open — "
             f"p_last={p_last:.3f}, pos_thr={pos_thr:.3f}, neg_thr={neg_thr:.3f}"
         )
         return
 
+    # ===== FLAT LOGIC =====
 
-    # 11) If flat and no fresh signal, do nothing
+    # SL-GUARD: if an SL just happened and we have NOT yet seen neutral, block fresh-cross entries.
+    if sl_active and not sl_neutral_seen:
+        if take_long or take_short:
+            print(
+                "[SL-GUARD] Fresh signal blocked after SL — waiting for probabilities "
+                "to pass through the neutral band (neg_thr < p < pos_thr). "
+                f"p_prev={p_prev:.3f}, p_last={p_last:.3f}, "
+                f"pos_thr={pos_thr:.3f}, neg_thr={neg_thr:.3f}"
+            )
+        else:
+            msg = _explain_no_open(p_prev, p_last, pos_thr, neg_thr)
+            print(msg)
+        return
+
+    # If flat and no fresh signal, do nothing
     if not (take_long or take_short):
         msg = _explain_no_open(p_prev, p_last, pos_thr, neg_thr)
         print(msg)
         return
 
-    # 12) Optional top-up for swap (unchanged)
+    # DAILY PROFIT GUARD: block new entries once daily target reached
+    if daily_guard_blocks_new_trades(daily_state, DAILY_PROFIT_TARGET_PCT):
+        print(
+            "[DAILY PROFIT GUARD] Fresh signal detected but daily profit target "
+            f"{DAILY_PROFIT_TARGET_PCT*100:.2f}% already reached "
+            f"({daily_state.get('daily_pct', 0.0)*100:.2f}%) — skipping new entry."
+        )
+        return
+
+    # 12) Optional top-up for swap
     if args.auto_transfer:
         transfer_spot_to_swap_if_needed(ex, min_usdt=50.0, buffer_frac=args.transfer_buffer, debug=args.debug)
 
-    # 13) OPEN order — balance-based sizing, now with attached TP/SL on exchange
+    # 13) OPEN order — balance-based sizing, with attached TP/SL on exchange
     try:
         quote_bal_swap = fetch_usdt_balance_swap(ex)
         side = "buy" if take_long else "sell"
 
-        # Leave a small safety buffer so Bybit has room for fees / margin.
-        # LONG ~97% of free balance, SHORT ~77% (keeping your 20% relative idea).
+        # Leave a small safety buffer
         risk_long = 0.97
         risk_short = 0.77
 
@@ -1022,8 +1108,6 @@ def decide_and_maybe_trade(args):
             print("Calculated order size is zero after precision rounding.")
             return
 
-
-        # Helpful debug
         print(
             f"[DEBUG] swap_bal={quote_bal_swap:.4f} usd_to_use={usd_to_use:.4f} "
             f"qty≈{qty_approx:.6f} notional≈{qty*last_close:.4f}"
@@ -1043,7 +1127,12 @@ def decide_and_maybe_trade(args):
         oid = order.get("id") or order.get("orderId") or order
         print(f"Order placed: {oid}")
 
-        # --- Attach TP & SL as exchange-side reduce-only orders (if supported) ---
+        # Reset SL guard because we are taking a new trade
+        if sl_active:
+            save_sl_guard(guard_path, {"active": False, "neutral_seen": False})
+            print("[SL-GUARD] Reset after new position opening.")
+
+        # --- Attach TP & SL as exchange-side reduce-only orders (existing logic) ---
         try:
             entry_price = float(order.get("average") or order.get("price") or last_close)
 
@@ -1053,7 +1142,6 @@ def decide_and_maybe_trade(args):
             sl_price_logged = None
 
             def _safe_order_id(o):
-                # handle dict or raw id
                 if isinstance(o, dict):
                     info = o.get("info") or {}
                     return (
@@ -1064,7 +1152,6 @@ def decide_and_maybe_trade(args):
                     )
                 return o
 
-            # BYBIT: use contract TP/SL params so SL actually attaches
             if ex.id == "bybit":
                 params_common = {
                     "reduceOnly": True,
@@ -1138,6 +1225,7 @@ def decide_and_maybe_trade(args):
                             tp_price_logged = tp_price
                         else:
                             print(f"[WARN] TP order returned no id on {ex.id}: {tp!r}")
+
                     if sl_pct is not None and sl_pct > 0:
                         sl_price = price_to_precision(ex, symbol, entry_price * (1.0 + sl_pct))
                         sl = ex.create_order(
@@ -1160,9 +1248,8 @@ def decide_and_maybe_trade(args):
                             print(f"[WARN] SL order returned no id on {ex.id}: {sl!r}")
 
             else:
-                # GENERIC / COINEX / OTHER: previous logic, but include takeProfitPrice where useful
+                # Generic / other exchanges (kept as-is)
                 if side == "buy":
-                    # LONG: TP above, SL below
                     if tp_pct is not None and tp_pct > 0:
                         tp_price = price_to_precision(ex, symbol, entry_price * (1.0 + tp_pct))
                         tp = ex.create_order(
@@ -1173,7 +1260,6 @@ def decide_and_maybe_trade(args):
                             tp_price,
                             {
                                 "reduceOnly": True,
-                                # helps some exchanges (e.g. CoinEx) show as TP
                                 "takeProfitPrice": float(tp_price),
                             },
                         )
@@ -1205,7 +1291,6 @@ def decide_and_maybe_trade(args):
                             print(f"[WARN] SL order returned no id on {ex.id}: {sl!r}")
 
                 else:
-                    # SHORT: TP below, SL above
                     if tp_pct is not None and tp_pct > 0:
                         tp_price = price_to_precision(ex, symbol, entry_price * (1.0 - tp_pct))
                         tp = ex.create_order(
