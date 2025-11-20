@@ -1019,7 +1019,7 @@ def decide_and_maybe_trade(args):
 
     # Derive base from ticker (BTCUSDC, BTC/USDC, etc.)
     raw_ticker = (ticker or "").upper()
-    base = raw_ticker.replace("/", "").replace(":", "")
+    base = "BTC"
     for suf in ("USDC", "USDT", "USD"):
         if base.endswith(suf):
             base = base[: -len(suf)]
