@@ -734,46 +734,6 @@ def safe_close_amount(ex, symbol: str, position_size: float) -> float:
         return 0.0
     return qty
 
-def _get_intx_portfolio_uuid(ex) -> Optional[str]:
-    """
-    Resolve the INTX (perpetuals) portfolio UUID for this key.
-
-    Priority:
-      1) COINBASE_INTX_PORTFOLIO_UUID env var (if you set it manually)
-      2) Scan get_portfolios() for type == 'INTX'
-    """
-    portfolio_uuid = os.environ.get("COINBASE_INTX_PORTFOLIO_UUID")
-    if portfolio_uuid:
-        return portfolio_uuid
-
-    try:
-        resp = ex.get_portfolios()
-        portfolios = None
-        if hasattr(resp, "portfolios"):
-            portfolios = resp.portfolios
-        elif isinstance(resp, dict):
-            portfolios = resp.get("portfolios", [])
-        else:
-            portfolios = []
-
-        if not portfolios:
-            return None
-
-        for pf in portfolios:
-            if isinstance(pf, dict):
-                pf_type = pf.get("type") or ""
-                pf_uuid = pf.get("uuid")
-            else:
-                pf_type = getattr(pf, "type", "") or ""
-                pf_uuid = getattr(pf, "uuid", None)
-
-            if pf_uuid and pf_type == "INTX":
-                return pf_uuid
-
-    except Exception as e:
-        print(f"[WARN] _get_intx_portfolio_uuid: failed to list portfolios: {e}")
-
-    return None
 
 def _get_cfm_balance_summary(ex) -> dict:
     """
@@ -818,50 +778,81 @@ def get_swap_position(ex, product_id: str) -> Optional[Dict]:
     return None
 
 
-def resolve_perp_product(client, base: str, prefer_venues=("CDE", "FCM")) -> str:
-    # Ask API only for futures & perpetuals
-    resp = client.get_products(
-        product_type="FUTURE",
-        contract_expiry_type="PERPETUAL",
-    )
-    prods = resp.products or []
+def resolve_perp_product(client, base: str) -> str:
+    """
+    Resolve a BTC/ETH futures product for *US derivatives/CFM*,
+    NOT the INTX international perps.
+
+    We:
+      - list FUTURE products
+      - skip anything with product_venue containing 'INTX'
+      - keep only base=<base>, quote in {USD, USDC}
+      - prefer 'PERPETUAL' expiry type if it exists,
+        otherwise just pick the first by expiry.
+    """
+    resp = client.get_products(product_type="FUTURE")
+    prods = getattr(resp, "products", resp)
 
     candidates = []
+    base = base.upper()
+
     for p in prods:
-        if p.base_currency != base or p.quote_currency != "USD":
+        # robust access (SDK objects or dict-like)
+        p_id   = getattr(p, "product_id", None) or p.get("product_id")
+        b_cur  = getattr(p, "base_currency", None) or p.get("base_currency")
+        q_cur  = getattr(p, "quote_currency", None) or p.get("quote_currency")
+        venue  = getattr(p, "product_venue", None) or p.get("product_venue") or ""
+        fdet   = getattr(p, "future_product_details", None) or p.get("future_product_details") or {}
+
+        venue_u = str(venue).upper()
+        if "INTX" in venue_u:
+            # <-- skip international perps completely
             continue
 
-        details = p.future_product_details or {}
-        venue = (details.get("product_venue") or "").upper()
-        display = getattr(p, "display_name", p.product_id)
+        if str(b_cur).upper() != base:
+            continue
+        if str(q_cur).upper() not in ("USD", "USDC"):
+            continue
 
-        candidates.append((venue, p))
-    
+        ce_type  = str(fdet.get("contract_expiry_type", "")).upper()
+        expiry   = str(fdet.get("contract_expiry", "") or "")
+        dispname = getattr(p, "display_name", None) or p.get("display_name") or p_id
+
+        # prefer PERPETUAL, then later expiry as a simple heuristic
+        is_perp = (ce_type == "PERPETUAL")
+        candidates.append((is_perp, expiry, p_id, venue_u, dispname))
+
     if not candidates:
-        raise RuntimeError(f"No PERPETUAL futures product found for base={base}")
+        raise RuntimeError(f"No eligible US-derivatives future found for base={base} "
+                           f"(only INTX perps or nothing listed)")
 
-    print("[DEBUG] Perp candidates for base", base, "=>",
-          [(v, pp.product_id) for v, pp in candidates])
+    # sort so (True, …) PERPETUAL comes first; otherwise by expiry string
+    candidates.sort(reverse=True)
+    is_perp, expiry, p_id, venue_u, dispname = candidates[0]
 
-    # 1) Prefer explicit US-derivatives venues (CDE/FCM)
-    for venue, p in candidates:
-        if venue in prefer_venues:
-            print(f"[DEBUG] Resolved CFM perp for base={base} -> "
-                  f"{p.product_id} (venue={venue}, name={p.display_name})")
-            return p.product_id
+    print(f"[DEBUG] Resolved Coinbase US-derivatives future for base={base} -> "
+          f"{p_id} (venue={venue_u}, name={dispname}, expiry={expiry}, is_perp={is_perp})")
 
-    # 2) Otherwise, pick any non-INTX if available
-    for venue, p in candidates:
-        if venue != "INTX":
-            print(f"[DEBUG] Resolved non-INTX perp for base={base} -> "
-                  f"{p.product_id} (venue={venue}, name={p.display_name})")
-            return p.product_id
+    return p_id
 
-    # 3) Fallback: last resort, might still be INTX
-    venue, p = candidates[0]
-    print(f"[WARN] Only INTX perp found for base={base}; using {p.product_id} (venue={venue})")
-    return p.product_id
 
+def debug_list_futures_for_base(client, base: str = "BTC"):
+    resp = client.get_products(product_type="FUTURE")
+    for p in resp.products:
+        fdet = p.future_product_details or {}
+        venue = (p.product_venue or "").upper()
+        print(
+            p.product_id,
+            "| base=", p.base_currency,
+            "quote=", p.quote_currency,
+            "venue=", venue,
+            "expiry_type=", fdet.get("contract_expiry_type"),
+            "expiry=", fdet.get("contract_expiry"),
+            "name=", p.display_name,
+        )
+
+
+debug_list_futures_for_base(client, "BTC")
 
 
 # =========================
