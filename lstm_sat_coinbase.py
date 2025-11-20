@@ -802,7 +802,10 @@ def get_swap_position(ex, product_id: str) -> Optional[Dict]:
     raw = ex.get("/api/v3/brokerage/cfm/positions")
     data = raw.to_dict() if hasattr(raw, "to_dict") else raw
     positions = data.get("positions") or []
-
+    
+    if not positions:
+        print("[DEBUG] get_swap_position: no CFM futures positions returned.")
+    
     for p in positions:
         if p.get("product_id") != product_id:
             continue
@@ -815,19 +818,51 @@ def get_swap_position(ex, product_id: str) -> Optional[Dict]:
     return None
 
 
-def resolve_perp_product(client, base: str) -> str:
-    prods = client.get_products(product_type="FUTURE").products
-    for p in prods:
-        details = p.future_product_details or {}
-        if details.get("contract_expiry_type") != "perpetual":
-            continue
-        # e.g. BTC-PERP, ETH-PERP, COIN50-PERP, etc.
-        if p.base_currency == base and p.quote_currency == "USD":
-            return p.product_id
-    raise RuntimeError(f"No perp product found for base={base}")
+def resolve_perp_product(client, base: str, prefer_venues=("CDE", "FCM")) -> str:
+    # Ask API only for futures & perpetuals
+    resp = client.get_products(
+        product_type="FUTURE",
+        contract_expiry_type="PERPETUAL",
+    )
+    prods = resp.products or []
 
-base = "BTC"
-product_id = resolve_perp_product(client, base)
+    candidates = []
+    for p in prods:
+        if p.base_currency != base or p.quote_currency != "USD":
+            continue
+
+        details = p.future_product_details or {}
+        venue = (details.get("product_venue") or "").upper()
+        display = getattr(p, "display_name", p.product_id)
+
+        candidates.append((venue, p))
+    
+    if not candidates:
+        raise RuntimeError(f"No PERPETUAL futures product found for base={base}")
+
+    print("[DEBUG] Perp candidates for base", base, "=>",
+          [(v, pp.product_id) for v, pp in candidates])
+
+    # 1) Prefer explicit US-derivatives venues (CDE/FCM)
+    for venue, p in candidates:
+        if venue in prefer_venues:
+            print(f"[DEBUG] Resolved CFM perp for base={base} -> "
+                  f"{p.product_id} (venue={venue}, name={p.display_name})")
+            return p.product_id
+
+    # 2) Otherwise, pick any non-INTX if available
+    for venue, p in candidates:
+        if venue != "INTX":
+            print(f"[DEBUG] Resolved non-INTX perp for base={base} -> "
+                  f"{p.product_id} (venue={venue}, name={p.display_name})")
+            return p.product_id
+
+    # 3) Fallback: last resort, might still be INTX
+    venue, p = candidates[0]
+    print(f"[WARN] Only INTX perp found for base={base}; using {p.product_id} (venue={venue})")
+    return p.product_id
+
+
 
 # =========================
 # Inference helpers (unchanged)
@@ -991,7 +1026,7 @@ def decide_and_maybe_trade(args):
     # 9) Coinbase client + product_id
     client = make_coinbase_client(args.pub_key, args.sec_key)
 
-    # Derive base symbol from model ticker (BTCUSDC, BTC/USDC, etc.)
+    # Derive base from ticker (BTCUSDC, BTC/USDC, etc.)
     raw_ticker = (ticker or "").upper()
     base = raw_ticker.replace("/", "").replace(":", "")
     for suf in ("USDC", "USDT", "USD"):
@@ -1001,8 +1036,18 @@ def decide_and_maybe_trade(args):
     if not base:
         base = "BTC"  # safe fallback
 
-    base = "BTC"
+    # TEMP: you forced BTC here before; now let the logic work,
+    # or keep this override if you only want BTC for now:
+    # base = "BTC"
+
     product_id = resolve_perp_product(client, base)
+
+    # 10) Position & SL/TP (+ signal exit on neutral)
+    pos        = get_swap_position(client, product_id)
+    last_close = float(df["close"].iloc[-1])
+    last_high  = float(df["high"].iloc[-1])
+    last_low   = float(df["low"].iloc[-1])
+
 
     # 10) Position & SL/TP (+ signal exit on neutral)
     pos       = get_swap_position(client, product_id)  # your Coinbase version
