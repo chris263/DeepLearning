@@ -308,7 +308,7 @@ def get_equity_for_daily_guard(ex) -> float:
                 v = acc.get("total") or acc.get("free") or acc.get("used")
                 if v is not None:
                     eq = float(v)
-                    print(f"[DAILY PROFIT] Using {code} total={eq:.2f} as equity baseline.")
+                    print(f"[DAILY PROFIT] Using {code} total={eq:.2f} as total (including unrealized).")
                     return eq
     except Exception as e:
         print(f"[WARN] fetch_balance() failed for daily guard, falling back to swap-only: {e}")

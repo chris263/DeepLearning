@@ -340,7 +340,7 @@ def get_equity_for_daily_guard_coinex(ex) -> float:
     # 1) Prefer swap/futures USDT balance (what you already use for sizing)
     try:
         eq = float(fetch_usdt_balance_swap(ex))
-        print(f"[DAILY PROFIT] CoinEx: using SWAP balance={eq:.2f} as equity baseline.")
+        # print(f"[DAILY PROFIT] CoinEx: using SWAP balance={eq:.2f} as equity baseline.")
         return eq
     except Exception as e:
         print(f"[WARN] CoinEx swap balance failed for daily guard, trying generic USDT total: {e}")
@@ -420,18 +420,30 @@ def load_daily_profit_state(path: str, today: str, equity_now: float) -> Dict[st
 
 
 
-def log_daily_status(state: Dict[str, Any], target_pct: float) -> None:
-    eq0 = float(state.get("equity_start", 0.0)) or 1.0
-    realized = float(state.get("realized_pnl", 0.0))
-    pct = realized / eq0
+def log_daily_status(state: Dict[str, Any], target_pct: float, equity_now: float = None) -> None:
+    eq0 = float(state.get("equity_start", 0.0) or 1.0)
+    realized = float(state.get("realized_pnl", 0.0) or 0.0)
+    realized_pct = realized / eq0
     date = state.get("date", "?")
     hit = bool(state.get("hit_target"))
 
-    print(
+    msg = (
         f"[DAILY PROFIT STATUS] date={date} | "
-        f"start_equity={eq0:.2f} | realized={realized:.2f} "
-        f"({pct*100:.2f}%) | target={target_pct*100:.2f}% | hit_target={hit}"
+        f"equity_start={eq0:.2f} | "
+        f"realized={realized:.2f} ({realized_pct*100:.2f}%) | "
+        f"target={target_pct*100:.2f}% | hit_target={hit}"
     )
+
+    if equity_now is not None and eq0 > 0:
+        eq_change_pct = (float(equity_now) - eq0) / eq0
+        msg += (
+            f" | equity_now={float(equity_now):.2f} "
+            f"({eq_change_pct*100:.2f}% vs start)"
+        )
+
+    msg += " | [GUARD uses REALIZED PnL only (open PnL & deposits ignored)]"
+    print(msg)
+
 
 def record_realized_pnl(path: str, state: Dict[str, Any], pnl_quote: float, target_pct: float) -> Dict[str, Any]:
     """
