@@ -815,55 +815,41 @@ def get_swap_position(ex, product_id: str) -> Optional[Dict]:
     return None
 
 
-def resolve_coinbase_perp_product_id(client, base: str = "BTC") -> str:
-    """
-    Resolve the Coinbase perpetual FUTURE product_id for a given base, e.g. 'BTC'.
-
-    Uses:
-      - product_type = FUTURE
-      - future_product_details.contract_expiry_type = PERPETUAL
-
-    Prefers product_venue == 'INTX' when multiple matches exist.
-    """
-    base_u = base.upper()
-
-    resp = client.get(
-        "/api/v3/brokerage/products",
-        params={
-            "product_type": "FUTURE",
-            "contract_expiry_type": "PERPETUAL",
-            "limit": 250,
-        },
-    )
-    products = resp.get("products", []) or []
-
+def resolve_perp_product(client, base: str) -> tuple[str, str]:
+    prods = client.get_products().products
     candidates = []
-    for p in products:
-        fpd = p.get("future_product_details") or {}
-        contract_code = (fpd.get("contract_code") or "").upper()
-        root_unit     = (fpd.get("contract_root_unit") or "").upper()
-        base_id       = (p.get("base_currency_id") or "").upper()
-        disp_name     = (p.get("display_name") or "").upper()
 
-        # Match BTC by contract_code, root_unit, base_id or display_name prefix
-        if base_u not in {contract_code, root_unit, base_id} and not disp_name.startswith(base_u + " "):
+    for p in prods:
+        details = getattr(p, "future_product_details", {}) or {}
+        underlying = details.get("underlying_asset") or p.base_currency
+        contract_type = details.get("contract_type")
+
+        # only perpetual futures on that underlying
+        if underlying != base:
+            continue
+        if contract_type != "PERPETUAL":
             continue
 
         candidates.append(p)
 
     if not candidates:
-        raise SystemExit(f"No perpetual FUTURE product found for base={base_u}")
+        raise RuntimeError(f"No perp products found for base={base}")
 
-    # Prefer INTX venue if present
-    intx = [p for p in candidates if p.get("product_venue") == "INTX"]
-    chosen = intx[0] if intx else candidates[0]
+    # Prefer non-INTX venues (CFM for US)
+    chosen = None
+    for p in candidates:
+        venue = (p.future_product_details or {}).get("venue")
+        if venue != "INTX":        # US CFM perps
+            chosen = p
+            break
 
-    pid = chosen["product_id"]
-    print(
-        f"[DEBUG] Resolved Coinbase perp product for base={base_u} -> "
-        f"{pid} (venue={chosen.get('product_venue')}, display_name={chosen.get('display_name')})"
-    )
-    return pid
+    if chosen is None:
+        chosen = candidates[0]
+
+    pid   = chosen.product_id      # e.g. "BTC-PERP"
+    venue = (chosen.future_product_details or {}).get("venue")
+    print(f"[DEBUG] Resolved Coinbase perp product for base={base} -> {pid} (venue={venue}, display_name={chosen.display_name})")
+    return pid, venue
 
 
 # =========================
@@ -1038,8 +1024,7 @@ def decide_and_maybe_trade(args):
     if not base:
         base = "BTC"  # safe fallback
 
-    product_id = resolve_coinbase_perp_product_id(client, base=base)
-
+    product_id, venue = resolve_perp_product(client, base)
 
     # 10) Position & SL/TP (+ signal exit on neutral)
     pos       = get_swap_position(client, product_id)  # your Coinbase version
@@ -1167,8 +1152,8 @@ def decide_and_maybe_trade(args):
             return
 
         # Risk fraction of buying power
-        risk_long  = 0.80
-        risk_short = 0.80
+        risk_long  = 0.50
+        risk_short = 0.50
         usd_to_use = cb_usdc_bal * (risk_long if take_long else risk_short)
         if usd_to_use <= 0:
             print("Calculated usd_to_use is zero or negative; skipping trade.")

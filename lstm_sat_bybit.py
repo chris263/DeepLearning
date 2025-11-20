@@ -616,6 +616,44 @@ def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: floa
         f"fresh-cross rules for LONG (p_prev<pos_thr≤p_last) or SHORT (p_prev>neg_thr≥p_last)."
     )
 
+## SL Protection
+def _sl_guard_file(guard_path: str) -> str:
+    # store per-script SL info right next to the normal guard file
+    return guard_path + ".sl_guard.json"
+
+def load_sl_guard(guard_path: str) -> dict:
+    path = _sl_guard_file(guard_path)
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+            if not isinstance(data, dict):
+                return {"active": False, "neutral_seen": False}
+            return {
+                "active": bool(data.get("active", False)),
+                "neutral_seen": bool(data.get("neutral_seen", False)),
+                "sl_ts": data.get("sl_ts"),
+                "sl_side": data.get("sl_side"),
+            }
+    except Exception:
+        return {"active": False, "neutral_seen": False}
+
+def save_sl_guard(guard_path: str, data: dict) -> None:
+    path = _sl_guard_file(guard_path)
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"[WARN] Could not write SL guard file {path}: {e}")
+
+def activate_sl_guard(guard_path: str, sl_ts: int, sl_side: str) -> None:
+    data = {
+        "active": True,
+        "neutral_seen": False,  # will be set True once we see neutral zone
+        "sl_ts": int(sl_ts),
+        "sl_side": str(sl_side),
+    }
+    save_sl_guard(guard_path, data)
+    print(f"[SL-GUARD] Activated after SL: side={sl_side}, sl_ts={sl_ts}")
 
         
 # =========================
@@ -751,6 +789,11 @@ def decide_and_maybe_trade(args):
                     ex.create_order(symbol, "market", "sell", close_qty, None, {"reduceOnly": True})
                     print(f"{reason} hit — closing existing LONG at ~{(sl_px if hit_sl else tp_px):.8g}")
                     write_last_executed(guard_path, last_close_ms)
+                    
+                    # >>> NEW: if this was a Stop Loss, activate the SL guard
+                    if reason == "SL":
+                        activate_sl_guard(guard_path, last_close_ms, sl_side="long")
+
                 except Exception as e:
                     print(f"[ERROR] close LONG on {reason} failed: {e}")
                 return
@@ -784,6 +827,11 @@ def decide_and_maybe_trade(args):
                     ex.create_order(symbol, "market", "buy", close_qty, None, {"reduceOnly": True})
                     print(f"{reason} hit — closing existing SHORT at ~{(sl_px if hit_sl else tp_px):.8g}")
                     write_last_executed(guard_path, last_close_ms)
+
+                    # >>> NEW: if this was a Stop Loss, activate the SL guard
+                    if reason == "SL":
+                        activate_sl_guard(guard_path, last_close_ms, sl_side="short")
+
                 except Exception as e:
                     print(f"[ERROR] close SHORT on {reason} failed: {e}")
                 return
