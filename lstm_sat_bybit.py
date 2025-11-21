@@ -1054,7 +1054,7 @@ def decide_and_maybe_trade(args):
     # === DAILY PROFIT GUARD: block NEW trades once target hit ===
     if daily_guard_blocks_new_trades(daily_state, DAILY_PROFIT_TARGET_PCT):
         print(
-            f"[DAILY PROFIT GUARD] Not opening because the daily target 🎯"
+            f"[DAILY PROFIT GUARD] Not opening because the daily target 🎯 "
             f"{DAILY_PROFIT_TARGET_PCT*100:.2f}% is already reached "
             f"({daily_state.get('daily_pct', 0.0)*100:.2f}%). "
             "No NEW positions will be opened today."
