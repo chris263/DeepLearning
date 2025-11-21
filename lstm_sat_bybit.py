@@ -1044,7 +1044,6 @@ def decide_and_maybe_trade(args):
     log_daily_status(daily_state, DAILY_PROFIT_TARGET_PCT)
 
     ## Update status
-    equity_now = get_equity_for_daily_guard_coinex(ex)
     daily_state = refresh_daily_state_with_equity(
         daily_guard_path,
         daily_state,
