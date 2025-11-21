@@ -462,7 +462,19 @@ def record_realized_pnl(path: str, state: Dict[str, Any], pnl_quote: float, targ
         current_balance = previous_current_balance + pnl_quote
         realized_pnl    = current_balance - equity_start
     """
-    eq0 = float(state.get("equity_start", 0.0)) or 1.0
+    eq0 = float(state.get("equity_start", 0.0) or 0.0)
+    if eq0 <= 0:
+        # Very defensive: if equity_start is zero or missing, warn and avoid division issues
+        print("[DAILY PROFIT] WARNING: equity_start is 0 or missing in state; "
+              "initializing to 1.0 just for percentage math.")
+        eq0 = 1.0
+
+    # Ensure current_balance exists
+    if "current_balance" not in state:
+        # This usually means old JSON from before we added the field
+        print("[DAILY PROFIT] WARNING: 'current_balance' missing in state; "
+              "initializing it from equity_start.")
+        state["current_balance"] = float(state.get("equity_start", 0.0) or 0.0)
 
     # Previous derived values
     cur_bal_prev = float(state.get("current_balance", eq0))
@@ -470,7 +482,8 @@ def record_realized_pnl(path: str, state: Dict[str, Any], pnl_quote: float, targ
     prev_pct = prev_realized / eq0 if eq0 > 0 else 0.0
 
     # New balance and derived PnL
-    cur_bal_new = cur_bal_prev + float(pnl_quote)
+    pnl_quote = float(pnl_quote)
+    cur_bal_new = cur_bal_prev + pnl_quote
     new_realized = cur_bal_new - eq0
     daily_pct = new_realized / eq0 if eq0 > 0 else 0.0
 
@@ -514,15 +527,26 @@ def daily_guard_blocks_new_trades(state: Dict[str, Any], target_pct: float) -> b
     HARD RULE:
       - If daily_pct >= target_pct OR hit_target is True → BLOCK new trades.
     """
-    eq0 = float(state.get("equity_start", 0.0) or 1.0)
+    eq0 = float(state.get("equity_start", 0.0) or 0.0)
+    if eq0 <= 0:
+        # If somehow equity_start is missing/zero, don't blow up; just treat pct as 0
+        print("[DAILY PROFIT] WARNING: equity_start is 0 or missing when checking guard.")
+        eq0 = 1.0
+
+    if "current_balance" not in state:
+        # This really shouldn't happen anymore after at least one record_realized_pnl,
+        # but let's be safe and noisy.
+        print("[DAILY PROFIT] WARNING: 'current_balance' missing when checking guard; "
+              "initializing from equity_start.")
+        state["current_balance"] = float(state.get("equity_start", 0.0) or 0.0)
+
     cur_bal = float(state.get("current_balance", eq0))
 
     daily_pct = (cur_bal - eq0) / eq0 if eq0 > 0 else 0.0
-    state["daily_pct"] = daily_pct  # keep in sync in memory
+    state["daily_pct"] = daily_pct
+    state["realized_pnl"] = cur_bal - eq0  # keep realized_pnl consistent too
 
     if daily_pct >= target_pct:
-        # Even if hit_target wasn't set before for some reason,
-        # we still enforce the block.
         return True
 
     if state.get("hit_target"):
@@ -530,6 +554,63 @@ def daily_guard_blocks_new_trades(state: Dict[str, Any], target_pct: float) -> b
 
     # (Optional: could also block if daily_pct <= -max_loss_pct)
     return False
+
+def refresh_daily_state_with_equity(
+    path: str,
+    state: Dict[str, Any],
+    equity_now: float,
+    target_pct: float,
+) -> Dict[str, Any]:
+    """
+    Hard-sync the daily state with the *actual* account equity from the exchange.
+
+    Use this when you want:
+      current_balance = equity_now_from_exchange
+      realized_pnl    = current_balance - equity_start
+
+    NOTE:
+      - Best used when FLAT (no open position), otherwise you are mixing
+        floating PnL into the "realized" PnL measure.
+    """
+    eq0_raw = state.get("equity_start", 0.0)
+    eq0 = float(eq0_raw if eq0_raw is not None else 0.0)
+    if eq0 <= 0:
+        print("[DAILY PROFIT] WARNING: equity_start is 0 or missing in state when refreshing from equity.")
+        # Avoid division by zero; we keep eq0 as 1.0 only for percentage math.
+        eq0 = 1.0
+
+    equity_now = float(equity_now or 0.0)
+
+    state["current_balance"] = equity_now
+    realized = equity_now - eq0
+    state["realized_pnl"] = realized
+    daily_pct = realized / eq0 if eq0 > 0 else 0.0
+    state["daily_pct"] = daily_pct
+
+    hit_before = bool(state.get("hit_target"))
+    hit_after = daily_pct >= target_pct
+    state["hit_target"] = hit_after
+
+    _save_json_atomic(path, state)
+
+    print(
+        "[DAILY PROFIT] [REFRESH] "
+        f"equity_now={equity_now:.2f} | "
+        f"equity_start={eq0:.2f} | "
+        f"realized={realized:.2f} ({daily_pct*100:.2f}%) | "
+        f"target={target_pct*100:.2f}% | hit_target={hit_after}"
+    )
+
+    if (not hit_before) and hit_after:
+        print("=" * 72)
+        print(
+            f"[DAILY PROFIT GUARD] 🎯 Daily target reached (via refresh)! "
+            f"+{daily_pct*100:.2f}% (target={target_pct*100:.2f}%)."
+        )
+        print("[DAILY PROFIT GUARD] No NEW positions will be opened for the rest of this day.")
+        print("=" * 72)
+
+    return state
 
 
 # =========================
@@ -1037,10 +1118,28 @@ def decide_and_maybe_trade(args):
 
     daily_guard_filename = f"coinex_daily_profit_{safe_strategy_id}.json"
     daily_guard_path = os.path.join(guard_dir, daily_guard_filename)
-
+    
     daily_state = load_daily_profit_state(daily_guard_path, today_str, equity_now)
     log_daily_status(daily_state, DAILY_PROFIT_TARGET_PCT)
-    # IMPORTANT: do NOT block here, we still need to be able to CLOSE positions.
+
+    ## Update status
+    equity_now = get_equity_for_daily_guard_coinex(ex)
+    daily_state = refresh_daily_state_with_equity(
+        daily_guard_path,
+        daily_state,
+        equity_now=equity_now,
+        target_pct=DAILY_PROFIT_TARGET_PCT,
+    )
+
+    # === DAILY PROFIT GUARD: block NEW trades once target hit ===
+    if daily_guard_blocks_new_trades(daily_state, DAILY_PROFIT_TARGET_PCT):
+        print(
+            f"[DAILY PROFIT GUARD] Not opening because the daily target "
+            f"{DAILY_PROFIT_TARGET_PCT*100:.2f}% is already reached "
+            f"({daily_state.get('daily_pct', 0.0)*100:.2f}%). "
+            "No NEW positions will be opened today."
+        )
+        return
 
     # 11) Position & SL/TP (+ signal exit on neutral)
     pos = get_swap_position(ex, symbol)
@@ -1049,7 +1148,14 @@ def decide_and_maybe_trade(args):
     last_high = float(df["high"].iloc[-1])
     last_low = float(df["low"].iloc[-1])
 
-    in_neutral = (neg_thr < p_last < pos_thr)
+    # 1) Still useful to have the simple "in neutral now"
+    in_neutral_now = (neg_thr < p_last < pos_thr)
+
+    # 2) NEW: detect a jump that *crosses* the neutral band
+    crossed_neutral_down = (p_prev >= pos_thr and p_last <= neg_thr)
+    crossed_neutral_up   = (p_prev <= neg_thr and p_last >= pos_thr)
+
+    crossed_neutral = in_neutral_now or crossed_neutral_down or crossed_neutral_up
 
     # --- SL GUARD: block immediate re-entry after a Stop Loss ---
     sl_guard = load_sl_guard(guard_path)
@@ -1058,12 +1164,13 @@ def decide_and_maybe_trade(args):
 
     # If we already took an SL and now the probabilities are in the neutral band,
     # mark that as "neutral crossed" and allow future entries.
-    if sl_active and in_neutral and not sl_neutral_seen:
+    if sl_active and not crossed_neutral and not sl_neutral_seen:
         sl_guard["neutral_seen"] = True
         sl_neutral_seen = True
         save_sl_guard(guard_path, sl_guard)
         print("[SL-GUARD] Neutral zone touched after last SL — "
               "new trades will be allowed on the next fresh-cross.")
+        return
 
     if pos is not None and pos.get("side"):
         # WE HAVE AN OPEN POSITION ON EXCHANGE ----
