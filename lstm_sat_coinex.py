@@ -956,7 +956,7 @@ def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: floa
         return (
             f"No new SHORT: probability stayed in SHORT zone "
             f"(p_prev={fp(p_prev)} → p_last={fp(p_last)} ≤ neg_thr={fp(neg_thr)}). "
-            f"We only open a LONG when p_last < p_prev."
+            f"We only open a SHORT when p_last < p_prev."
         )
 
     # 3) Crossed but not in a valid fresh-cross configuration
