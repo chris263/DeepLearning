@@ -1543,11 +1543,11 @@ def decide_and_maybe_trade(args):
 
             if tp_order_id or sl_order_id:
                 parts = []
-                if tp_order_id:
-                    parts.append(f"TP[id={tp_order_id!r}, px={tp_price_logged}]")
-                if sl_order_id:
-                    parts.append(f"SL[id={sl_order_id!r}, px={sl_price_logged}]")
-                print("Attached TP/SL orders — " + ", ".join(parts))
+                # if tp_order_id:
+                #     parts.append(f"TP[id={tp_order_id!r}, px={tp_price_logged}]")
+                # if sl_order_id:
+                #     parts.append(f"SL[id={sl_order_id!r}, px={sl_price_logged}]")
+                print("Attached TP/SL orders — Success!!")
 
         except Exception as e:
             print(f"[WARN] failed to attach TP/SL orders: {e}")
