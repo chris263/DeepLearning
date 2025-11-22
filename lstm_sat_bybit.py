@@ -334,6 +334,10 @@ def load_daily_profit_state(path: str, today: str, equity_now: float) -> Dict[st
 
     equity_now: current account equity in quote currency (e.g. USDT/USDC).
                 Used ONLY when creating a NEW day state.
+
+    NOTE:
+        This function NO LONGER writes the JSON file.
+        Caller is responsible for persisting `st` if desired.
     """
     st: Dict[str, Any] = {}
 
@@ -356,11 +360,11 @@ def load_daily_profit_state(path: str, today: str, equity_now: float) -> Dict[st
             "daily_pct": 0.0,
             "hit_target": False,
         }
-        _save_json_atomic(path, st)
         print(
             f"[DAILY PROFIT] Initialized daily state (Bybit): "
             f"date={today}, equity_start={eq0:.2f}"
         )
+        # NOTE: no _save_json_atomic here anymore
         return st
 
     # 2) Same day: DO NOT change equity_start
@@ -384,8 +388,9 @@ def load_daily_profit_state(path: str, today: str, equity_now: float) -> Dict[st
     st.setdefault("hit_target", False)
     st.setdefault("date", today)
 
-    _save_json_atomic(path, st)
+    # NOTE: no _save_json_atomic(path, st) here anymore
     return st
+
 
 
 def log_daily_status(state: Dict[str, Any], target_pct: float) -> None:

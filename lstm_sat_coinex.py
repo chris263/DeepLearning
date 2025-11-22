@@ -387,16 +387,17 @@ def _save_json_atomic(path: str, payload: Dict[str, Any]) -> None:
 
 def load_daily_profit_state(path: str, today: str, equity_now: float) -> Dict[str, Any]:
     """
-    Load or initialize the daily profit state.
+    Load or (if new day) initialize the daily profit state.
 
-    IMPORTANT:
-    - If file exists for 'today', we DO NOT change equity_start.
-    - But for the current day, we always set current_balance to the live
-      equity_now coming from the exchange (for CoinEx: free + notional_sum).
+    equity_now: current account equity in quote currency (e.g. USDT/USDC).
+                Used ONLY when creating a NEW day state.
+
+    NOTE:
+        This function NO LONGER writes the JSON file.
+        Caller is responsible for persisting `st` if desired.
     """
     st: Dict[str, Any] = {}
 
-    # Try to load existing state
     if os.path.exists(path):
         try:
             with open(path, "r") as f:
@@ -405,52 +406,47 @@ def load_daily_profit_state(path: str, today: str, equity_now: float) -> Dict[st
             print(f"[DAILY PROFIT] failed to read {path}: {e}; resetting state.")
             st = {}
 
-    # Convert live equity argument
-    live_eq = float(equity_now or 0.0)
-
-    # 1) New or different day → initialize fresh state using equity_now
+    # 1) New or different day → reset with new equity_start
     if not st or st.get("date") != today:
-        eq0 = live_eq  # equity_start = live equity at the first run of the day
+        eq0 = float(equity_now or 0.0)
         st = {
             "date": today,
-            "equity_start": eq0,      # FIXED for the entire day
-            "current_balance": eq0,   # start day at this equity
-            "realized_pnl": 0.0,      # derived from current_balance - equity_start
+            "equity_start": eq0,          # FIXED for the whole day
+            "current_balance": eq0,       # realized balance after last closed trade
+            "realized_pnl": 0.0,          # derived from current_balance - equity_start
             "daily_pct": 0.0,
             "hit_target": False,
         }
-        _save_json_atomic(path, st)
         print(
-            f"[DAILY PROFIT] Initialized daily state: "
+            f"[DAILY PROFIT] Initialized daily state (Bybit): "
             f"date={today}, equity_start={eq0:.2f}"
         )
+        # NOTE: no _save_json_atomic here anymore
         return st
 
-    # 2) Same day: DO NOT change equity_start, but always sync current_balance
-    eq0_raw = st.get("equity_start", 0.0)
-    eq0 = float(eq0_raw if eq0_raw is not None else 0.0)
-    if eq0 <= 0:
-        print("[DAILY PROFIT] WARNING: equity_start is 0 or missing in state; "
-              "using 1.0 only for percentage math.")
-        eq0 = 1.0
+    # 2) Same day: DO NOT change equity_start
+    eq0 = float(st.get("equity_start", 0.0) or 1.0)
 
-    # Here is the key change:
-    # - current_balance is always set to live_eq (= free + notional_sum for CoinEx)
-    cur_bal = live_eq
-    st["current_balance"] = cur_bal
+    # Ensure current_balance exists
+    if "current_balance" not in st:
+        # If missing (old file), infer from equity_now if provided, else from equity_start
+        if equity_now is not None:
+            st["current_balance"] = float(equity_now)
+        else:
+            st["current_balance"] = eq0
 
-    # Realized PnL is always derived from current_balance - equity_start
+    cur_bal = float(st.get("current_balance", eq0))
+
+    # Realized PnL derived from current_balance - equity_start
     realized = cur_bal - eq0
     st["realized_pnl"] = realized
     st["daily_pct"] = realized / eq0 if eq0 > 0 else 0.0
 
-    # keep required fields
     st.setdefault("hit_target", False)
     st.setdefault("date", today)
 
-    _save_json_atomic(path, st)
+    # NOTE: no _save_json_atomic(path, st) here anymore
     return st
-
 
 
 def log_daily_status(state: Dict[str, Any], target_pct: float, equity_now: float = None) -> None:
