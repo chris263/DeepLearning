@@ -481,73 +481,69 @@ def log_daily_status(state: Dict[str, Any], target_pct: float, equity_now: float
     print(msg)
 
 
-def record_realized_pnl(path: str, state: Dict[str, Any], pnl_quote: float, target_pct: float) -> Dict[str, Any]:
+def refresh_daily_state_with_equity(
+    path: str,
+    state: Dict[str, Any],
+    equity_now: float,
+    target_pct: float,
+    prev_prob: float,
+    last_prob: float,
+) -> Dict[str, Any]:
     """
-    Update the daily realized PnL after a trade is closed.
+    Hard-sync the daily state with the *actual* account equity from the exchange.
 
-    pnl_quote: realized profit/loss in quote currency (e.g. USDT).
-               >0 = profit, <0 = loss.
+    Use this when you want:
+      current_balance = equity_now_from_exchange
+      realized_pnl    = current_balance - equity_start
 
-    All PnL is derived from:
-        current_balance = previous_current_balance + pnl_quote
-        realized_pnl    = current_balance - equity_start
+    NOTE:
+      - Best used when FLAT (no open position), otherwise you are mixing
+        floating PnL into the "realized" PnL measure.
     """
-    eq0 = float(state.get("equity_start", 0.0) or 0.0)
+    eq0_raw = state.get("equity_start", 0.0)
+    eq0 = float(eq0_raw if eq0_raw is not None else 0.0)
     if eq0 <= 0:
-        # Very defensive: if equity_start is zero or missing, warn and avoid division issues
-        print("[DAILY PROFIT] WARNING: equity_start is 0 or missing in state; "
-              "initializing to 1.0 just for percentage math.")
+        print("[DAILY PROFIT] WARNING: equity_start is 0 or missing in state when refreshing from equity.")
+        # Avoid division by zero; we keep eq0 as 1.0 only for percentage math.
         eq0 = 1.0
 
-    # Ensure current_balance exists
-    if "current_balance" not in state:
-        # This usually means old JSON from before we added the field
-        print("[DAILY PROFIT] WARNING: 'current_balance' missing in state; "
-              "initializing it from equity_start.")
-        state["current_balance"] = float(state.get("equity_start", 0.0) or 0.0)
+    equity_now = float(equity_now or 0.0)
 
-    # Previous derived values
-    cur_bal_prev = float(state.get("current_balance", eq0))
-    prev_realized = cur_bal_prev - eq0
-    prev_pct = prev_realized / eq0 if eq0 > 0 else 0.0
-
-    # New balance and derived PnL
-    pnl_quote = float(pnl_quote)
-    cur_bal_new = cur_bal_prev + pnl_quote
-    new_realized = cur_bal_new - eq0
-    daily_pct = new_realized / eq0 if eq0 > 0 else 0.0
-
-    state["current_balance"] = cur_bal_new
-    state["realized_pnl"] = new_realized
+    state["current_balance"] = equity_now
+    realized = equity_now - eq0
+    state["realized_pnl"] = realized
+    daily_pct = realized / eq0 if eq0 > 0 else 0.0
     state["daily_pct"] = daily_pct
 
     hit_before = bool(state.get("hit_target"))
     hit_after = daily_pct >= target_pct
     state["hit_target"] = hit_after
 
+    ## probs
+    state["prev_prob"] = prev_prob
+    state["last_prob"] = last_prob
+
     _save_json_atomic(path, state)
 
-    # Main status line
     print(
-        "[DAILY PROFIT] "
-        f"P&LΔ={pnl_quote:+.2f} | "
-        f"realized={prev_realized:.2f}→{new_realized:.2f} "
-        f"({prev_pct*100:.2f}%→{daily_pct*100:.2f}%) | "
-        f"current_balance={cur_bal_prev:.2f}→{cur_bal_new:.2f} | "
+        "[DAILY PROFIT] [REFRESH] "
+        f"equity_now={equity_now:.2f} | "
+        f"equity_start={eq0:.2f} | "
+        f"realized={realized:.2f} ({daily_pct*100:.2f}%) | "
         f"target={target_pct*100:.2f}% | hit_target={hit_after}"
     )
 
-    # One-time banner when target is crossed
     if (not hit_before) and hit_after:
         print("=" * 72)
         print(
-            f"[DAILY PROFIT GUARD] 🎯 Daily target reached! +{daily_pct*100:.2f}% "
-            f"(target={target_pct*100:.2f}%)."
+            f"[DAILY PROFIT GUARD] 🎯 Daily target reached (via refresh)! "
+            f"+{daily_pct*100:.2f}% (target={target_pct*100:.2f}%)."
         )
         print("[DAILY PROFIT GUARD] No NEW positions will be opened for the rest of this day.")
         print("=" * 72)
 
     return state
+
 
 
 def daily_guard_blocks_new_trades(state: Dict[str, Any], target_pct: float) -> bool:
@@ -634,6 +630,10 @@ def refresh_daily_state_with_equity(
     hit_before = bool(state.get("hit_target"))
     hit_after = daily_pct >= target_pct
     state["hit_target"] = hit_after
+
+    ## probs
+    state["prev_prob"] = prev_prob
+    state["last_prob"] = last_prob
 
     _save_json_atomic(path, state)
 

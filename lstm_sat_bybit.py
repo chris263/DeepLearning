@@ -563,7 +563,6 @@ def refresh_daily_state_with_equity(
     state["hit_target"] = hit_after
 
     ## probs
-
     state["prev_prob"] = prev_prob
     state["last_prob"] = last_prob
 
@@ -587,6 +586,7 @@ def refresh_daily_state_with_equity(
         print("=" * 72)
 
     return state
+
 
 
 # =========================
