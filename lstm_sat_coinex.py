@@ -1232,7 +1232,7 @@ def decide_and_maybe_trade(args):
             if p_last < pos_thr:
                 try:
                     ex.create_order(symbol, "market", "sell", close_qty, None, {"reduceOnly": True})
-                    zone = "neutral" if in_neutral else "short"
+                    zone = "neutral" if in_neutral_now else "short"
                     print(
                         f"Signal exit — LONG → {zone} zone: "
                         f"p_last={p_last:.3f} < pos_thr={pos_thr:.3f}; closing LONG at ~{last_close}"
@@ -1290,7 +1290,7 @@ def decide_and_maybe_trade(args):
             if p_last > neg_thr:
                 try:
                     ex.create_order(symbol, "market", "buy", close_qty, None, {"reduceOnly": True})
-                    zone = "neutral" if in_neutral else "long"
+                    zone = "neutral" if in_neutral_now else "long"
                     print(
                         f"Signal exit — SHORT → {zone} zone: "
                         f"p_last={p_last:.3f} > neg_thr={neg_thr:.3f}; closing SHORT at ~{last_close}"
