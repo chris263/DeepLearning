@@ -323,35 +323,59 @@ def resolve_last_closed(now_ms: int, last_bar_open_ms: int, timeframe: str) -> T
 DAILY_PROFIT_TARGET_PCT = float(os.getenv("DAILY_PROFIT_TARGET_PCT", "0.02"))  # 2% default
 
 def get_equity_for_daily_guard_coinex(ex) -> float:
-    # 1) Free USDT from the swap account (what you already use for sizing)
+    """
+    For CoinEx, approximate the daily-guard 'equity' as:
+
+        free USDT in the swap account
+      + sum of notional for ALL open swap positions (size * entryPrice).
+
+    Rationale:
+      - CoinEx swap free balance drops when you open a position because margin
+        moves out of "free".
+      - But your *total* equity is roughly: free + position_notional (+/- open PnL).
+      - Using only 'free' makes it look like a huge loss after opening a trade;
+        adding notional keeps equity stable.
+    """
+
+    # 1) Free USDT from your existing helper (what you already use for sizing)
+    free = 0.0
     try:
         free = float(fetch_usdt_balance_swap(ex))
     except Exception as e:
         print(f"[WARN] CoinEx swap free balance failed for daily guard: {e}")
-        free = 0.0
+        # Fallback: try generic swap balance
+        try:
+            bal = ex.fetch_balance(params={"type": "swap"})
+            acc = bal.get("USDT") or {}
+            v = acc.get("free") or acc.get("total") or acc.get("used")
+            free = float(v or 0.0)
+        except Exception as e2:
+            print(f"[WARN] CoinEx generic swap balance fallback failed for daily guard: {e2}")
+            free = 0.0
 
-    total = free
-
-    # 2) Add notional of the current position on this symbol, if any.
-    #    'symbol' is expected to be defined at module level.
+    # 2) Sum notional of ALL open swap positions
+    notional_sum = 0.0
     try:
-        pos = get_swap_position(ex, symbol)
+        positions = ex.fetch_positions()
+        for p in positions or []:
+            if not p:
+                continue
+            # Mirror your get_swap_position size logic
+            sz = float(p.get("contracts") or p.get("contractSize") or p.get("size") or 0.0)
+            entry = float(p.get("entryPrice") or 0.0)
+            if sz and entry:
+                notional_sum += abs(sz) * entry
     except Exception as e:
-        print(f"[WARN] CoinEx get_swap_position failed for daily guard: {e}")
-        pos = None
+        print(f"[WARN] CoinEx fetch_positions failed for daily guard: {e}")
 
-    if pos:
-        entry = float(pos.get("entry") or 0.0)
-        size = float(pos.get("size") or 0.0)
-        if entry > 0 and size > 0:
-            notional = entry * size
-            total += notional
+    total = free + notional_sum
 
     print(
         f"[DAILY PROFIT] CoinEx daily equity baseline: "
-        f"free={free:.2f}, est_total≈{total:.2f}"
+        f"free={free:.2f}, positions_notional≈{notional_sum:.2f}, est_total≈{total:.2f}"
     )
     return total
+
 
 
 def _save_json_atomic(path: str, payload: Dict[str, Any]) -> None:
