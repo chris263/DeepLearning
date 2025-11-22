@@ -602,6 +602,8 @@ def refresh_daily_state_with_equity(
     state: Dict[str, Any],
     equity_now: float,
     target_pct: float,
+    prev_prob: float,
+    last_prob: float,
 ) -> Dict[str, Any]:
     """
     Hard-sync the daily state with the *actual* account equity from the exchange.
@@ -1172,6 +1174,8 @@ def decide_and_maybe_trade(args):
         daily_state,
         equity_now=equity_now,
         target_pct=DAILY_PROFIT_TARGET_PCT,
+        prev_prob=p_prev,
+        last_prob=p_last,
     )
 
     # === DAILY PROFIT GUARD: block NEW trades once target hit ===
