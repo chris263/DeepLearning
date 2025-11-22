@@ -323,53 +323,35 @@ def resolve_last_closed(now_ms: int, last_bar_open_ms: int, timeframe: str) -> T
 DAILY_PROFIT_TARGET_PCT = float(os.getenv("DAILY_PROFIT_TARGET_PCT", "0.02"))  # 2% default
 
 def get_equity_for_daily_guard_coinex(ex) -> float:
-    """
-    For CoinEx, use the SWAP account *total* USDT equity as the daily equity baseline.
-
-    IMPORTANT:
-    - We want total = free + used (or 'total' if ccxt gives it),
-      NOT just free/available, otherwise an open position will make it
-      look like the account suddenly lost a huge amount.
-    - Spot USDT (from fetch_balance without swap params) does NOT include futures margin.
-    """
-    # 1) Prefer swap/futures total USDT equity
+    # 1) Free USDT from the swap account (what you already use for sizing)
     try:
-        bal = ex.fetch_balance(params={"type": "swap"})
-        acc = bal.get("USDT") or {}
-        free = float(acc.get("free") or 0.0)
-        used = float(acc.get("used") or 0.0)
-        total = float(acc.get("total") or (free + used))
-
-        print(
-            f"[DAILY PROFIT] CoinEx swap equity baseline: "
-            f"free={free:.2f}, used={used:.2f}, total={total:.2f}"
-        )
-        return total
+        free = float(fetch_usdt_balance_swap(ex))
     except Exception as e:
-        print(f"[WARN] CoinEx swap equity fetch failed for daily guard, falling back: {e}")
+        print(f"[WARN] CoinEx swap free balance failed for daily guard: {e}")
+        free = 0.0
 
-    # 2) Fallback: existing helper (likely free balance only, but better than nothing)
+    total = free
+
+    # 2) Add notional of the current position on this symbol, if any.
+    #    'symbol' is expected to be defined at module level.
     try:
-        eq = float(fetch_usdt_balance_swap(ex))
-        print(f"[DAILY PROFIT] CoinEx fallback: using swap balance={eq:.2f} as equity baseline.")
-        return eq
-    except Exception as e2:
-        print(f"[WARN] CoinEx swap balance fallback failed for daily guard, trying generic USDT total: {e2}")
+        pos = get_swap_position(ex, symbol)
+    except Exception as e:
+        print(f"[WARN] CoinEx get_swap_position failed for daily guard: {e}")
+        pos = None
 
-    # 3) Fallback: generic USDT total from fetch_balance (spot)
-    try:
-        bal = ex.fetch_balance()
-        acc = bal.get("USDT") or {}
-        v = acc.get("total") or acc.get("free") or acc.get("used")
-        if v is not None:
-            eq = float(v)
-            print(f"[DAILY PROFIT] CoinEx generic fallback: using USDT total={eq:.2f} as equity baseline.")
-            return eq
-    except Exception as e3:
-        print(f"[WARN] CoinEx generic equity fallback failed: {e3}")
+    if pos:
+        entry = float(pos.get("entry") or 0.0)
+        size = float(pos.get("size") or 0.0)
+        if entry > 0 and size > 0:
+            notional = entry * size
+            total += notional
 
-    print("[WARN] CoinEx: could not determine equity; using 0.0 for daily guard baseline.")
-    return 0.0
+    print(
+        f"[DAILY PROFIT] CoinEx daily equity baseline: "
+        f"free={free:.2f}, est_total≈{total:.2f}"
+    )
+    return total
 
 
 def _save_json_atomic(path: str, payload: Dict[str, Any]) -> None:
