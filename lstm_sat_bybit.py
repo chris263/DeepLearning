@@ -511,6 +511,16 @@ def daily_guard_blocks_new_trades(state: Dict[str, Any], target_pct: float) -> b
     if state.get("hit_target"):
         return True
 
+    if daily_pct <= -2.0:
+        print(
+            "[DAILY SL] [BLOCK] "
+            f"equity_now={equity_now:.2f} | "
+            f"equity_start={eq0:.2f} | "
+            f"realized={realized:.2f} ({daily_pct*100:.2f}%) | "
+            f"No more trades today!"
+        )
+        return True
+
     # (Optional: could also block if daily_pct <= -max_loss_pct)
     return False
 
