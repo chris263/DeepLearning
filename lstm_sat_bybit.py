@@ -511,7 +511,7 @@ def daily_guard_blocks_new_trades(state: Dict[str, Any], target_pct: float) -> b
     if state.get("hit_target"):
         return True
 
-    if daily_pct <= -2.0:
+    if daily_pct <= -0.02:
         print(
             "[DAILY SL] [BLOCK] "
             f"equity_now={equity_now:.2f} | "

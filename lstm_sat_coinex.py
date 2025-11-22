@@ -583,8 +583,8 @@ def daily_guard_blocks_new_trades(state: Dict[str, Any], target_pct: float) -> b
     if state.get("hit_target"):
         return True
 
-    # Hard daily stop-loss (example -2.0 => -200%; tweak as you like)
-    if daily_pct <= -2.0:
+    # Hard daily stop-loss (example -0.02 => -2%; tweak as you like)
+    if daily_pct <= -0.02:
         print(
             "[DAILY SL] [BLOCK] "
             f"equity_now={cur_bal:.2f} | "
