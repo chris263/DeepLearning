@@ -324,28 +324,49 @@ DAILY_PROFIT_TARGET_PCT = float(os.getenv("DAILY_PROFIT_TARGET_PCT", "0.02"))  #
 
 def get_equity_for_daily_guard_coinex(ex) -> float:
     """
-    For CoinEx, use the SWAP account USDT balance as the daily equity baseline.
-    Spot USDT (from fetch_balance) does NOT include futures margin.
+    For CoinEx, use the SWAP account *total* USDT equity as the daily equity baseline.
+
+    IMPORTANT:
+    - We want total = free + used (or 'total' if ccxt gives it),
+      NOT just free/available, otherwise an open position will make it
+      look like the account suddenly lost a huge amount.
+    - Spot USDT (from fetch_balance without swap params) does NOT include futures margin.
     """
-    # 1) Prefer swap/futures USDT balance (what you already use for sizing)
+    # 1) Prefer swap/futures total USDT equity
+    try:
+        bal = ex.fetch_balance(params={"type": "swap"})
+        acc = bal.get("USDT") or {}
+        free = float(acc.get("free") or 0.0)
+        used = float(acc.get("used") or 0.0)
+        total = float(acc.get("total") or (free + used))
+
+        print(
+            f"[DAILY PROFIT] CoinEx swap equity baseline: "
+            f"free={free:.2f}, used={used:.2f}, total={total:.2f}"
+        )
+        return total
+    except Exception as e:
+        print(f"[WARN] CoinEx swap equity fetch failed for daily guard, falling back: {e}")
+
+    # 2) Fallback: existing helper (likely free balance only, but better than nothing)
     try:
         eq = float(fetch_usdt_balance_swap(ex))
-        # print(f"[DAILY PROFIT] CoinEx: using SWAP balance={eq:.2f} as equity baseline.")
+        print(f"[DAILY PROFIT] CoinEx fallback: using swap balance={eq:.2f} as equity baseline.")
         return eq
-    except Exception as e:
-        print(f"[WARN] CoinEx swap balance failed for daily guard, trying generic USDT total: {e}")
+    except Exception as e2:
+        print(f"[WARN] CoinEx swap balance fallback failed for daily guard, trying generic USDT total: {e2}")
 
-    # 2) Fallback: generic USDT total from fetch_balance (spot)
+    # 3) Fallback: generic USDT total from fetch_balance (spot)
     try:
         bal = ex.fetch_balance()
         acc = bal.get("USDT") or {}
         v = acc.get("total") or acc.get("free") or acc.get("used")
         if v is not None:
             eq = float(v)
-            print(f"[DAILY PROFIT] CoinEx fallback: using USDT total={eq:.2f} as equity baseline.")
+            print(f"[DAILY PROFIT] CoinEx generic fallback: using USDT total={eq:.2f} as equity baseline.")
             return eq
-    except Exception as e2:
-        print(f"[WARN] CoinEx generic equity fallback failed: {e2}")
+    except Exception as e3:
+        print(f"[WARN] CoinEx generic equity fallback failed: {e3}")
 
     print("[WARN] CoinEx: could not determine equity; using 0.0 for daily guard baseline.")
     return 0.0
@@ -541,10 +562,11 @@ def daily_guard_blocks_new_trades(state: Dict[str, Any], target_pct: float) -> b
         state["current_balance"] = float(state.get("equity_start", 0.0) or 0.0)
 
     cur_bal = float(state.get("current_balance", eq0))
+    realized = cur_bal - eq0
+    daily_pct = realized / eq0 if eq0 > 0 else 0.0
 
-    daily_pct = (cur_bal - eq0) / eq0 if eq0 > 0 else 0.0
     state["daily_pct"] = daily_pct
-    state["realized_pnl"] = cur_bal - eq0  # keep realized_pnl consistent too
+    state["realized_pnl"] = realized  # keep realized_pnl consistent too
 
     if daily_pct >= target_pct:
         return True
@@ -552,10 +574,11 @@ def daily_guard_blocks_new_trades(state: Dict[str, Any], target_pct: float) -> b
     if state.get("hit_target"):
         return True
 
+    # Hard daily stop-loss (example -2.0 => -200%; tweak as you like)
     if daily_pct <= -2.0:
         print(
             "[DAILY SL] [BLOCK] "
-            f"equity_now={equity_now:.2f} | "
+            f"equity_now={cur_bal:.2f} | "
             f"equity_start={eq0:.2f} | "
             f"realized={realized:.2f} ({daily_pct*100:.2f}%) | "
             f"No more trades today!"
@@ -664,6 +687,7 @@ def write_lastbars_store(data: Dict[str, Dict]) -> None:
 
 def bar_id(ticker: str, timeframe: str, last_ts_ms: int) -> str:
     return f"{ticker}|{timeframe}|{int(last_ts_ms)}"
+
 
 
 def update_shared_lastbar(ticker: str, timeframe: str, last_open_ts_ms: int, last_close_ms: int) -> None:
