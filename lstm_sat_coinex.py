@@ -391,8 +391,8 @@ def load_daily_profit_state(path: str, today: str, equity_now: float) -> Dict[st
 
     IMPORTANT:
     - If file exists for 'today', we DO NOT change equity_start.
-      You can safely edit it manually and it will be respected.
-    - equity_now is only used when creating a NEW day/state.
+    - But for the current day, we always set current_balance to the live
+      equity_now coming from the exchange (for CoinEx: free + notional_sum).
     """
     st: Dict[str, Any] = {}
 
@@ -405,14 +405,17 @@ def load_daily_profit_state(path: str, today: str, equity_now: float) -> Dict[st
             print(f"[DAILY PROFIT] failed to read {path}: {e}; resetting state.")
             st = {}
 
+    # Convert live equity argument
+    live_eq = float(equity_now or 0.0)
+
     # 1) New or different day → initialize fresh state using equity_now
     if not st or st.get("date") != today:
-        eq0 = float(equity_now or 0.0)
+        eq0 = live_eq  # equity_start = live equity at the first run of the day
         st = {
             "date": today,
-            "equity_start": eq0,          # FIXED for the entire day
-            "current_balance": eq0,       # last known balance for the day
-            "realized_pnl": 0.0,          # derived from current_balance - equity_start
+            "equity_start": eq0,      # FIXED for the entire day
+            "current_balance": eq0,   # start day at this equity
+            "realized_pnl": 0.0,      # derived from current_balance - equity_start
             "daily_pct": 0.0,
             "hit_target": False,
         }
@@ -423,19 +426,18 @@ def load_daily_profit_state(path: str, today: str, equity_now: float) -> Dict[st
         )
         return st
 
-    # 2) Same day: DO NOT change equity_start.
-    eq0 = float(st.get("equity_start", 0.0) or 1.0)
+    # 2) Same day: DO NOT change equity_start, but always sync current_balance
+    eq0_raw = st.get("equity_start", 0.0)
+    eq0 = float(eq0_raw if eq0_raw is not None else 0.0)
+    if eq0 <= 0:
+        print("[DAILY PROFIT] WARNING: equity_start is 0 or missing in state; "
+              "using 1.0 only for percentage math.")
+        eq0 = 1.0
 
-    # Ensure current_balance exists.
-    if "current_balance" not in st:
-        # If it's missing, assume current balance is whatever equity_now says,
-        # or fall back to equity_start.
-        if equity_now is not None:
-            st["current_balance"] = float(equity_now)
-        else:
-            st["current_balance"] = eq0
-
-    cur_bal = float(st.get("current_balance", eq0))
+    # Here is the key change:
+    # - current_balance is always set to live_eq (= free + notional_sum for CoinEx)
+    cur_bal = live_eq
+    st["current_balance"] = cur_bal
 
     # Realized PnL is always derived from current_balance - equity_start
     realized = cur_bal - eq0
@@ -448,6 +450,7 @@ def load_daily_profit_state(path: str, today: str, equity_now: float) -> Dict[st
 
     _save_json_atomic(path, st)
     return st
+
 
 
 def log_daily_status(state: Dict[str, Any], target_pct: float, equity_now: float = None) -> None:
