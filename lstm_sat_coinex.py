@@ -1260,7 +1260,7 @@ def decide_and_maybe_trade(args):
                     # >>> record realized PnL for LONG close
                     exit_px = last_close
                     pnl_quote = (exit_px - entry) * close_qty
-                    daily_state = record_realized_pnL(
+                    daily_state = record_realized_pnl(
                         daily_guard_path,
                         daily_state,
                         pnl_quote=pnl_quote,
@@ -1285,7 +1285,7 @@ def decide_and_maybe_trade(args):
                     # >>> record realized PnL for LONG signal exit
                     exit_px = last_close
                     pnl_quote = (exit_px - entry) * close_qty
-                    daily_state = record_realized_pnL(
+                    daily_state = record_realized_pnl(
                         daily_guard_path,
                         daily_state,
                         pnl_quote=pnl_quote,
