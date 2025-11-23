@@ -505,8 +505,9 @@ def daily_guard_blocks_new_trades(state: Dict[str, Any], equity_now: float, targ
         state["current_balance"] = float(state.get("equity_start", 0.0) or 0.0)
 
     cur_bal = float(state.get("current_balance", eq0))
-
-    daily_pct = (cur_bal - eq0) / eq0 if eq0 > 0 else 0.0
+    realized = cur_bal - eq0
+    daily_pct = realized / eq0 if eq0 > 0 else 0.0
+    
     state["daily_pct"] = daily_pct
     state["realized_pnl"] = cur_bal - eq0  # keep realized_pnl consistent too
 
