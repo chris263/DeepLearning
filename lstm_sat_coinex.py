@@ -556,7 +556,7 @@ def daily_guard_blocks_new_trades(state: Dict[str, Any], target_pct: float) -> b
         eq0 = 1.0
 
     if "current_balance" not in state:
-        # This really shouldn't happen anymore after at least one record_realized_pnl,
+        # This really shouldn't happen anymore after at least one refresh_daily_state_with_equity,
         # but let's be safe and noisy.
         print("[DAILY PROFIT] WARNING: 'current_balance' missing when checking guard; "
               "initializing from equity_start.")
@@ -1260,11 +1260,13 @@ def decide_and_maybe_trade(args):
                     # >>> record realized PnL for LONG close
                     exit_px = last_close
                     pnl_quote = (exit_px - entry) * close_qty
-                    daily_state = record_realized_pnl(
+                    daily_state = refresh_daily_state_with_equity(
                         daily_guard_path,
                         daily_state,
                         pnl_quote=pnl_quote,
                         target_pct=DAILY_PROFIT_TARGET_PCT,
+                        prev_prob=p_prev,
+                        last_prob=p_last,
                     )
 
                 except Exception as e:
@@ -1285,11 +1287,13 @@ def decide_and_maybe_trade(args):
                     # >>> record realized PnL for LONG signal exit
                     exit_px = last_close
                     pnl_quote = (exit_px - entry) * close_qty
-                    daily_state = record_realized_pnl(
+                    daily_state = refresh_daily_state_with_equity(
                         daily_guard_path,
                         daily_state,
                         pnl_quote=pnl_quote,
                         target_pct=DAILY_PROFIT_TARGET_PCT,
+                        prev_prob=p_prev,
+                        last_prob=p_last,
                     )
 
                 except Exception as e:
@@ -1318,7 +1322,7 @@ def decide_and_maybe_trade(args):
                     # >>> record realized PnL for SHORT close
                     exit_px = last_close
                     pnl_quote = (entry - exit_px) * close_qty
-                    daily_state = record_realized_pnl(
+                    daily_state = refresh_daily_state_with_equity(
                         daily_guard_path,
                         daily_state,
                         pnl_quote=pnl_quote,
@@ -1343,7 +1347,7 @@ def decide_and_maybe_trade(args):
                     # >>> record realized PnL for SHORT signal exit
                     exit_px = last_close
                     pnl_quote = (entry - exit_px) * close_qty
-                    daily_state = record_realized_pnl(
+                    daily_state = refresh_daily_state_with_equity(
                         daily_guard_path,
                         daily_state,
                         pnl_quote=pnl_quote,
