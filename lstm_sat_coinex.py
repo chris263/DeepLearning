@@ -1395,16 +1395,6 @@ def decide_and_maybe_trade(args):
         print(msg)
         return
 
-    # === DAILY PROFIT GUARD: block NEW trades once target hit ===
-    if daily_guard_blocks_new_trades(daily_state, equity_now, sl_pct, DAILY_PROFIT_TARGET_PCT):
-        print(
-            f"[DAILY PROFIT GUARD] Blocking NEW CoinEx trade: "
-            f"🎯 target {DAILY_PROFIT_TARGET_PCT*100:.2f}% already reached "
-            f"({daily_state.get('daily_pct', 0.0)*100:.2f}%). "
-            "No NEW positions will be opened today."
-        )
-        return
-
     # 13) OPEN order — balance-based sizing, now with attached TP/SL on exchange
     try:
         quote_bal_swap = fetch_usdt_balance_swap(ex)

@@ -1296,14 +1296,6 @@ def decide_and_maybe_trade(args):
         print(msg)
         return
 
-    # === DAILY PROFIT GUARD: block NEW trades once target hit ===
-    if daily_guard_blocks_new_trades(daily_state, equity_now, sl_pct, DAILY_PROFIT_TARGET_PCT):
-        print(
-            f"[DAILY PROFIT GUARD] Blocking NEW trade: "
-            f"🎯 target {DAILY_PROFIT_TARGET_PCT*100:.2f}% already reached "
-            f"({daily_state.get('daily_pct', 0.0)*100:.2f}%)."
-        )
-        return
 
     # 12) Optional top-up for swap
     if args.auto_transfer:
