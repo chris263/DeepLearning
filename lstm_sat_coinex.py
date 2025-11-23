@@ -464,17 +464,10 @@ def log_daily_status(state: Dict[str, Any], target_pct: float, equity_now: float
         f"realized={realized:.2f} ({realized_pct*100:.2f}%) | "
         f"target={target_pct*100:.2f}% | hit_target={hit}"
     )
-
-    # Optional: show live equity_now vs start (informational only)
-    if equity_now is not None and eq0 > 0:
-        eq_change_pct = (float(equity_now) - eq0) / eq0
-        msg += (
-            f" | equity_now={float(equity_now):.2f} "
-            f"({eq_change_pct*100:.2f}% vs start)"
-        )
-
-    msg += " | [GUARD uses REALIZED PnL derived from (current_balance - equity_start)]"
+    
     print(msg)
+
+    
 def daily_guard_blocks_new_trades(state: Dict[str, Any], equity_now: float, sl_pct: float, target_pct: float) -> bool:
     """
     Returns True if we must NOT open new positions today.
