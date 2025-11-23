@@ -586,14 +586,6 @@ def refresh_daily_state_with_equity(
 
     _save_json_atomic(path, state)
 
-    print(
-        "[DAILY PROFIT] [REFRESH] "
-        f"equity_now={equity_now:.2f} | "
-        f"equity_start={eq0:.2f} | "
-        f"realized={realized:.2f} ({daily_pct*100:.2f}%) | "
-        f"target={target_pct*100:.2f}% | hit_target={hit_after}"
-    )
-
     if (not hit_before) and hit_after:
         print("=" * 72)
         print(
