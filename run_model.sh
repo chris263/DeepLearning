@@ -57,9 +57,9 @@ if [ "$MINUTE" -le 2 ]; then
 	echo "Bybit ETH 1H"
 	python3 $WORKDIR/lstm_sat_bybit.py  --model-dir "$WORKDIR/lstm/eth_lstm_1h_2025/"  --bars-json "/home/production/tmp/ETHUSDT_1h_6m.json" --ticker ETHUSDT --timeframe 1h  --pub_key API_BYBIT_BTC --sec_key API_BYBIT_SECRET_BTC --debug
     
-    echo
-    echo "CROSS TRADE SOLUSDT"
-    ython3 cross_prob_bybit.py --btc-json ~/guards/coinex_daily_profit_btc_lstm_1h_2025.json --eth-json ~/guards/bybit_daily_profit_eth_lstm_1h_2025.json --trade-ticker SOLUSDT --key-name API_CROSSTRADE --key-secret API_CROSSTRADE_SECRET --verbose
+   echo
+   echo "CROSS TRADE SOLUSDT"
+   python3 cross_prob_bybit.py --btc-json ~/guards/coinex_daily_profit_btc_lstm_1h_2025.json --eth-json ~/guards/bybit_daily_profit_eth_lstm_1h_2025.json --trade-ticker SOLUSDT --key-name API_CROSSTRADE --key-secret API_CROSSTRADE_SECRET --state-json ~/gurads/cross_state_SOLUSDT.json --verbose
     
     # echo
     # echo "COINBASE SAT BTCUSDC 1h"
