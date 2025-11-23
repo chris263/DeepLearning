@@ -484,7 +484,7 @@ def record_realized_pnl(path: str, state: Dict[str, Any], pnl_quote: float, targ
     return state
 
 
-def daily_guard_blocks_new_trades(state: Dict[str, Any], equity_now: float, target_pct: float) -> bool:
+def daily_guard_blocks_new_trades(state: Dict[str, Any], equity_now: float, sl_pct: float, target_pct: float) -> bool:
     """
     Returns True if we must NOT open new positions today.
 
@@ -507,7 +507,7 @@ def daily_guard_blocks_new_trades(state: Dict[str, Any], equity_now: float, targ
     cur_bal = float(state.get("current_balance", eq0))
     realized = cur_bal - eq0
     daily_pct = realized / eq0 if eq0 > 0 else 0.0
-    
+
     state["daily_pct"] = daily_pct
     state["realized_pnl"] = cur_bal - eq0  # keep realized_pnl consistent too
 
@@ -517,7 +517,7 @@ def daily_guard_blocks_new_trades(state: Dict[str, Any], equity_now: float, targ
     if state.get("hit_target"):
         return True
 
-    if daily_pct <= -0.02:
+    if daily_pct <= -sl_pct:
         print(
             "[DAILY SL] [BLOCK] "
             f"equity_now={equity_now:.2f} | "
@@ -1077,7 +1077,7 @@ def decide_and_maybe_trade(args):
     )
 
     # === DAILY PROFIT GUARD: block NEW trades once target hit ===
-    if daily_guard_blocks_new_trades(daily_state, equity_now, DAILY_PROFIT_TARGET_PCT):
+    if daily_guard_blocks_new_trades(daily_state, equity_now, sl_pct, DAILY_PROFIT_TARGET_PCT):
         print(
             f"[DAILY PROFIT GUARD] Not opening because the daily target 🎯 "
             f"{DAILY_PROFIT_TARGET_PCT*100:.2f}% is already reached "
@@ -1291,7 +1291,7 @@ def decide_and_maybe_trade(args):
         return
 
     # === DAILY PROFIT GUARD: block NEW trades once target hit ===
-    if daily_guard_blocks_new_trades(daily_state, equity_now, DAILY_PROFIT_TARGET_PCT):
+    if daily_guard_blocks_new_trades(daily_state, equity_now, sl_pct, DAILY_PROFIT_TARGET_PCT):
         print(
             f"[DAILY PROFIT GUARD] Blocking NEW trade: "
             f"🎯 target {DAILY_PROFIT_TARGET_PCT*100:.2f}% already reached "
