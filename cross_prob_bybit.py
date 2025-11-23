@@ -215,7 +215,7 @@ def load_probs(path: str) -> Tuple[float, float]:
     return p_prev, p_last
 
 
-def classify_zone(p_last: float, pos_thr: float, neg_thr: float) -> str:
+def classify_zone(p_last: float, p_prev: float, pos_thr: float, neg_thr: float) -> str:
     """
     Return 'LONG', 'SHORT', or 'NEUTRAL' based on p_last.
 
@@ -223,9 +223,9 @@ def classify_zone(p_last: float, pos_thr: float, neg_thr: float) -> str:
     SHORT zone  : p_last <= neg_thr
     NEUTRAL     : otherwise
     """
-    if p_last >= pos_thr:
+    if (p_last >= pos_thr) and (p_prev < p_last):
         return "LONG"
-    elif p_last <= neg_thr:
+    elif (p_last <= neg_thr) and (p_prev > p_last):
         return "SHORT"
     else:
         return "NEUTRAL"
@@ -448,8 +448,8 @@ def main() -> None:
     pos_thr = float(args.pos_thr)
     neg_thr = float(args.neg_thr)
 
-    zone_btc = classify_zone(btc_last, pos_thr, neg_thr)
-    zone_eth = classify_zone(eth_last, pos_thr, neg_thr)
+    zone_btc = classify_zone(btc_last, btc_prev, pos_thr, neg_thr)
+    zone_eth = classify_zone(eth_last, eth_prev, pos_thr, neg_thr)
 
     print(
         f"[PROBS] BTC prev={btc_prev:.6f} last={btc_last:.6f} zone={zone_btc} | "
