@@ -475,65 +475,6 @@ def log_daily_status(state: Dict[str, Any], target_pct: float, equity_now: float
 
     msg += " | [GUARD uses REALIZED PnL derived from (current_balance - equity_start)]"
     print(msg)
-
-
-def refresh_daily_state_with_equity(
-    path: str,
-    state: Dict[str, Any],
-    equity_now: float,
-    target_pct: float,
-    prev_prob: float,
-    last_prob: float,
-) -> Dict[str, Any]:
-    """
-    Hard-sync the daily state with the *actual* account equity from the exchange.
-
-    Use this when you want:
-      current_balance = equity_now_from_exchange
-      realized_pnl    = current_balance - equity_start
-
-    NOTE:
-      - Best used when FLAT (no open position), otherwise you are mixing
-        floating PnL into the "realized" PnL measure.
-    """
-    eq0_raw = state.get("equity_start", 0.0)
-    eq0 = float(eq0_raw if eq0_raw is not None else 0.0)
-    if eq0 <= 0:
-        print("[DAILY PROFIT] WARNING: equity_start is 0 or missing in state when refreshing from equity.")
-        # Avoid division by zero; we keep eq0 as 1.0 only for percentage math.
-        eq0 = 1.0
-
-    equity_now = float(equity_now or 0.0)
-
-    state["current_balance"] = equity_now
-    realized = equity_now - eq0
-    state["realized_pnl"] = realized
-    daily_pct = realized / eq0 if eq0 > 0 else 0.0
-    state["daily_pct"] = daily_pct
-
-    hit_before = bool(state.get("hit_target"))
-    hit_after = daily_pct >= target_pct
-    state["hit_target"] = hit_after
-
-    ## probs
-    state["prev_prob"] = prev_prob
-    state["last_prob"] = last_prob
-
-    _save_json_atomic(path, state)
-
-    if (not hit_before) and hit_after:
-        print("=" * 72)
-        print(
-            f"[DAILY PROFIT GUARD] 🎯 Daily target reached (via refresh)! "
-            f"+{daily_pct*100:.2f}% (target={target_pct*100:.2f}%)."
-        )
-        print("[DAILY PROFIT GUARD] No NEW positions will be opened for the rest of this day.")
-        print("=" * 72)
-
-    return state
-
-
-
 def daily_guard_blocks_new_trades(state: Dict[str, Any], equity_now: float, sl_pct: float, target_pct: float) -> bool:
     """
     Returns True if we must NOT open new positions today.
@@ -1252,7 +1193,7 @@ def decide_and_maybe_trade(args):
                     daily_state = refresh_daily_state_with_equity(
                         daily_guard_path,
                         daily_state,
-                        pnl_quote=pnl_quote,
+                        equity_now=pnl_quote,
                         target_pct=DAILY_PROFIT_TARGET_PCT,
                         prev_prob=p_prev,
                         last_prob=p_last,
@@ -1279,7 +1220,7 @@ def decide_and_maybe_trade(args):
                     daily_state = refresh_daily_state_with_equity(
                         daily_guard_path,
                         daily_state,
-                        pnl_quote=pnl_quote,
+                        equity_now=pnl_quote,
                         target_pct=DAILY_PROFIT_TARGET_PCT,
                         prev_prob=p_prev,
                         last_prob=p_last,
@@ -1314,8 +1255,10 @@ def decide_and_maybe_trade(args):
                     daily_state = refresh_daily_state_with_equity(
                         daily_guard_path,
                         daily_state,
-                        pnl_quote=pnl_quote,
+                        equity_now=pnl_quote,
                         target_pct=DAILY_PROFIT_TARGET_PCT,
+                        prev_prob=p_prev,
+                        last_prob=p_last,
                     )
 
                 except Exception as e:
@@ -1339,8 +1282,10 @@ def decide_and_maybe_trade(args):
                     daily_state = refresh_daily_state_with_equity(
                         daily_guard_path,
                         daily_state,
-                        pnl_quote=pnl_quote,
+                        equity_now=pnl_quote,
                         target_pct=DAILY_PROFIT_TARGET_PCT,
+                        prev_prob=p_prev,
+                        last_prob=p_last,
                     )
 
                 except Exception as e:
