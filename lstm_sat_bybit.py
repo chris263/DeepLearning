@@ -484,7 +484,7 @@ def record_realized_pnl(path: str, state: Dict[str, Any], pnl_quote: float, targ
     return state
 
 
-def daily_guard_blocks_new_trades(state: Dict[str, Any], target_pct: float) -> bool:
+def daily_guard_blocks_new_trades(state: Dict[str, Any], equity_now: float, target_pct: float) -> bool:
     """
     Returns True if we must NOT open new positions today.
 
@@ -1076,7 +1076,7 @@ def decide_and_maybe_trade(args):
     )
 
     # === DAILY PROFIT GUARD: block NEW trades once target hit ===
-    if daily_guard_blocks_new_trades(daily_state, DAILY_PROFIT_TARGET_PCT):
+    if daily_guard_blocks_new_trades(daily_state, equity_now, DAILY_PROFIT_TARGET_PCT):
         print(
             f"[DAILY PROFIT GUARD] Not opening because the daily target 🎯 "
             f"{DAILY_PROFIT_TARGET_PCT*100:.2f}% is already reached "
@@ -1290,7 +1290,7 @@ def decide_and_maybe_trade(args):
         return
 
     # === DAILY PROFIT GUARD: block NEW trades once target hit ===
-    if daily_guard_blocks_new_trades(daily_state, DAILY_PROFIT_TARGET_PCT):
+    if daily_guard_blocks_new_trades(daily_state, equity_now, DAILY_PROFIT_TARGET_PCT):
         print(
             f"[DAILY PROFIT GUARD] Blocking NEW trade: "
             f"🎯 target {DAILY_PROFIT_TARGET_PCT*100:.2f}% already reached "
