@@ -512,14 +512,26 @@ def daily_guard_blocks_new_trades(state: Dict[str, Any], equity_now: float, sl_p
     state["realized_pnl"] = cur_bal - eq0  # keep realized_pnl consistent too
 
     if daily_pct >= target_pct:
+        print(
+            f"[DAILY PROFIT GUARD] Not opening because the daily target 🎯 "
+            f"{DAILY_PROFIT_TARGET_PCT*100:.2f}% is already reached "
+            f"({daily_state.get('daily_pct', 0.0)*100:.2f}%). "
+            "No NEW positions will be opened today."
+        )
         return True
 
     if state.get("hit_target"):
+        print(
+            f"[DAILY PROFIT GUARD] Not opening because the daily target 🎯 "
+            f"{DAILY_PROFIT_TARGET_PCT*100:.2f}% is already reached "
+            f"({daily_state.get('daily_pct', 0.0)*100:.2f}%). "
+            "No NEW positions will be opened today."
+        )
         return True
 
     if daily_pct <= -sl_pct:
         print(
-            "[DAILY SL] [BLOCK] "
+            "[DAILY SL] [BLOCK] 🛑 STOP "
             f"equity_now={equity_now:.2f} | "
             f"equity_start={eq0:.2f} | "
             f"realized={realized:.2f} ({daily_pct*100:.2f}%) | "
@@ -1078,12 +1090,6 @@ def decide_and_maybe_trade(args):
 
     # === DAILY PROFIT GUARD: block NEW trades once target hit ===
     if daily_guard_blocks_new_trades(daily_state, equity_now, sl_pct, DAILY_PROFIT_TARGET_PCT):
-        print(
-            f"[DAILY PROFIT GUARD] Not opening because the daily target 🎯 "
-            f"{DAILY_PROFIT_TARGET_PCT*100:.2f}% is already reached "
-            f"({daily_state.get('daily_pct', 0.0)*100:.2f}%). "
-            "No NEW positions will be opened today."
-        )
         return
 
     
