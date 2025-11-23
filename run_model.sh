@@ -59,7 +59,7 @@ if [ "$MINUTE" -le 2 ]; then
     
    echo
    echo "CROSS TRADE SOLUSDT"
-   python3 cross_prob_bybit.py --btc-json ~/guards/coinex_daily_profit_btc_lstm_1h_2025.json --eth-json ~/guards/bybit_daily_profit_eth_lstm_1h_2025.json --trade-ticker SOLUSDT --key-name API_CROSSTRADE --key-secret API_CROSSTRADE_SECRET --verbose
+   python3 cross_prob_bybit.py --btc-json ~/guards/coinex_daily_profit_btc_lstm_1h_2025.json --eth-json ~/guards/bybit_daily_profit_eth_lstm_1h_2025.json --trade-ticker SOLUSDT --risk 0.50 --key-name API_CROSSTRADE --key-secret API_CROSSTRADE_SECRET --verbose
     
     # echo
     # echo "COINBASE SAT BTCUSDC 1h"
