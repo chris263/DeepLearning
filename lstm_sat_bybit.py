@@ -515,7 +515,7 @@ def daily_guard_blocks_new_trades(state: Dict[str, Any], equity_now: float, sl_p
         print(
             f"[DAILY PROFIT GUARD] Not opening because the daily target 🎯 "
             f"{DAILY_PROFIT_TARGET_PCT*100:.2f}% is already reached "
-            f"({daily_state.get('daily_pct', 0.0)*100:.2f}%). "
+            f"({state.get('daily_pct', 0.0)*100:.2f}%). "
             "No NEW positions will be opened today."
         )
         return True
@@ -524,7 +524,7 @@ def daily_guard_blocks_new_trades(state: Dict[str, Any], equity_now: float, sl_p
         print(
             f"[DAILY PROFIT GUARD] Not opening because the daily target 🎯 "
             f"{DAILY_PROFIT_TARGET_PCT*100:.2f}% is already reached "
-            f"({daily_state.get('daily_pct', 0.0)*100:.2f}%). "
+            f"({state.get('daily_pct', 0.0)*100:.2f}%). "
             "No NEW positions will be opened today."
         )
         return True
