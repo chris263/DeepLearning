@@ -418,7 +418,7 @@ def load_daily_profit_state(path: str, today: str, equity_now: float) -> Dict[st
             "hit_target": False,
         }
         print(
-            f"[DAILY PROFIT] Initialized daily state (Bybit): "
+            f"[DAILY PROFIT] Initialized daily state (Coinex): "
             f"date={today}, equity_start={eq0:.2f}"
         )
         # NOTE: no _save_json_atomic here anymore

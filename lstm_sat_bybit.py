@@ -1363,196 +1363,103 @@ def decide_and_maybe_trade(args):
                         o.get("id")
                         or o.get("orderId")
                         or info.get("orderId")
-                        or info.get("order_id")
+                        or info.get("id")
                     )
                 return o
 
-            if ex.id == "bybit":
-                params_common = {
-                    "reduceOnly": True,
-                    "tpslMode": "Full",
-                    "positionIdx": 0,
-                }
+            params_common = {
+                "reduceOnly": True,
+                "tpslMode": "Full",
+                "positionIdx": 0,
+            }
 
-                if side == "buy":
-                    # LONG: TP above, SL below
-                    if tp_pct is not None and tp_pct > 0:
-                        tp_price = price_to_precision(ex, symbol, entry_price * (1.0 + tp_pct))
-                        tp = ex.create_order(
-                            symbol,
-                            "market",
-                            "sell",
-                            qty,
-                            None,
-                            {
-                                **params_common,
-                                "takeProfitPrice": float(tp_price),
-                                "tpTriggerBy": "LastPrice",
-                            },
-                        )
-                        oid = _safe_order_id(tp)
-                        if oid:
-                            tp_order_id = oid
-                            tp_price_logged = tp_price
-                        else:
-                            print(f"[WARN] TP order returned no id on {ex.id}: {tp!r}")
+            if side == "buy":
+                # LONG: TP above, SL below
+                if tp_pct is not None and tp_pct > 0:
+                    tp_price = price_to_precision(ex, symbol, entry_price * (1.0 + tp_pct))
+                    tp = ex.create_order(
+                        symbol,
+                        "market",
+                        "sell",
+                        qty,
+                        None,
+                        {
+                            **params_common,
+                            "takeProfitPrice": float(tp_price),
+                            "tpTriggerBy": "LastPrice",
+                        },
+                    )
+                    oid = _safe_order_id(tp)
+                    if oid:
+                        tp_order_id = oid
+                        tp_price_logged = tp_price
+                    else:
+                        print(f"[WARN] TP order attached!!")
 
-                    if sl_pct is not None and sl_pct > 0:
-                        sl_price = price_to_precision(ex, symbol, entry_price * (1.0 - sl_pct))
-                        sl = ex.create_order(
-                            symbol,
-                            "market",
-                            "sell",
-                            qty,
-                            None,
-                            {
-                                **params_common,
-                                "stopLossPrice": float(sl_price),
-                                "slTriggerBy": "LastPrice",
-                            },
-                        )
-                        oid = _safe_order_id(sl)
-                        if oid:
-                            sl_order_id = oid
-                            sl_price_logged = sl_price
-                        else:
-                            print(f"[WARN] SL order returned no id on {ex.id}: {sl!r}")
-
-                else:
-                    # SHORT: TP below, SL above
-                    if tp_pct is not None and tp_pct > 0:
-                        tp_price = price_to_precision(ex, symbol, entry_price * (1.0 - tp_pct))
-                        tp = ex.create_order(
-                            symbol,
-                            "market",
-                            "buy",
-                            qty,
-                            None,
-                            {
-                                **params_common,
-                                "takeProfitPrice": float(tp_price),
-                                "tpTriggerBy": "LastPrice",
-                            },
-                        )
-                        oid = _safe_order_id(tp)
-                        if oid:
-                            tp_order_id = oid
-                            tp_price_logged = tp_price
-                        else:
-                            print(f"[WARN] TP order returned no id on {ex.id}: {tp!r}")
-
-                    if sl_pct is not None and sl_pct > 0:
-                        sl_price = price_to_precision(ex, symbol, entry_price * (1.0 + sl_pct))
-                        sl = ex.create_order(
-                            symbol,
-                            "market",
-                            "buy",
-                            qty,
-                            None,
-                            {
-                                **params_common,
-                                "stopLossPrice": float(sl_price),
-                                "slTriggerBy": "LastPrice",
-                            },
-                        )
-                        oid = _safe_order_id(sl)
-                        if oid:
-                            sl_order_id = oid
-                            sl_price_logged = sl_price
-                        else:
-                            print(f"[WARN] SL order returned no id on {ex.id}: {sl!r}")
+                if sl_pct is not None and sl_pct > 0:
+                    sl_price = price_to_precision(ex, symbol, entry_price * (1.0 - sl_pct))
+                    sl = ex.create_order(
+                        symbol,
+                        "market",
+                        "sell",
+                        qty,
+                        None,
+                        {
+                            **params_common,
+                            "stopLossPrice": float(sl_price),
+                            "slTriggerBy": "LastPrice",
+                        },
+                    )
+                    oid = _safe_order_id(sl)
+                    if oid:
+                        sl_order_id = oid
+                        sl_price_logged = sl_price
+                    else:
+                        print(f"[WARN] SL order attached!")
 
             else:
-                # Generic / other exchanges (kept as-is)
-                if side == "buy":
-                    if tp_pct is not None and tp_pct > 0:
-                        tp_price = price_to_precision(ex, symbol, entry_price * (1.0 + tp_pct))
-                        tp = ex.create_order(
-                            symbol,
-                            "limit",
-                            "sell",
-                            qty,
-                            tp_price,
-                            {
-                                "reduceOnly": True,
-                                "takeProfitPrice": float(tp_price),
-                            },
-                        )
-                        oid = _safe_order_id(tp)
-                        if oid:
-                            tp_order_id = oid
-                            tp_price_logged = tp_price
-                        else:
-                            print(f"[WARN] TP order returned no id on {ex.id}: {tp!r}")
+                # SHORT: TP below, SL above
+                if tp_pct is not None and tp_pct > 0:
+                    tp_price = price_to_precision(ex, symbol, entry_price * (1.0 - tp_pct))
+                    tp = ex.create_order(
+                        symbol,
+                        "market",
+                        "buy",
+                        qty,
+                        None,
+                        {
+                            **params_common,
+                            "takeProfitPrice": float(tp_price),
+                            "tpTriggerBy": "LastPrice",
+                        },
+                    )
+                    oid = _safe_order_id(tp)
+                    if oid:
+                        tp_order_id = oid
+                        tp_price_logged = tp_price
+                    else:
+                        print(f"[WARN] TP order attached!!")
 
-                    if sl_pct is not None and sl_pct > 0:
-                        sl_price = price_to_precision(ex, symbol, entry_price * (1.0 - sl_pct))
-                        sl = ex.create_order(
-                            symbol,
-                            "market",
-                            "sell",
-                            qty,
-                            None,
-                            {
-                                "reduceOnly": True,
-                                "stopLossPrice": float(sl_price),
-                            },
-                        )
-                        oid = _safe_order_id(sl)
-                        if oid:
-                            sl_order_id = oid
-                            sl_price_logged = sl_price
-                        else:
-                            print(f"[WARN] SL order returned no id on {ex.id}: {sl!r}")
-
-                else:
-                    if tp_pct is not None and tp_pct > 0:
-                        tp_price = price_to_precision(ex, symbol, entry_price * (1.0 - tp_pct))
-                        tp = ex.create_order(
-                            symbol,
-                            "limit",
-                            "buy",
-                            qty,
-                            tp_price,
-                            {
-                                "reduceOnly": True,
-                                "takeProfitPrice": float(tp_price),
-                            },
-                        )
-                        oid = _safe_order_id(tp)
-                        if oid:
-                            tp_order_id = oid
-                            tp_price_logged = tp_price
-                        else:
-                            print(f"[WARN] TP order returned no id on {ex.id}: {tp!r}")
-
-                    if sl_pct is not None and sl_pct > 0:
-                        sl_price = price_to_precision(ex, symbol, entry_price * (1.0 + sl_pct))
-                        sl = ex.create_order(
-                            symbol,
-                            "market",
-                            "buy",
-                            qty,
-                            None,
-                            {
-                                "reduceOnly": True,
-                                "stopLossPrice": float(sl_price),
-                            },
-                        )
-                        oid = _safe_order_id(sl)
-                        if oid:
-                            sl_order_id = oid
-                            sl_price_logged = sl_price
-                        else:
-                            print(f"[WARN] SL order returned no id on {ex.id}: {sl!r}")
-
-            if tp_order_id or sl_order_id:
-                parts = []
-                # if tp_order_id:
-                #     parts.append(f"TP[id={tp_order_id!r}, px={tp_price_logged}]")
-                # if sl_order_id:
-                #     parts.append(f"SL[id={sl_order_id!r}, px={sl_price_logged}]")
-                print("Attached TP/SL orders — Success!!")
+                if sl_pct is not None and sl_pct > 0:
+                    sl_price = price_to_precision(ex, symbol, entry_price * (1.0 + sl_pct))
+                    sl = ex.create_order(
+                        symbol,
+                        "market",
+                        "buy",
+                        qty,
+                        None,
+                        {
+                            **params_common,
+                            "stopLossPrice": float(sl_price),
+                            "slTriggerBy": "LastPrice",
+                        },
+                    )
+                    oid = _safe_order_id(sl)
+                    if oid:
+                        sl_order_id = oid
+                        sl_price_logged = sl_price
+                    else:
+                        print(f"[WARN] SL order attached!!")
 
         except Exception as e:
             print(f"[WARN] failed to attach TP/SL orders: {e}")
