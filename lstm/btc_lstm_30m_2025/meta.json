@@ -7,7 +7,7 @@
   "ticker": "BTCUSDT",
   "timeframe": "30m",
   "lookback": 64,
-  "horizon": 6,
+  "horizon": 4,
   "ichimoku": {
     "tenkan": 9,
     "kijun": 26,
@@ -33,14 +33,14 @@
     "vol20"
   ],
   "preprocess_file": "preprocess.json",
-  "created_at": "2025-11-18T02:42:34Z",
-  "pos_thr": 0.60,
-  "neg_thr": 0.39999999999999996,
-  "prob_threshold": 0.60,
-  "short_prob_threshold": 0.39999999999999996,
+  "created_at": "2025-11-25T16:24:38Z",
+  "pos_thr": 0.55,
+  "neg_thr": 0.44999999999999996,
+  "prob_threshold": 0.55,
+  "short_prob_threshold": 0.44999999999999996,
   "risk": {
     "sl_pct": 0.02,
-    "tp_pct": 0.04,
+    "tp_pct": 0.06,
     "fee_bps": 1.0
   }
 }
