@@ -122,6 +122,9 @@ def load_bars_from_json(path: str) -> pd.DataFrame:
 # =========================
 # Ichimoku + features
 # =========================
+import numpy as np
+import pandas as pd
+
 def rolling_mid(high: pd.Series, low: pd.Series, n: int) -> pd.Series:
     n = int(n)
     hh = high.rolling(n, min_periods=n).max()
@@ -138,23 +141,91 @@ def ichimoku(df: pd.DataFrame, tenkan: int, kijun: int, senkou: int) -> pd.DataF
     d["cloud_bot"] = d[["span_a", "span_b"]].min(axis=1)
     return d
 
-def compute_rsi(close: pd.Series, window: int = 14) -> pd.Series:
+def compute_rsi(close: pd.Series, length: int = 14) -> pd.Series:
     """
-    Wilder-style RSI on close prices.
-    Returns values in [0, 100].
+    Wilder-style RSI.
     """
+    length = int(length)
     delta = close.diff()
-
     gain = delta.clip(lower=0.0)
     loss = -delta.clip(upper=0.0)
 
-    # Wilder's smoothing (EMA with alpha=1/window)
-    avg_gain = gain.ewm(alpha=1.0 / window, min_periods=window, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0 / window, min_periods=window, adjust=False).mean()
+    avg_gain = gain.ewm(alpha=1.0 / length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / length, adjust=False).mean()
 
     rs = avg_gain / (avg_loss + 1e-12)
     rsi = 100.0 - (100.0 / (1.0 + rs))
     return rsi
+
+def build_features(
+    df: pd.DataFrame,
+    tenkan: int,
+    kijun: int,
+    senkou: int,
+    displacement: int,
+    slope_window: int = 8,
+    rsi_len: int = 14,
+) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Build Ichimoku + RSI feature set for LIVE Bybit data.
+    Must match the training script exactly.
+    """
+    d = ichimoku(df, tenkan, kijun, senkou)
+
+    # Basic price / volume transforms
+    d["px"] = d["close"]
+    d["ret1"] = d["close"].pct_change().fillna(0)
+    d["oc_diff"] = (d["close"] - d["open"]) / d["open"]
+    d["hl_range"] = (d["high"] - d["low"]) / d["px"]
+    d["logv"] = np.log1p(d["volume"])
+    d["logv_chg"] = d["logv"].diff().fillna(0)
+
+    # Ichimoku distances
+    d["dist_px_cloud_top"] = (d["px"] - d["cloud_top"]) / d["px"]
+    d["dist_px_cloud_bot"] = (d["px"] - d["cloud_bot"]) / d["px"]
+    d["dist_tk_kj"] = (d["tenkan"] - d["kijun"]) / d["px"]
+    d["span_order"] = (d["span_a"] > d["span_b"]).astype(float)
+
+    # Slopes
+    sw = int(max(1, slope_window))
+    d["tk_slope"] = (d["tenkan"] - d["tenkan"].shift(sw)) / (d["px"] + 1e-9)
+    d["kj_slope"] = (d["kijun"] - d["kijun"].shift(sw)) / (d["px"] + 1e-9)
+    d["span_a_slope"] = (d["span_a"] - d["span_a"].shift(sw)) / (d["px"] + 1e-9)
+    d["span_b_slope"] = (d["span_b"] - d["span_b"].shift(sw)) / (d["px"] + 1e-9)
+
+    D = int(displacement)
+    d["chikou_above"] = (d["close"] > d["close"].shift(D)).astype(float)
+    d["vol20"] = d["ret1"].rolling(20, min_periods=20).std().fillna(0)
+
+    # ---- RSI features (length=rsi_len, using ±2 std bands) ----
+    d["rsi"] = compute_rsi(d["close"], length=rsi_len)
+    d["rsi_ma"] = d["rsi"].rolling(rsi_len, min_periods=rsi_len).mean()
+    d["rsi_std"] = d["rsi"].rolling(rsi_len, min_periods=rsi_len).std()
+
+    # Bollinger-style bands on RSI (± 2 * std)
+    d["rsi_upper"] = d["rsi_ma"] + 2.0 * d["rsi_std"]
+    d["rsi_lower"] = d["rsi_ma"] - 2.0 * d["rsi_std"]
+
+    # Normalized deviation from the band width; uses "2 std" explicitly
+    denom = (2.0 * d["rsi_std"]).replace(0, np.nan)
+    d["rsi_z2"] = (d["rsi"] - d["rsi_ma"]) / denom
+
+    feature_cols = [
+        "ret1", "oc_diff", "hl_range", "logv_chg",
+        "dist_px_cloud_top", "dist_px_cloud_bot", "dist_tk_kj", "span_order",
+        "tk_slope", "kj_slope", "span_a_slope", "span_b_slope",
+        "chikou_above", "vol20",
+        "rsi", "rsi_z2",
+    ]
+
+    feat = d[feature_cols].copy().dropna().reset_index(drop=True)
+    ts = d.loc[feat.index, "timestamp"].reset_index(drop=True)
+    px = d.loc[feat.index, "close"].reset_index(drop=True)
+
+    out = feat.copy()
+    out.insert(0, "timestamp", ts)
+    out.insert(1, "close", px)
+    return out, feature_cols
 
 
 def slope(series: pd.Series, w: int = 8) -> pd.Series:
@@ -274,6 +345,18 @@ def load_bundle(model_dir: str):
         "displacement": int(ik.get("displacement", meta.get("displacement", 26))),
     }
 
+    # --- NEW: RSI params from meta.json ---
+    rsi_meta = meta.get("rsi") or {}
+    rsi_len = int(rsi_meta.get("length", 14))  # same as used in training
+
+    # --- Load preprocess.json (scaler + feature names) ---
+    with open(preprocess_path, "r") as f:
+        pre = json.load(f)
+
+    feature_names = pre.get("feature_names") or meta.get("features") or []
+    if not feature_names:
+        raise SystemExit("No feature_names found in preprocess.json or meta.json")
+
     mean = np.array(pre.get("mean"), dtype=np.float32)
     std  = np.array(pre.get("std"), dtype=np.float32)
     if mean.shape[0] != len(feature_names) or std.shape[0] != len(feature_names):
@@ -294,9 +377,11 @@ def load_bundle(model_dir: str):
         "mean": mean,
         "std": std,
         "ichimoku": ichimoku_params,
+        "rsi": {"length": rsi_len},   # <<< add this
         "paths": {"dir": model_dir},
-        # "fee_bps": float(fee_bps) if fee_bps is not None else None,  # expose if you plan to use it
+        # "fee_bps": float(fee_bps) if fee_bps is not None else None,
     }
+
 
 
 
@@ -1013,6 +1098,12 @@ def decide_and_maybe_trade(args):
     mean, std = bundle["mean"], bundle["std"]
     ik = bundle["ichimoku"]; model_dir = bundle["paths"]["dir"]
 
+    # NEW: RSI config (for RSI & rsi_z2 features)
+    # meta.json from lstm_rsi_ichimoku.py has:
+    #   "rsi": { "length": <int>, "bands_std": 2.0 }
+    rsi_cfg = bundle.get("rsi") or meta.get("rsi") or {}
+    rsi_len = int(rsi_cfg.get("length", 14))
+
     # Derive a per-strategy identifier from the model directory
     strategy_id = os.path.basename(os.path.normpath(model_dir))
     safe_strategy_id = re.sub(r'[^A-Za-z0-9_.-]', '_', strategy_id)
@@ -1027,15 +1118,25 @@ def decide_and_maybe_trade(args):
         print("Not enough bars to build features.")
         return
 
-    # Build + align features & check names
-    feat_df_full = build_features(
-        df[["timestamp","ts","open","high","low","close","volume"]].copy(),
-        ik["tenkan"], ik["kijun"], ik["senkou"], ik["displacement"]
+    # 3b) Build + align features & check names
+    # IMPORTANT: build_features must match lstm_rsi_ichimoku.py:
+    #   def build_features(df, tenkan, kijun, senkou, displacement,
+    #                      slope_window=8, rsi_len=14) -> (df, feature_cols)
+    feat_df_full, live_feature_cols = build_features(
+        df[["timestamp", "ts", "open", "high", "low", "close", "volume"]].copy(),
+        ik["tenkan"],
+        ik["kijun"],
+        ik["senkou"],
+        ik["displacement"],
+        rsi_len=rsi_len,  # this is what makes RSI + rsi_z2 appear
     )
+
     feat_df_full = align_features_to_meta(feat_df_full, feats)
-    for c in feats:
-        if c not in feat_df_full.columns:
-            raise SystemExit(f"Feature '{c}' missing in computed frame.")
+
+    missing = [c for c in feats if c not in feat_df_full.columns]
+    if missing:
+        raise SystemExit(f"Feature(s) {missing} missing in computed frame: {missing}")
+
     feat_df = feat_df_full.copy()
 
     # 4) Inference (prev vs last bar)
@@ -1047,7 +1148,10 @@ def decide_and_maybe_trade(args):
     if getattr(args, "debug", False):
         closes = df["close"].to_numpy()
         feat_l1 = float(np.abs(X_last - X_prev).sum())
-        print(f"[DEBUG] prev_close→last_close: {closes[-2]:.4f}→{closes[-1]:.4f} | feat_L1_diff={feat_l1:.6g}")
+        print(
+            f"[DEBUG] prev_close→last_close: {closes[-2]:.4f}→{closes[-1]:.4f} "
+            f"| feat_L1_diff={feat_l1:.6g}"
+        )
 
     p_prev, p_last = run_model(model, X, mean, std)
     if getattr(args, "debug", False):
@@ -1070,7 +1174,10 @@ def decide_and_maybe_trade(args):
     update_shared_lastbar(ticker, timeframe, ts_last_open, last_close_ms)
     if args.debug:
         shared = read_lastbars_store().get(f"{ticker}:{timeframe}", {})
-        print(f"[DEBUG] shared lastbar: {shared.get('bar_id')} last_close_ts={shared.get('last_close_ts')}")
+        print(
+            f"[DEBUG] shared lastbar: {shared.get('bar_id')} "
+            f"last_close_ts={shared.get('last_close_ts')}"
+        )
 
     # 7) Guard & reversal state (per-bar)
     suffix = f"bybit_swap_{ticker}_{timeframe}"
