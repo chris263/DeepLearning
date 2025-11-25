@@ -48,7 +48,7 @@ python3 $WORKDIR/lstm_sat_bybit.py  --model-dir "$WORKDIR/lstm/btc_lstm_30m_2025
 
 echo
 echo "Bybit ETH RSI 30M"
-python3 $WORKDIR/lstm_sat_rsi_bybit.py  --model-dir "$WORKDIR/lstm/eth_lstm_rsi_30m_2025/"  --bars-json "/home/production/tmp/ETHUSDT_30m_6m.json" --ticker ETHUSDT --timeframe 30m  --pub_key API_CROSSTRADE --sec_key API_CROSSTRADE_SECRET --debug
+python3 $WORKDIR/lstm_sat_rsi_bybit.py  --model-dir "$WORKDIR/lstm/eth_lstm_rsi_30m/"  --bars-json "/home/production/tmp/ETHUSDT_30m_6m.json" --ticker ETHUSDT --timeframe 30m  --pub_key API_CROSSTRADE --sec_key API_CROSSTRADE_SECRET --debug
 
 
 if [ "$MINUTE" -le 2 ]; then
