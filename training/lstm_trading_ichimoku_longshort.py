@@ -74,22 +74,31 @@ def _coerce_timestamp_series(ts: pd.Series) -> pd.Series:
 
 
 def load_db_ohlcv(db_url: str, ticker: str, timeframe: str,
-                   start: Optional[str] = None, end: Optional[str] = None) -> pd.DataFrame:
+                  start: Optional[str] = None, end: Optional[str] = None) -> pd.DataFrame:
     """
-    Load OHLCV from a JSON file (replaces the old Postgres-based version).
+    Load OHLCV from a JSON file instead of Postgres.
 
-    The JSON file is expected to be a list of bars like:
-        [
-          {"ts": 1669487400000, "open": ..., "high": ..., "low": ..., "close": ..., "volume": ...},
-          ...
-        ]
+    JSON format (your example):
+
+    [
+      {
+        "ts": 1669487400000,
+        "open": 1210.8,
+        "high": 1210.85,
+        "low": 1205.35,
+        "close": 1207.65,
+        "volume": 13081.98
+      },
+      ...
+    ]
 
     `db_url` is now interpreted as the path to this JSON file.
-    `ticker` and `timeframe` are kept only for API compatibility with existing callers.
+    `ticker` and `timeframe` are kept only so existing calls still work.
     """
     import json
     import os
 
+    # Treat db_url as the JSON file path
     json_path = os.path.abspath(os.path.expanduser(db_url))
     with open(json_path, "r") as f:
         data = json.load(f)
@@ -99,24 +108,27 @@ def load_db_ohlcv(db_url: str, ticker: str, timeframe: str,
 
     df = pd.DataFrame(data)
 
-    # Required columns based on your example
+    # Ensure required columns are present
     required_cols = ["ts", "open", "high", "low", "close", "volume"]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         raise ValueError(f"JSON missing required columns: {missing}")
 
-    # Convert ts -> timestamp (datetime64[ns]) to match the original DB version
+    # Convert ts -> timestamp (datetime64[ns]) to match old behavior
     df["timestamp"] = _coerce_timestamp_series(df["ts"]).astype("datetime64[ns]")
 
     # Coerce numeric columns
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Keep exactly the same final structure as the original version
+    # Keep exactly the same structure as the original DB loader
     df = df[["timestamp", "open", "high", "low", "close", "volume"]]
-    df = df.dropna().sort_values("timestamp").reset_index(drop=True)
+    df = df.dropna().sort_values("timestamp")
 
-    # Date filters (on timestamp) – same semantics as before
+    # 🔴 IMPORTANT: force RangeIndex so build_features(d.loc[feat.index, ...]) works
+    df = df.reset_index(drop=True)
+
+    # Date filters (same semantics as original)
     if start:
         df = df[df.timestamp >= pd.to_datetime(start)]
     if end:
@@ -126,7 +138,6 @@ def load_db_ohlcv(db_url: str, ticker: str, timeframe: str,
         raise ValueError("Bars exist but are outside the requested date window or all NaN.")
 
     return df
-
 
 # ==============
 # Ichimoku & Features
