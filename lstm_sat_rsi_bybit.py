@@ -124,26 +124,27 @@ def load_bars_from_json(path: str) -> pd.DataFrame:
 # =========================
 import numpy as np
 import pandas as pd
-
 def rolling_mid(high: pd.Series, low: pd.Series, n: int) -> pd.Series:
     n = int(n)
     hh = high.rolling(n, min_periods=n).max()
     ll = low.rolling(n, min_periods=n).min()
     return (hh + ll) / 2.0
 
+
 def ichimoku(df: pd.DataFrame, tenkan: int, kijun: int, senkou: int) -> pd.DataFrame:
     d = df.copy()
-    d["tenkan"] = rolling_mid(d.high, d.low, tenkan)
-    d["kijun"] = rolling_mid(d.high, d.low, kijun)
+    d["tenkan"] = rolling_mid(d["high"], d["low"], tenkan)
+    d["kijun"] = rolling_mid(d["high"], d["low"], kijun)
     d["span_a"] = (d["tenkan"] + d["kijun"]) / 2.0
-    d["span_b"] = rolling_mid(d.high, d.low, senkou)
+    d["span_b"] = rolling_mid(d["high"], d["low"], senkou)
     d["cloud_top"] = d[["span_a", "span_b"]].max(axis=1)
     d["cloud_bot"] = d[["span_a", "span_b"]].min(axis=1)
     return d
 
+
 def compute_rsi(close: pd.Series, length: int = 14) -> pd.Series:
     """
-    Wilder-style RSI.
+    Wilder-style RSI (same as training).
     """
     length = int(length)
     delta = close.diff()
@@ -157,6 +158,7 @@ def compute_rsi(close: pd.Series, length: int = 14) -> pd.Series:
     rsi = 100.0 - (100.0 / (1.0 + rs))
     return rsi
 
+
 def build_features(
     df: pd.DataFrame,
     tenkan: int,
@@ -165,10 +167,10 @@ def build_features(
     displacement: int,
     slope_window: int = 8,
     rsi_len: int = 14,
-) -> tuple[pd.DataFrame, list[str]]:
+) -> Tuple[pd.DataFrame, List[str]]:
     """
-    Build Ichimoku + RSI feature set for LIVE Bybit data.
-    Must match the training script exactly.
+    Build Ichimoku + RSI feature set for LIVE data.
+    This must match the training script (including rsi_z2).
     """
     d = ichimoku(df, tenkan, kijun, senkou)
 
@@ -193,6 +195,7 @@ def build_features(
     d["span_a_slope"] = (d["span_a"] - d["span_a"].shift(sw)) / (d["px"] + 1e-9)
     d["span_b_slope"] = (d["span_b"] - d["span_b"].shift(sw)) / (d["px"] + 1e-9)
 
+    # Chikou + volatility
     D = int(displacement)
     d["chikou_above"] = (d["close"] > d["close"].shift(D)).astype(float)
     d["vol20"] = d["ret1"].rolling(20, min_periods=20).std().fillna(0)
@@ -218,6 +221,7 @@ def build_features(
         "rsi", "rsi_z2",
     ]
 
+    # Drop NaNs and align timestamp/close
     feat = d[feature_cols].copy().dropna().reset_index(drop=True)
     ts = d.loc[feat.index, "timestamp"].reset_index(drop=True)
     px = d.loc[feat.index, "close"].reset_index(drop=True)
@@ -225,8 +229,8 @@ def build_features(
     out = feat.copy()
     out.insert(0, "timestamp", ts)
     out.insert(1, "close", px)
-    return out, feature_cols
 
+    return out, feature_cols
 
 def slope(series: pd.Series, w: int = 8) -> pd.Series:
     return series.diff(w)
