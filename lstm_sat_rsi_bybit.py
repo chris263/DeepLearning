@@ -122,8 +122,11 @@ def load_bars_from_json(path: str) -> pd.DataFrame:
 # =========================
 # Ichimoku + features
 # =========================
-import numpy as np
-import pandas as pd
+# =========================
+# Ichimoku + features
+# =========================
+
+
 def rolling_mid(high: pd.Series, low: pd.Series, n: int) -> pd.Series:
     n = int(n)
     hh = high.rolling(n, min_periods=n).max()
@@ -270,40 +273,6 @@ def align_features_to_meta(feat_df: pd.DataFrame, meta_features: List[str]) -> p
                 cols.add(name)
                 break
     return feat_df
-
-def build_features(df: pd.DataFrame, tenkan: int, kijun: int, senkou: int,
-                   displacement: int, slope_window: int = 8) -> pd.DataFrame:
-    d = ichimoku(df, tenkan, kijun, senkou)
-    d["px"] = d["close"]
-    d["ret1"] = d["close"].pct_change().fillna(0)
-    d["oc_diff"] = (d["close"] - d["open"]) / d["open"]
-    d["hl_range"] = (d["high"] - d["low"]) / d["px"]
-    d["logv"] = np.log1p(d["volume"])
-    d["logv_chg"] = d["logv"].diff().fillna(0)
-
-    # --- NEW: RSI feature (14-period, Wilder-style) ---
-    rsi_series = compute_rsi(d["close"], window=14)
-    d["rsi"] = rsi_series.fillna(50.0)   # neutral 50 for early bars
-    d["rsi14"] = d["rsi"]                # convenience alias
-
-    d["dist_px_cloud_top"] = (d["px"] - d["cloud_top"]) / d["px"]
-    d["dist_px_cloud_bot"] = (d["px"] - d["cloud_bot"]) / d["px"]
-    d["dist_tk_kj"] = (d["tenkan"] - d["kijun"]) / d["px"]
-    d["span_order"] = (d["span_a"] > d["span_b"]).astype(float)
-
-    sw = int(max(1, slope_window))
-    d["tk_slope"] = (d["tenkan"] - d["tenkan"].shift(sw)) / (d["px"] + 1e-9)
-    d["kj_slope"] = (d["kijun"] - d["kijun"].shift(sw)) / (d["px"] + 1e-9)
-    d["span_a_slope"] = (d["span_a"] - d["span_a"].shift(sw)) / (d["px"] + 1e-9)
-    d["span_b_slope"] = (d["span_b"] - d["span_b"].shift(sw)) / (d["px"] + 1e-9)
-
-    D = int(displacement)
-    d["chikou_above"] = (d["close"] > d["close"].shift(D)).astype(float)
-    d["vol20"] = d["ret1"].rolling(20, min_periods=20).std().fillna(0)
-    d["ts"] = df["ts"].values
-    d["timestamp"] = df["timestamp"].values
-    return d
-
 
 
 # =========================
