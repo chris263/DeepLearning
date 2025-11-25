@@ -4,33 +4,20 @@ LSTM Ichimoku Trader — Long & Short (No Overlap)
 ================================================
 
 This revision keeps your original pipeline/results **unchanged** but adjusts how
-artifacts are saved so SAT can load the bundle directly, and adds support for
-loading OHLCV from a JSON file instead of Postgres:
+artifacts are saved so SAT can load the bundle directly:
 
-- **JSON mode** via --json-path:
-    - Expects ts/timestamp/time + open/high/low/close/volume.
-    - If provided, overrides DB loading.
-- **DB mode** still available via --db-url / DATABASE_URL.
-- **model.pt** is TorchScript (jit script → fallback to trace), so
+- **model.pt** is now **TorchScript** (jit script → fallback to trace), so
   `torch.jit.load()` in SAT works without shipping Python class code.
-- **preprocess.json** includes mean/std/features so SAT can standardize inputs
-  exactly like training.
+- **preprocess.npz** includes `mean`, `std`, **and** `features` so SAT can
+  standardize inputs exactly like training.
 - **meta.json** uses SAT-friendly keys (`features`, `torchscript`, `input_layout`=NLC,
   `prob_threshold`, `short_prob_threshold`, plus the original `pos_thr`/`neg_thr`).
+- Safe prints even when `--bundle-dir` isn't provided.
 
-Example (DB mode):
-  python lstm_trading_ichimoku_longshort.py \
-    --db-url postgresql://... \
-    --ticker BTCUSDT --timeframe 1h \
-    --train-start 2023-01-01 --train-end 2024-12-31 --test-end 2025-11-03 \
-    --lookback 64 --horizon 4 --epochs 15 --batch-size 256 --pos-thr 0.55 \
-    --sl-pct 0.02 --tp-pct 0.06 --fee-bps 1.0 --seed 7 --device cpu \
-    --out-dir ./results/BTCUSDT_1h \
-    --bundle-dir /app/app/analysis/models/lstm_longshort_btc_1h
+Everything else (training, backtest, thresholds, SL/TP, etc.) is intact.
 
-Example (JSON mode):
+Example (also writes an SAT-ready bundle):
   python lstm_trading_ichimoku_longshort.py \
-    --json-path ./BTCUSDT_1h.json \
     --ticker BTCUSDT --timeframe 1h \
     --train-start 2023-01-01 --train-end 2024-12-31 --test-end 2025-11-03 \
     --lookback 64 --horizon 4 --epochs 15 --batch-size 256 --pos-thr 0.55 \
@@ -86,59 +73,50 @@ def _coerce_timestamp_series(ts: pd.Series) -> pd.Series:
     return out.dt.tz_localize(None) if getattr(out.dt, "tz", None) is not None else out
 
 
-def load_json_ohlcv(json_path: str,
-                    start: Optional[str] = None,
-                    end: Optional[str] = None) -> pd.DataFrame:
+def load_db_ohlcv(db_url: str, ticker: str, timeframe: str,
+                   start: Optional[str] = None, end: Optional[str] = None) -> pd.DataFrame:
     """
-    Load OHLCV from a JSON file with ts/open/high/low/close/volume.
+    Load OHLCV from a JSON file (replaces the old Postgres-based version).
 
-    JSON can be:
-      - A list of bars:
-          [{ "ts": ..., "open": ..., "high": ..., "low": ..., "close": ..., "volume": ... }, ...]
-        or using "timestamp"/"time" instead of "ts".
-      - A dict with 'bars' or 'data' containing that list.
+    The JSON file is expected to be a list of bars like:
+        [
+          {"ts": 1669487400000, "open": ..., "high": ..., "low": ..., "close": ..., "volume": ...},
+          ...
+        ]
+
+    `db_url` is now interpreted as the path to this JSON file.
+    `ticker` and `timeframe` are kept only for API compatibility with existing callers.
     """
-    json_path = os.path.abspath(os.path.expanduser(json_path))
+    import json
+    import os
+
+    json_path = os.path.abspath(os.path.expanduser(db_url))
     with open(json_path, "r") as f:
         data = json.load(f)
 
-    # Unwrap common container keys
-    if isinstance(data, dict):
-        if isinstance(data.get("bars"), list):
-            data = data["bars"]
-        elif isinstance(data.get("data"), list):
-            data = data["data"]
-
     if not isinstance(data, list):
-        raise ValueError("Expected JSON list of bars, or dict with 'bars'/'data' list.")
+        raise ValueError("JSON must be a list of bar objects.")
 
     df = pd.DataFrame(data)
 
-    # Map time key to 'timestamp'
-    if "timestamp" not in df.columns:
-        if "ts" in df.columns:
-            df["timestamp"] = df["ts"]
-        elif "time" in df.columns:
-            df["timestamp"] = df["time"]
-        else:
-            raise ValueError("JSON must contain 'timestamp', 'ts', or 'time' field.")
+    # Required columns based on your example
+    required_cols = ["ts", "open", "high", "low", "close", "volume"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"JSON missing required columns: {missing}")
 
-    # Volume alias: allow 'vol' → 'volume'
-    if "volume" not in df.columns and "vol" in df.columns:
-        df["volume"] = df["vol"]
+    # Convert ts -> timestamp (datetime64[ns]) to match the original DB version
+    df["timestamp"] = _coerce_timestamp_series(df["ts"]).astype("datetime64[ns]")
 
-    # Coerce timestamps
-    df["timestamp"] = _coerce_timestamp_series(df["timestamp"]).astype("datetime64[ns]")
-
-    # Ensure OHLCV columns
+    # Coerce numeric columns
     for c in ["open", "high", "low", "close", "volume"]:
-        if c not in df.columns:
-            raise ValueError(f"JSON missing required '{c}' field.")
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
+    # Keep exactly the same final structure as the original version
     df = df[["timestamp", "open", "high", "low", "close", "volume"]]
     df = df.dropna().sort_values("timestamp").reset_index(drop=True)
 
+    # Date filters (on timestamp) – same semantics as before
     if start:
         df = df[df.timestamp >= pd.to_datetime(start)]
     if end:
@@ -146,58 +124,9 @@ def load_json_ohlcv(json_path: str,
 
     if df.empty:
         raise ValueError("Bars exist but are outside the requested date window or all NaN.")
+
     return df
 
-
-def load_db_ohlcv(db_url: str, ticker: str, timeframe: str,
-                   start: Optional[str] = None, end: Optional[str] = None) -> pd.DataFrame:
-    """Load OHLCV from Postgres `price.data_json` (JSON array of bars)."""
-    if psycopg is None:
-        raise RuntimeError("psycopg (v3) is required for DB mode. Install `psycopg[binary]`.")
-
-    def sql_tpl(time_key: str, col: str) -> str:
-        return f"""
-        SELECT
-            bar->>'{time_key}' AS ts,
-            (bar->>'open')::double precision  AS open,
-            (bar->>'high')::double precision  AS high,
-            (bar->>'low')::double precision   AS low,
-            (bar->>'close')::double precision AS close,
-            COALESCE((bar->>'volume')::double precision, 0) AS volume
-        FROM price p, jsonb_array_elements(p.data_json) AS bar
-        WHERE p.{col} = %s AND p.timeframe = %s
-        """
-
-    with psycopg.connect(db_url) as conn:
-        conn.execute("SET TIME ZONE 'UTC'")
-        try:
-            cur = conn.execute(sql_tpl("ts", "ticker"), (ticker, timeframe))
-        except Exception:
-            cur = conn.execute(sql_tpl("ts", "symbol"), (ticker, timeframe))
-        rows = cur.fetchall()
-        if not rows:
-            try:
-                cur = conn.execute(sql_tpl("timestamp", "ticker"), (ticker, timeframe))
-            except Exception:
-                cur = conn.execute(sql_tpl("timestamp", "symbol"), (ticker, timeframe))
-            rows = cur.fetchall()
-
-    if not rows:
-        raise ValueError("No bars returned — check timeframe/ticker or DB contents.")
-
-    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df["timestamp"] = _coerce_timestamp_series(df["timestamp"]).astype("datetime64[ns]")
-    for c in ["open", "high", "low", "close", "volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna().sort_values("timestamp").reset_index(drop=True)
-
-    if start:
-        df = df[df.timestamp >= pd.to_datetime(start)]
-    if end:
-        df = df[df.timestamp <= pd.to_datetime(end)]
-    if df.empty:
-        raise ValueError("Bars exist but are outside the requested date window.")
-    return df
 
 # ==============
 # Ichimoku & Features
@@ -579,11 +508,7 @@ def backtest_threshold_ls(df_raw: pd.DataFrame, df_feat: pd.DataFrame, feature_c
 
 def parse_args():
     ap = argparse.ArgumentParser(description="LSTM Ichimoku trading classifier + backtest (long & short, no overlap)")
-    ap.add_argument("--db-url", default=os.getenv("DATABASE_URL"),
-                    help="Postgres DSN for DB mode; if omitted, use --json-path")
-    ap.add_argument("--json-path", type=str,
-                    help="Path to JSON OHLCV file with ts/open/high/low/close/volume; overrides --db-url if set")
-
+    ap.add_argument("--db-url", default=os.getenv("DATABASE_URL"), help="Postgres DSN; falls back to env DATABASE_URL")
     ap.add_argument("--ticker", required=True, help="Ticker (e.g., ETHUSDT)")
     ap.add_argument("--timeframe", required=True, help="Timeframe label (e.g., 4h, 1h)")
 
@@ -619,17 +544,14 @@ def parse_args():
 
     # Output directory
     ap.add_argument("--out-dir", type=str, default=".", help="Directory to save artifacts (created if missing)")
-    ap.add_argument("--bundle-dir", type=str, help="If set, also write SAT bundle (model.pt, preprocess.json, meta.json)")
+    ap.add_argument("--bundle-dir", type=str, help="If set, also write SAT bundle (model.pt, preprocess.npz, meta.json)")
 
     return ap.parse_args()
 
 def main():
     args = parse_args()
-
-    # Need either JSON or DB
-    if not args.json_path and not args.db_url:
-        raise SystemExit("Provide --json-path or --db-url / DATABASE_URL env var.")
-
+    if not args.db_url:
+        raise SystemExit("Provide --db-url or set DATABASE_URL env var.")
     neg_thr = (1.0 - args.pos_thr) if args.neg_thr is None else float(args.neg_thr)
     if neg_thr >= args.pos_thr:
         print(f"[warn] neg_thr ({neg_thr}) >= pos_thr ({args.pos_thr}); tightening to avoid overlap.")
@@ -642,20 +564,8 @@ def main():
         return os.path.join(out_dir, name)
 
     # 1) Load full window (train + (optional) test)
-    if args.json_path:
-        df_all = load_json_ohlcv(
-            args.json_path,
-            start=args.train_start,
-            end=args.test_end or args.train_end,
-        )
-    else:
-        df_all = load_db_ohlcv(
-            args.db_url,
-            ticker=args.ticker,
-            timeframe=args.timeframe,
-            start=args.train_start,
-            end=args.test_end or args.train_end,
-        )
+    df_all = load_db_ohlcv(args.db_url, ticker=args.ticker, timeframe=args.timeframe,
+                           start=args.train_start, end=args.test_end or args.train_end)
 
     # 2) Build features (no look-ahead)
     feat_all, feature_cols = build_features(df_all, args.tenkan, args.kijun, args.senkou, args.displacement)
