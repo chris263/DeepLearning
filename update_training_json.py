@@ -111,7 +111,7 @@ def update_json(json_file, symbol, timeframe):
 
     # 3) Filter for 6-month data (based on latest ts in file)
     candles = filter_last_two_years(candles)
-    print(f"[INFO] After 6-month filter: {len(candles)} candles remain")
+    print(f"[INFO] After 3-year filter: {len(candles)} candles remain")
 
     # Get 'since' timestamp for Bybit request
     since_ts = candles[-1]["ts"] if candles else None
@@ -147,7 +147,7 @@ def update_json(json_file, symbol, timeframe):
         last_ts = updated[-1]["ts"]
         cutoff_ts = last_ts - TWO_YEARS_MS
         updated = [c for c in updated if c["ts"] >= cutoff_ts]
-        print(f"[INFO] After final 6-month trim: {len(updated)} candles")
+        print(f"[INFO] After final 3-year trim: {len(updated)} candles")
 
     # Save back in same format
     path.write_text(json.dumps(updated, indent=2))
