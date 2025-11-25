@@ -75,26 +75,6 @@ def _coerce_timestamp_series(ts: pd.Series) -> pd.Series:
 
 def load_db_ohlcv(db_url: str, ticker: str, timeframe: str,
                   start: Optional[str] = None, end: Optional[str] = None) -> pd.DataFrame:
-    """
-    Load OHLCV from a JSON file instead of Postgres.
-
-    JSON format (your example):
-
-    [
-      {
-        "ts": 1669487400000,
-        "open": 1210.8,
-        "high": 1210.85,
-        "low": 1205.35,
-        "close": 1207.65,
-        "volume": 13081.98
-      },
-      ...
-    ]
-
-    `db_url` is now interpreted as the path to this JSON file.
-    `ticker` and `timeframe` are kept only so existing calls still work.
-    """
     import json
     import os
 
@@ -114,19 +94,20 @@ def load_db_ohlcv(db_url: str, ticker: str, timeframe: str,
     if missing:
         raise ValueError(f"JSON missing required columns: {missing}")
 
-    # Convert ts -> timestamp (datetime64[ns]) to match old behavior
+    # Convert ts → timestamp (datetime64[ns]) to match the original DB behavior
+    # We KEEP 'ts' as-is; 'timestamp' is just an extra column used by the pipeline.
     df["timestamp"] = _coerce_timestamp_series(df["ts"]).astype("datetime64[ns]")
 
     # Coerce numeric columns
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Keep exactly the same structure as the original DB loader
-    df = df[["timestamp", "open", "high", "low", "close", "volume"]]
-    df = df.dropna().sort_values("timestamp")
+    # Same structure as the old DB loader, but ts is still present in df
+    # (even though the rest of the code only cares about 'timestamp' + ohlcv).
+    df = df[["ts", "timestamp", "open", "high", "low", "close", "volume"]]
 
-    # 🔴 IMPORTANT: force RangeIndex so build_features(d.loc[feat.index, ...]) works
-    df = df.reset_index(drop=True)
+    # Clean and sort
+    df = df.dropna().sort_values("timestamp")
 
     # Date filters (same semantics as original)
     if start:
@@ -137,7 +118,11 @@ def load_db_ohlcv(db_url: str, ticker: str, timeframe: str,
     if df.empty:
         raise ValueError("Bars exist but are outside the requested date window or all NaN.")
 
+    # IMPORTANT: reset index AFTER filtering so build_features(d.loc[feat.index, ...]) works
+    df = df.reset_index(drop=True)
+
     return df
+
 
 # ==============
 # Ichimoku & Features
