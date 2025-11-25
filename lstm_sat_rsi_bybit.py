@@ -306,37 +306,59 @@ def build_features(df: pd.DataFrame, tenkan: int, kijun: int, senkou: int,
 # Bundle I/O
 # =========================
 def load_bundle(model_dir: str):
-    model_dir = os.path.abspath(os.path.expanduser(model_dir))
-    meta_path = os.path.join(model_dir, "meta.json")
-    pre_path  = os.path.join(model_dir, "preprocess.json")
-    mdl_path  = os.path.join(model_dir, "model.pt")
-    for p in (meta_path, pre_path, mdl_path):
-        if not os.path.exists(p):
-            raise SystemExit(f"Missing bundle file: {p}")
+    """
+    Load SAT bundle from a directory containing:
+      - model.pt
+      - preprocess.json
+      - meta.json
+    """
 
+    model_dir = os.path.abspath(model_dir)
+
+    meta_path        = os.path.join(model_dir, "meta.json")
+    preprocess_path  = os.path.join(model_dir, "preprocess.json")
+    model_path       = os.path.join(model_dir, "model.pt")
+
+    if not os.path.exists(meta_path):
+        raise SystemExit(f"meta.json not found in {model_dir}")
+    if not os.path.exists(preprocess_path):
+        raise SystemExit(f"preprocess.json not found in {model_dir}")
+    if not os.path.exists(model_path):
+        raise SystemExit(f"model.pt not found in {model_dir}")
+
+    # --- 1) Load meta & preprocess ---
     with open(meta_path, "r") as f:
         meta = json.load(f)
-    with open(pre_path, "r") as f:
+
+    with open(preprocess_path, "r") as f:
         pre = json.load(f)
 
-    feature_names = meta.get("features") or meta.get("feature_names")
+    # feature names from preprocess.json (preferred), or meta fallback
+    feature_names = (
+        pre.get("feature_names")
+        or pre.get("features")
+        or meta.get("features")
+        or []
+    )
     if not feature_names:
-        raise SystemExit("meta.json missing 'features' list")
+        raise SystemExit("No feature_names found in preprocess.json/meta.json")
 
-    lookback = int(meta.get("lookback") or meta.get("window") or 64)
-    pos_thr  = float(meta.get("pos_thr", 0.55))
-    neg_thr  = float(meta.get("neg_thr", 0.45))
+    mean = np.asarray(pre["mean"], dtype=np.float32)
+    std  = np.asarray(pre["std"], dtype=np.float32)
+    if mean.shape[0] != len(feature_names) or std.shape[0] != len(feature_names):
+        raise SystemExit("preprocess.json shapes don't match features")
 
-    # --- risk (nested first, then legacy top-level) ---
+    # --- 2) Core model params ---
+    lookback = int(meta.get("lookback", 64))
+
+    pos_thr = float(meta.get("pos_thr", meta.get("prob_threshold", 0.55)))
+    neg_thr = float(meta.get("neg_thr", meta.get("short_prob_threshold", 0.45)))
+
     risk = meta.get("risk") or {}
-    sl_pct = risk.get("sl_pct", meta.get("sl_pct"))
-    tp_pct = risk.get("tp_pct", meta.get("tp_pct"))
-    fee_bps = risk.get("fee_bps", meta.get("fee_bps"))  # not required by runners, but available
+    sl_pct = float(risk.get("sl_pct", meta.get("sl_pct", 0.02)))
+    tp_pct = float(risk.get("tp_pct", meta.get("tp_pct", 0.06)))
 
-    sl_pct = float(sl_pct) if sl_pct is not None else None
-    tp_pct = float(tp_pct) if tp_pct is not None else None
-
-    # --- ichimoku (nested first, then legacy top-level, then defaults) ---
+    # --- 3) Ichimoku params ---
     ik = meta.get("ichimoku") or {}
     ichimoku_params = {
         "tenkan":       int(ik.get("tenkan",       meta.get("tenkan", 9))),
@@ -345,24 +367,12 @@ def load_bundle(model_dir: str):
         "displacement": int(ik.get("displacement", meta.get("displacement", 26))),
     }
 
-    # --- NEW: RSI params from meta.json ---
+    # --- 4) RSI params (for rsi_z2 etc.) ---
     rsi_meta = meta.get("rsi") or {}
-    rsi_len = int(rsi_meta.get("length", 14))  # same as used in training
+    rsi_len = int(rsi_meta.get("length", 14))
 
-    # --- Load preprocess.json (scaler + feature names) ---
-    with open(preprocess_path, "r") as f:
-        pre = json.load(f)
-
-    feature_names = pre.get("feature_names") or meta.get("features") or []
-    if not feature_names:
-        raise SystemExit("No feature_names found in preprocess.json or meta.json")
-
-    mean = np.array(pre.get("mean"), dtype=np.float32)
-    std  = np.array(pre.get("std"), dtype=np.float32)
-    if mean.shape[0] != len(feature_names) or std.shape[0] != len(feature_names):
-        raise SystemExit("preprocess.json shapes don't match features")
-
-    model = torch.jit.load(mdl_path, map_location="cpu")
+    # --- 5) Load TorchScript model ---
+    model = torch.jit.load(model_path, map_location="cpu")
     model.eval()
 
     return {
@@ -377,9 +387,8 @@ def load_bundle(model_dir: str):
         "mean": mean,
         "std": std,
         "ichimoku": ichimoku_params,
-        "rsi": {"length": rsi_len},   # <<< add this
+        "rsi": {"length": rsi_len},
         "paths": {"dir": model_dir},
-        # "fee_bps": float(fee_bps) if fee_bps is not None else None,
     }
 
 
