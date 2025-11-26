@@ -40,11 +40,11 @@ echo "log file  : $LOG_FILE"
 echo "==============================================="
 
 echo "Coinex ETH 30m"
-python3 $WORKDIR/lstm_sat_coinex.py  --model-dir "$WORKDIR/lstm/ethusdt_lstm_30m_2025/"   --bars-json "/home/production/tmp/ETHUSDT_30m_6m.json" --ticker ETHUSDT --timeframe 30m --pub_key API_KEY_ETH --sec_key API_SECRET_ETH --debug
+python3 $WORKDIR/lstm_sat_rsi_coinex.py  --model-dir "$WORKDIR/lstm/ethusdt_lstm_30m_2025/"   --bars-json "/home/production/tmp/ETHUSDT_30m_6m.json" --ticker ETHUSDT --timeframe 30m --pub_key API_KEY_ETH --sec_key API_SECRET_ETH --debug
 
 echo
 echo "Bybit BTC 30M"
-python3 $WORKDIR/lstm_sat_bybit.py  --model-dir "$WORKDIR/lstm/btc_lstm_30m_2025/"  --bars-json "/home/production/tmp/BTCUSDT_30m_6m.json" --ticker BTCUSDT --timeframe 30m  --pub_key API_BYBIT_SAT --sec_key API_BYBIT_SECRET_SAT --debug
+python3 $WORKDIR/lstm_sat_rsi_bybit.py  --model-dir "$WORKDIR/lstm/btc_lstm_30m_2025/"  --bars-json "/home/production/tmp/BTCUSDT_30m_6m.json" --ticker BTCUSDT --timeframe 30m  --pub_key API_BYBIT_SAT --sec_key API_BYBIT_SECRET_SAT --debug
 
 echo
 echo "Bybit ETH RSI 30M"
@@ -54,11 +54,11 @@ python3 $WORKDIR/lstm_sat_rsi_bybit.py  --model-dir "$WORKDIR/lstm/eth_lstm_rsi_
 if [ "$MINUTE" -le 2 ]; then
 	echo 
 	echo "Coinex BTC 1H"
-	python3 $WORKDIR/lstm_sat_coinex.py  --model-dir "$WORKDIR/lstm/btc_lstm_1h_2025/"   --bars-json "/home/production/tmp/BTCUSDT_1h_6m.json" --ticker BTCUSDT --timeframe 1h  --pub_key API_KEY --sec_key API_SECRET --debug
+	python3 $WORKDIR/lstm_sat_rsi_coinex.py  --model-dir "$WORKDIR/lstm/btc_lstm_1h_2025/"   --bars-json "/home/production/tmp/BTCUSDT_1h_6m.json" --ticker BTCUSDT --timeframe 1h  --pub_key API_KEY --sec_key API_SECRET --debug
 
 	echo
 	echo "Bybit ETH 1H"
-	python3 $WORKDIR/lstm_sat_bybit.py  --model-dir "$WORKDIR/lstm/eth_lstm_1h_2025/"  --bars-json "/home/production/tmp/ETHUSDT_1h_6m.json" --ticker ETHUSDT --timeframe 1h  --pub_key API_BYBIT_BTC --sec_key API_BYBIT_SECRET_BTC --debug
+	python3 $WORKDIR/lstm_sat_rsi_bybit.py  --model-dir "$WORKDIR/lstm/eth_lstm_1h_2025/"  --bars-json "/home/production/tmp/ETHUSDT_1h_6m.json" --ticker ETHUSDT --timeframe 1h  --pub_key API_BYBIT_BTC --sec_key API_BYBIT_SECRET_BTC --debug
     
    #echo
    #echo "CROSS TRADE SOLUSDT"
