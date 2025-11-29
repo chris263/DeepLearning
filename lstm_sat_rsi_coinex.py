@@ -511,8 +511,8 @@ def load_daily_profit_state(path: str, today: str, equity_now: float) -> Dict[st
 
 def log_daily_status(state: Dict[str, Any], target_pct: float, equity_now: float = None) -> None:
     eq0 = float(state.get("equity_start", 0.0) or 1.0)
-    realized = float(state.get("current_balance", eq0))
-    cur_bal = realized + eq0
+    cur_bal = float(state.get("current_balance", eq0))
+    realized = cur_bal - eq0
     realized_pct = realized / eq0 if eq0 > 0 else 0.0
     date = state.get("date", "?")
     hit = bool(state.get("hit_target"))
