@@ -984,48 +984,54 @@ def _explain_no_open(p_prev: float, p_last: float, pos_thr: float, neg_thr: floa
     in_neutral_now = (neg_thr < p_last < pos_thr)
     in_neutral_prev = (neg_thr < p_prev < pos_thr)
 
-    # 1) Neutral band => close any open position and wait
+    # 1) Neutral band => we stay flat, waiting for a fresh cross
     if in_neutral_now:
-        if p_prev > pos_thr:
+        if p_prev >= pos_thr:
             # Came from LONG zone into neutral
             return (
-                f"Neutral band: p_last={fp(p_last)} moved down from LONG zone "
-                f"(p_prev={fp(p_prev)} ≥ pos_thr={fp(pos_thr)}). "
-                "Strategy closes any existing LONG here, but no fresh position is opened."
+                f"No trade: p_last={fp(p_last)} moved down from LONG zone "
+                f"(p_prev={fp(p_prev)} ≥ pos_thr={fp(pos_thr)}) into the neutral band. "
+                "We do not open fresh positions inside the neutral band; we wait for a new clear signal."
             )
-        if p_prev < neg_thr:
+        if p_prev <= neg_thr:
             # Came from SHORT zone into neutral
             return (
-                f"Neutral band: p_last={fp(p_last)} moved up from SHORT zone "
-                f"(p_prev={fp(p_prev)} ≤ neg_thr={fp(neg_thr)}). "
-                "Strategy closes any existing SHORT here, but no fresh position is opened."
+                f"No trade: p_last={fp(p_last)} moved up from SHORT zone "
+                f"(p_prev={fp(p_prev)} ≤ neg_thr={fp(neg_thr)}) into the neutral band. "
+                "We do not open fresh positions inside the neutral band; we wait for a new clear signal."
             )
         # Stayed inside neutral
         return (
             f"No trade: p_prev={fp(p_prev)} → p_last={fp(p_last)} both inside "
             f"neutral band ({fp(neg_thr)} < p < {fp(pos_thr)}). "
-            "We require a cross out of neutral to open a position."
+            "The strategy stays flat in the neutral band and waits for a fresh cross into LONG or SHORT zone."
         )
 
     # 2) Already in LONG or SHORT zone and stayed there => no fresh cross
+    # LONG zone: p_last ≥ pos_thr
     if p_last >= pos_thr and p_prev > p_last:
         return (
-            f"No new LONG: probability stayed in LONG zone "
-            f"(p_prev={fp(p_prev)}  →  p_last={fp(p_last)} ≥ pos_thr={fp(pos_thr)}). "
-            f"We only open a LONG when p_last > p_prev."
-        )
-    if p_last <= neg_thr and p_prev < p_last:
-        return (
-            f"No new SHORT: probability stayed in SHORT zone "
-            f"(p_prev={fp(p_prev)} → p_last={fp(p_last)} ≤ neg_thr={fp(neg_thr)}). "
-            f"We only open a SHORT when p_last < p_prev."
+            f"No new LONG: probability stayed in LONG zone but moved down "
+            f"(p_prev={fp(p_prev)} → p_last={fp(p_last)} ≥ pos_thr={fp(pos_thr)}). "
+            "We only open a LONG when the probability moves upward (p_last > p_prev)."
         )
 
-    # 3) Crossed but not in a valid fresh-cross configuration
+    # SHORT zone: p_last ≤ neg_thr
+    if p_last <= neg_thr and p_prev < p_last:
+        return (
+            f"No new SHORT: probability stayed in SHORT zone but moved up "
+            f"(p_prev={fp(p_prev)} → p_last={fp(p_last)} ≤ neg_thr={fp(neg_thr)}). "
+            "We only open a SHORT when the probability moves downward (p_last < p_prev)."
+        )
+
+    # 3) Crossed in some way, but not in a valid fresh-cross configuration
     return (
         f"No trade: p_prev={fp(p_prev)}, p_last={fp(p_last)} — does not satisfy "
-        f"fresh-cross rules for LONG (p_prev<pos_thr≤p_last) or SHORT (p_prev>neg_thr≥p_last)."
+        "fresh-cross rules for a new position: "
+        f"LONG requires (p_last ≥ pos_thr and p_last > p_prev), "
+        f"SHORT requires (p_last ≤ neg_thr and p_last < p_prev)."
     )
+
 
 ## SL Protection
 def _sl_guard_file(guard_path: str) -> str:
@@ -1295,7 +1301,7 @@ def decide_and_maybe_trade(args):
                 return
 
             # 10b) SIGNAL EXIT: close LONG when leaving LONG zone
-            if p_last < pos_thr:
+            if (p_last < neg_thr) and (p_prev > p_last):
                 try:
                     ex.create_order(symbol, "market", "sell", close_qty, None, {"reduceOnly": True})
                     zone = "neutral" if in_neutral_now else "short"
@@ -1353,7 +1359,7 @@ def decide_and_maybe_trade(args):
                 return
 
             # 10d) SIGNAL EXIT: close SHORT when leaving SHORT zone
-            if p_last > neg_thr:
+            if (p_last > pos_thr) and (p_prev < p_last):
                 try:
                     ex.create_order(symbol, "market", "buy", close_qty, None, {"reduceOnly": True})
                     zone = "neutral" if in_neutral_now else "long"
